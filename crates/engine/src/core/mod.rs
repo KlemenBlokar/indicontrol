@@ -239,6 +239,7 @@ impl Core {
                 self.save();
                 self.send(ToUi::Roles(roles));
                 self.send(self.mount_msg());
+                self.push_optics();
                 self.send_guider();
                 Ok(())
             }
@@ -293,7 +294,7 @@ impl Core {
                         Some(existing) => *existing = seq,
                         None => lib.push(seq),
                     }
-                    lib.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    lib.sort_by_key(|a| a.name.to_lowercase());
                     self.save();
                     self.send(ToUi::SequenceLibrary {
                         sequences: self.state.sequences.clone(),
@@ -347,6 +348,14 @@ impl Core {
                 self.state.focus = settings.clone();
                 self.save();
                 self.send(ToUi::FocusSettings(settings));
+                Ok(())
+            }
+            ToEngine::SetOptics(optics) => {
+                self.state.optics = optics.clone();
+                self.save();
+                self.send(ToUi::Optics(optics));
+                self.push_optics();
+                self.send_guider();
                 Ok(())
             }
             ToEngine::SaveProfile { name } => {
@@ -448,6 +457,10 @@ impl Core {
                 if let Some(p) = self.property(&device, &name) {
                     self.send(ToUi::PropertyDefined(p));
                 }
+                // Cameras define SCOPE_INFO when they connect.
+                if name == "SCOPE_INFO" {
+                    self.push_optics();
+                }
             }
             Event::Updated { device, name } => {
                 if let Some(p) = self.property(&device, &name) {
@@ -521,6 +534,37 @@ impl Core {
         });
     }
 
+    /// Write configured focal lengths/apertures to the cameras' SCOPE_INFO.
+    fn push_optics(&self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let o = &self.state.optics;
+        for (camera, focal, aperture) in [
+            (&self.state.roles.main_camera, o.focal_length, o.aperture),
+            (&self.state.roles.guide_camera, o.guide_focal_length, o.guide_aperture),
+        ] {
+            let (Some(camera), Some(focal)) = (camera, focal) else {
+                continue;
+            };
+            let current = {
+                let cache = client.cache();
+                let Some(p) = cache.property(camera, "SCOPE_INFO") else {
+                    continue;
+                };
+                (p.number("FOCAL_LENGTH"), p.number("APERTURE"))
+            };
+            let aperture = aperture.or(current.1).unwrap_or(0.0);
+            if current != (Some(focal), Some(aperture)) {
+                let _ = client.send_number(
+                    camera,
+                    "SCOPE_INFO",
+                    &[("FOCAL_LENGTH", focal), ("APERTURE", aperture)],
+                );
+            }
+        }
+    }
+
     fn profiles_msg(&self) -> ToUi {
         ToUi::Profiles {
             names: self.state.profiles.iter().map(|p| p.name.clone()).collect(),
@@ -543,9 +587,11 @@ impl Core {
         let old_server = (self.state.indi.host.clone(), self.state.indi.port);
         self.state.apply(&profile);
         self.save();
+        self.push_optics();
         self.log(None, format!("Profile '{name}' loaded"), LogLevel::Info);
         for msg in [
             ToUi::Roles(self.state.roles.clone()),
+            ToUi::Optics(self.state.optics.clone()),
             ToUi::ImagingSettings(self.state.imaging.clone()),
             ToUi::GuiderSettings(self.state.guider.clone()),
             ToUi::SolverSettings(self.state.solver.clone()),
@@ -628,6 +674,7 @@ impl Core {
             },
             self.status_msg(),
             ToUi::Roles(self.state.roles.clone()),
+            ToUi::Optics(self.state.optics.clone()),
             ToUi::ImagingSettings(self.state.imaging.clone()),
             ToUi::Devices(devices),
             self.capture_msg(),

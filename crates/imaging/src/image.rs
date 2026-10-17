@@ -72,25 +72,32 @@ impl Image {
         let data: Vec<u16> = match bitpix {
             8 => raw.iter().map(|&b| clamp(b as f64 * bscale + bzero)).collect(),
             16 if bscale == 1.0 && bzero == 32768.0 => raw
-                .chunks_exact(2)
-                .map(|b| (i16::from_be_bytes([b[0], b[1]]) as i32 + 32768) as u16)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| (i16::from_be_bytes(b) as i32 + 32768) as u16)
                 .collect(),
             16 => raw
-                .chunks_exact(2)
-                .map(|b| clamp(i16::from_be_bytes([b[0], b[1]]) as f64 * bscale + bzero))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| clamp(i16::from_be_bytes(b) as f64 * bscale + bzero))
                 .collect(),
             32 => raw
-                .chunks_exact(4)
-                .map(|b| clamp(i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64 * bscale + bzero))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| clamp(i32::from_be_bytes(b) as f64 * bscale + bzero))
                 .collect(),
             -32 | -64 => {
                 let values: Vec<f64> = if bitpix == -32 {
-                    raw.chunks_exact(4)
-                        .map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                    raw.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&b| f32::from_be_bytes(b) as f64)
                         .collect()
                 } else {
-                    raw.chunks_exact(8)
-                        .map(|b| f64::from_be_bytes(b.try_into().expect("8 bytes")))
+                    raw.as_chunks::<8>().0.iter().map(|&b| f64::from_be_bytes(b))
                         .collect()
                 };
                 let values: Vec<f64> = values.iter().map(|v| v * bscale + bzero).collect();

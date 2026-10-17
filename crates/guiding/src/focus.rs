@@ -91,8 +91,9 @@ fn solve3(mut m: [[f64; 3]; 3], mut v: [f64; 3]) -> Option<[f64; 3]> {
         for row in 0..3 {
             if row != col {
                 let f = m[row][col] / m[col][col];
-                for k in col..3 {
-                    m[row][k] -= f * m[col][k];
+                let pivot_row = m[col];
+                for (x, p) in m[row].iter_mut().zip(pivot_row).skip(col) {
+                    *x -= f * p;
                 }
                 v[row] -= f * v[col];
             }

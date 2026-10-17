@@ -56,6 +56,18 @@ pub fn engine_url(input: &str) -> String {
     format!("ws://{host}:{port}{WS_PATH}")
 }
 
+/// Telescope optics. INDI 2.x keeps these on each camera (`SCOPE_INFO`); the
+/// engine pushes them there so metadata, plate solving and guiding know them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Optics {
+    /// Main telescope focal length (mm), including reducers/barlows.
+    pub focal_length: Option<f64>,
+    pub aperture: Option<f64>,
+    pub guide_focal_length: Option<f64>,
+    pub guide_aperture: Option<f64>,
+}
+
 /// Which INDI device fills each equipment role.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -300,6 +312,7 @@ pub enum ToUi {
     SolverSettings(SolverSettings),
     Autofocus { status: AutofocusStatus },
     FocusSettings(FocusSettings),
+    Optics(Optics),
     /// Saved equipment profiles and the one last loaded or saved.
     Profiles { names: Vec<String>, active: Option<String> },
 }
@@ -377,6 +390,7 @@ pub enum ToEngine {
     Autofocus,
     AbortAutofocus,
     SetFocusSettings(FocusSettings),
+    SetOptics(Optics),
     /// Save the current rig (INDI server, roles, all settings) under a name.
     SaveProfile { name: String },
     LoadProfile { name: String },
@@ -428,6 +442,7 @@ pub struct UiState {
     pub focus_settings: FocusSettings,
     pub profiles: Vec<String>,
     pub active_profile: Option<String>,
+    pub optics: Optics,
 }
 
 impl Default for UiState {
@@ -457,6 +472,7 @@ impl Default for UiState {
             focus_settings: FocusSettings::default(),
             profiles: Vec::new(),
             active_profile: None,
+            optics: Optics::default(),
         }
     }
 }
@@ -528,6 +544,7 @@ impl UiState {
             ToUi::SolverSettings(s) => self.solver_settings = s,
             ToUi::Autofocus { status } => self.autofocus = status,
             ToUi::FocusSettings(s) => self.focus_settings = s,
+            ToUi::Optics(o) => self.optics = o,
             ToUi::Profiles { names, active } => {
                 self.profiles = names;
                 self.active_profile = active;

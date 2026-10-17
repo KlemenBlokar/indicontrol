@@ -65,9 +65,10 @@ impl Wcs {
         det.abs().sqrt() * 3600.0
     }
 
-    /// Angle of the image +y axis from north through east (degrees).
+    /// Image rotation in the FITS CROTA2 sense (what ASTAP and most tools
+    /// display): CD = [[Δ1 cos ρ, −Δ2 sin ρ], [Δ1 sin ρ, Δ2 cos ρ]].
     pub fn rotation(&self) -> f64 {
-        self.cd[0][1].atan2(self.cd[1][1]).to_degrees().rem_euclid(360.0)
+        (-self.cd[0][1]).atan2(self.cd[1][1]).to_degrees().rem_euclid(360.0)
     }
 
     /// A sky image seen through a telescope (no mirror) has east 90° counter-
@@ -215,9 +216,7 @@ fn failure_text(kind: SolverKind, output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let last = stderr
         .lines()
-        .chain(stdout.lines())
-        .filter(|l| !l.trim().is_empty())
-        .last()
+        .chain(stdout.lines()).rfind(|l| !l.trim().is_empty())
         .unwrap_or("");
     format!("{} found no solution{}", kind.label(), if last.is_empty() { String::new() } else { format!(" ({last})") })
 }
@@ -240,20 +239,28 @@ mod tests {
     use super::*;
     use imaging::Card;
 
+    /// Real ASTAP output for an INDI CCD simulator frame (Pleiades, camera
+    /// rotated by 30°, 5.2 µm pixels at 500 mm).
+    const ASTAP_SIM_ROTATED: &str = "PLTSOLVD=T\nCRPIX1= 6.4050000000000000E+002\nCRPIX2= 5.1250000000000000E+002\n\
+        CRVAL1= 5.6742522965195235E+001\nCRVAL2= 2.4113337591358043E+001\n\
+        CDELT1= 5.9585080177927967E-004\nCDELT2= 5.9559141360341868E-004\n\
+        CROTA1= 1.5000189054107602E+002\nCROTA2= 1.4997474871878060E+002\n\
+        CD1_1=-5.1603176132138052E-004\nCD1_2=-2.9790837398194128E-004\n\
+        CD2_1= 2.9802299902436399E-004\nCD2_2=-5.1566600044083044E-004\nCMDLINE=astap_cli -f rot_001.fits\n";
+
     #[test]
     fn astap_ini() {
-        let ini = "PLTSOLVD=T\nCRPIX1= 2.0005000000000000E+003\nCRPIX2= 1.5005000000000000E+003\n\
-                   CRVAL1= 8.3822083333E+001\nCRVAL2=-5.3911111111E+000\nCDELT1=-3.0E-004\nCDELT2= 3.0E-004\n\
-                   CROTA1= 10.0\nCROTA2= 10.0\nCD1_1=-2.954423E-004\nCD1_2= 5.209445E-005\n\
-                   CD2_1= 5.209445E-005\nCD2_2= 2.954423E-004\nCMDLINE=astap -f x.fits\n";
-        let wcs = parse_astap_ini(ini).unwrap();
-        assert_eq!(wcs.crval, (83.822083333, -5.3911111111));
-        assert!((wcs.pixel_scale() - 1.08).abs() < 0.001, "{}", wcs.pixel_scale());
-        assert!((wcs.rotation() - 10.0).abs() < 0.01, "{}", wcs.rotation());
-        assert!(!wcs.mirrored());
+        let wcs = parse_astap_ini(ASTAP_SIM_ROTATED).unwrap();
+        assert_eq!(wcs.crval, (56.742522965195235, 24.113337591358043));
+        // 206.265 · 5.2 µm / 500 mm = 2.145"/px
+        assert!((wcs.pixel_scale() - 2.145).abs() < 0.002, "{}", wcs.pixel_scale());
+        // Matches ASTAP's own CROTA2.
+        assert!((wcs.rotation() - 149.97).abs() < 0.05, "{}", wcs.rotation());
+        // CDELT1 > 0: the simulator's images are mirrored.
+        assert!(wcs.mirrored());
         // CRPIX is the centre for ASTAP.
-        let (ra, dec) = wcs.pixel_to_sky(2000.5, 1500.5);
-        assert!((ra - 83.822083333).abs() < 1e-9 && (dec + 5.3911111111).abs() < 1e-9);
+        let (ra, dec) = wcs.pixel_to_sky(640.5, 512.5);
+        assert!((ra - 56.742522965195235).abs() < 1e-9 && (dec - 24.113337591358043).abs() < 1e-9);
 
         let err = parse_astap_ini("PLTSOLVD=F\nERROR=Not enough stars\n").unwrap_err();
         assert!(err.contains("Not enough stars"), "{err}");

@@ -40,7 +40,48 @@ pub(crate) enum Purpose {
     Focus,
 }
 
+/// Camera settings that solve/focus frames change and must put back.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CameraSnapshot {
+    binning: Option<u32>,
+    gain: Option<f64>,
+}
+
 impl Core {
+    pub(super) fn camera_snapshot(&self) -> CameraSnapshot {
+        let read = || -> Option<CameraSnapshot> {
+            let cache = self.client.as_ref()?.cache();
+            let cam = cache.devices.get(self.state.roles.main_camera.as_ref()?)?;
+            Some(CameraSnapshot {
+                binning: equipment::number(cam, "CCD_BINNING", "HOR_BIN").map(|n| n.value.round() as u32),
+                gain: equipment::control_value(cam, Control::Gain).map(|n| n.value),
+            })
+        };
+        read().unwrap_or_default()
+    }
+
+    /// Put binning and gain back after special-purpose frames, so later
+    /// captures that leave them unset don't inherit e.g. 2×2 solve binning.
+    pub(super) fn camera_restore(&self, snap: &CameraSnapshot) {
+        let (Some(client), Some(camera)) = (&self.client, &self.state.roles.main_camera) else {
+            return;
+        };
+        if let Some(b) = snap.binning {
+            let b = b as f64;
+            let _ = client.send_number(camera, "CCD_BINNING", &[("HOR_BIN", b), ("VER_BIN", b)]);
+        }
+        if let Some(g) = snap.gain {
+            let location = client
+                .cache()
+                .devices
+                .get(camera)
+                .and_then(|cam| equipment::control_location(cam, Control::Gain));
+            if let Some((prop, el)) = location {
+                let _ = client.send_number(camera, &prop, &[(&el, g)]);
+            }
+        }
+    }
+
     pub(super) fn start_capture(&mut self, req: CaptureRequest, purpose: Purpose) -> Result<(), String> {
         if self.job.is_some() {
             return Err("a capture is already running".into());

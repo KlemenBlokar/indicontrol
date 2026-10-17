@@ -30,6 +30,7 @@ pub(crate) struct SolveJob {
     /// A solver result that arrived while the solve frame was still being
     /// processed; handled once the capture has finished.
     pending: Option<Result<SolveResult, String>>,
+    camera: super::capture::CameraSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,6 +92,7 @@ impl Core {
             from_sequence,
             epoch: 0,
             pending: None,
+            camera: self.camera_snapshot(),
         });
         match target {
             Some(_) => self.solve_slew(),
@@ -302,6 +304,7 @@ impl Core {
         let Some(job) = self.solve_job.take() else {
             return;
         };
+        self.camera_restore(&job.camera);
         self.log(None, message.clone(), if ok { LogLevel::Info } else { LogLevel::Error });
         self.solve_status.busy = false;
         self.solve_status.message = message;

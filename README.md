@@ -186,3 +186,18 @@ indiserver indi_simulator_telescope indi_simulator_ccd indi_simulator_wheel
 
 `cargo test --workspace` runs unit tests plus end-to-end tests against a
 scripted fake INDI server.
+
+Tests against the real simulators are opt-in. The CCD and guide simulators
+only render stars when the GSC catalogue is installed (`gsc` on PATH and
+`GSCDAT` pointing at its data); plate solving uses ASTAP:
+
+```sh
+GSCDAT=~/.local/share/GSC indiserver -p 7630 indi_simulator_telescope \
+    indi_simulator_ccd indi_simulator_wheel indi_simulator_focus indi_simulator_guide
+INDI_SIM=127.0.0.1:7630 ASTAP=~/.local/opt/astap/astap_cli \
+    cargo test -p engine --test simulators -- --nocapture
+```
+
+INDI 2.x keeps the telescope focal length on each camera (`SCOPE_INFO`).
+Set it under **Optics** in the Equipment panel: the engine writes it to the
+cameras, and FITS metadata, plate solving and the guider rely on it.

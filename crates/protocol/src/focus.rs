@@ -37,7 +37,7 @@ impl Default for FocusSettings {
             backlash: 0,
             aperture: 15.0,
             min_stars: 3,
-            max_shifts: 2,
+            max_shifts: 4,
         }
     }
 }
@@ -56,6 +56,7 @@ pub struct AutofocusStatus {
 /// When a sequence refocuses.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct AutofocusTriggers {
     pub on_start: bool,
     /// Every N light frames (0 = never).
@@ -66,14 +67,3 @@ pub struct AutofocusTriggers {
     pub after_flip: bool,
 }
 
-impl Default for AutofocusTriggers {
-    fn default() -> Self {
-        Self {
-            on_start: false,
-            every_frames: 0,
-            on_filter_change: false,
-            temperature_delta: None,
-            after_flip: false,
-        }
-    }
-}

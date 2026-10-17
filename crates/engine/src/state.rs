@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use protocol::guider::Calibration;
-use protocol::{FlatRecord, FocusSettings, GuiderSettings, ImagingSettings, Roles, Sequence, SolverSettings};
+use protocol::{
+    FlatRecord, FocusSettings, GuiderSettings, ImagingSettings, Optics, Roles, Sequence, SolverSettings,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,6 +34,7 @@ pub struct Profile {
     pub name: String,
     pub indi: IndiSettings,
     pub roles: Roles,
+    pub optics: Optics,
     pub imaging: ImagingSettings,
     pub guider: GuiderSettings,
     pub guider_calibration: Option<Calibration>,
@@ -45,6 +48,7 @@ pub struct Profile {
 pub struct PersistedState {
     pub indi: IndiSettings,
     pub roles: Roles,
+    pub optics: Optics,
     pub imaging: ImagingSettings,
     pub sequences: Vec<Sequence>,
     /// Exposures found by flat auto-exposure, for matching dark flats.
@@ -64,6 +68,7 @@ impl PersistedState {
             name: name.to_owned(),
             indi: self.indi.clone(),
             roles: self.roles.clone(),
+            optics: self.optics.clone(),
             imaging: self.imaging.clone(),
             guider: self.guider.clone(),
             guider_calibration: self.guider_calibration.clone(),
@@ -76,6 +81,7 @@ impl PersistedState {
     pub fn apply(&mut self, p: &Profile) {
         self.indi = p.indi.clone();
         self.roles = p.roles.clone();
+        self.optics = p.optics.clone();
         self.imaging = p.imaging.clone();
         self.guider = p.guider.clone();
         self.guider_calibration = p.guider_calibration.clone();

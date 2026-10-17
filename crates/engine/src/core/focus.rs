@@ -23,6 +23,7 @@ pub(crate) struct FocusJob {
     from_sequence: bool,
     filter_slot: Option<u32>,
     best: Option<(f64, f64)>,
+    camera: super::capture::CameraSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,6 +137,7 @@ impl Core {
             from_sequence,
             filter_slot: filter_slot.or(self.state.focus.filter_slot),
             best: None,
+            camera: self.camera_snapshot(),
         });
         self.focus_status = AutofocusStatus {
             running: true,
@@ -355,6 +357,7 @@ impl Core {
         let Some(job) = self.focus_job.take() else {
             return;
         };
+        self.camera_restore(&job.camera);
         self.log(None, message.clone(), if ok { LogLevel::Info } else { LogLevel::Error });
         self.focus_status.running = false;
         self.focus_status.message = message;

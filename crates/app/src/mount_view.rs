@@ -70,7 +70,8 @@ impl MountView {
                     }
                 }
                 Some(false) => {
-                    if ui.button("Park").on_hover_text("Stops guiding and parks the mount").clicked() {
+                    let park = ui.button("Park").on_hover_text("Stops guiding and parks the mount");
+                    if park.clicked() {
                         actions.push(ToEngine::MountPark);
                     }
                 }

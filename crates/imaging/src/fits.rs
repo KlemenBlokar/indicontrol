@@ -303,7 +303,7 @@ impl Fits {
         }
         let mut header = Header::default();
         let mut end = None;
-        for (i, raw) in bytes.chunks_exact(CARD).enumerate() {
+        for (i, raw) in bytes.as_chunks::<CARD>().0.iter().enumerate() {
             if raw.starts_with(b"END") && raw[3..].iter().all(|&b| b == b' ') {
                 end = Some((i + 1) * CARD);
                 break;
@@ -367,6 +367,9 @@ fn data_len(h: &Header) -> Result<usize, FitsError> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::sample_fits;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -407,9 +410,11 @@ mod tests {
         assert!(text.contains("OBJECT  = 'M 31 ''Andromeda'''"));
 
         let parsed: Vec<Card> = bytes
-            .chunks_exact(CARD)
+            .as_chunks::<CARD>()
+            .0
+            .iter()
             .take_while(|c| !c.starts_with(b"END"))
-            .map(Card::parse)
+            .map(|c| Card::parse(c))
             .collect();
         assert_eq!(parsed, h.cards);
     }
@@ -461,5 +466,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) use tests::sample_fits;

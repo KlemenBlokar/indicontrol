@@ -414,8 +414,13 @@ impl TestUi {
     }
 
     pub async fn until(&mut self, what: &str, pred: impl Fn(&TestUi) -> bool) {
+        self.until_for(what, 10, pred).await
+    }
+
+    /// Like [`until`](Self::until) with a custom per-message timeout (seconds).
+    pub async fn until_for(&mut self, what: &str, secs: u64, pred: impl Fn(&TestUi) -> bool) {
         while !pred(self) {
-            let msg = timeout(Duration::from_secs(10), self.ws.next())
+            let msg = timeout(Duration::from_secs(secs), self.ws.next())
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for {what}; log: {:#?}", self.state.log))
                 .expect("socket closed")
