@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use protocol::guider::Calibration;
-use protocol::{FlatRecord, GuiderSettings, ImagingSettings, Roles, Sequence};
+use protocol::{FlatRecord, GuiderSettings, ImagingSettings, Roles, Sequence, SolverSettings};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +36,7 @@ pub struct PersistedState {
     pub flat_exposures: Vec<FlatRecord>,
     pub guider: GuiderSettings,
     pub guider_calibration: Option<Calibration>,
+    pub solver: SolverSettings,
 }
 
 /// `~/Pictures/indicontrol` (or `~/indicontrol` without a pictures dir).

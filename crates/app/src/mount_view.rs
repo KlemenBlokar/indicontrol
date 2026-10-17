@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 use indi_link::{format_number, parse_number};
-use protocol::{MountInfo, ToEngine, UiState};
+use protocol::{MountInfo, SolverKind, SolverSettings, ToEngine, UiState};
 
 const RED: Color32 = Color32::from_rgb(220, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
@@ -11,18 +11,23 @@ const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
 pub struct MountView {
     ra_input: String,
     dec_input: String,
+    solver_edit: SolverSettings,
 }
 
-fn hms(hours: f64) -> String {
+pub fn hms(hours: f64) -> String {
     format_number(hours.rem_euclid(24.0), "%010.6m").trim().to_owned()
 }
 
-fn dms(deg: f64) -> String {
+pub fn dms(deg: f64) -> String {
     let s = format_number(deg, "%010.6m").trim().to_owned();
     if deg >= 0.0 { format!("+{s}") } else { s }
 }
 
 impl MountView {
+    pub fn on_solver_settings(&mut self, s: &SolverSettings) {
+        self.solver_edit = s.clone();
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         let Some(m) = &state.mount else {
             ui.label(RichText::new(match &state.roles.mount {
@@ -72,10 +77,75 @@ impl MountView {
             }
         });
         ui.separator();
-        self.goto(ui, m, actions);
+        self.goto(ui, m, state, actions);
+        ui.separator();
+        solve_status(ui, state, actions);
+        self.solver_settings(ui, state, actions);
     }
 
-    fn goto(&mut self, ui: &mut egui::Ui, m: &MountInfo, actions: &mut Vec<ToEngine>) {
+    fn solver_settings(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
+        egui::CollapsingHeader::new("Plate solver settings").show(ui, |ui| {
+            let s = &mut self.solver_edit;
+            egui::Grid::new("solver").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                ui.label("Solver");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut s.kind, SolverKind::Astap, "ASTAP");
+                    ui.selectable_value(&mut s.kind, SolverKind::AstrometryNet, "astrometry.net");
+                });
+                ui.end_row();
+                match s.kind {
+                    SolverKind::Astap => {
+                        ui.label("ASTAP program");
+                        ui.text_edit_singleline(&mut s.astap_path)
+                            .on_hover_text("astap or astap_cli, with a path if it is not on PATH (on the engine's computer)");
+                    }
+                    SolverKind::AstrometryNet => {
+                        ui.label("solve-field program");
+                        ui.text_edit_singleline(&mut s.astrometry_path)
+                            .on_hover_text("Needs index files for your field of view installed");
+                    }
+                }
+                ui.end_row();
+                ui.label("Search radius");
+                ui.add(egui::DragValue::new(&mut s.search_radius).range(1.0..=180.0).suffix("°"));
+                ui.end_row();
+                ui.label("Downsample");
+                ui.add(egui::DragValue::new(&mut s.downsample).range(0..=8)).on_hover_text("0 = solver default");
+                ui.end_row();
+                ui.label("Timeout");
+                ui.add(egui::DragValue::new(&mut s.timeout).range(5.0..=600.0).suffix(" s"));
+                ui.end_row();
+                ui.label("Extra arguments");
+                ui.text_edit_singleline(&mut s.extra_args);
+                ui.end_row();
+                ui.label("Exposure");
+                ui.add(egui::DragValue::new(&mut s.exposure).range(0.01..=120.0).speed(0.1).suffix(" s"));
+                ui.end_row();
+                ui.label("Binning");
+                let mut bin = s.binning.unwrap_or(1);
+                ui.add(egui::DragValue::new(&mut bin).range(1..=4).prefix("×"));
+                s.binning = Some(bin);
+                ui.end_row();
+                ui.label("Centre within");
+                ui.add(egui::DragValue::new(&mut s.center_tolerance).range(0.1..=60.0).speed(0.1).suffix("'"));
+                ui.end_row();
+                ui.label("Max attempts");
+                ui.add(egui::DragValue::new(&mut s.center_attempts).range(1..=20));
+                ui.end_row();
+            });
+            let changed = *s != state.solver_settings;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
+                    actions.push(ToEngine::SetSolverSettings(s.clone()));
+                }
+                if ui.add_enabled(changed, egui::Button::new("Revert")).clicked() {
+                    *s = state.solver_settings.clone();
+                }
+            });
+        });
+    }
+
+    fn goto(&mut self, ui: &mut egui::Ui, m: &MountInfo, state: &UiState, actions: &mut Vec<ToEngine>) {
         ui.label(RichText::new("Go to (J2000)").strong());
         let ra = parse_number(&self.ra_input);
         let dec = parse_number(&self.dec_input);
@@ -121,9 +191,60 @@ impl MountView {
                     dec_deg: dec.expect("checked"),
                 });
             }
+            if ui
+                .add_enabled(can && !state.solve.busy, egui::Button::new("Slew & center"))
+                .on_hover_text("Slew, then plate solve, sync and re-slew until centred")
+                .clicked()
+            {
+                actions.push(ToEngine::CenterOn {
+                    ra_hours: ra.expect("checked"),
+                    dec_deg: dec.expect("checked"),
+                });
+            }
             if ui.button("Use current position").clicked() {
                 self.ra_input = hms(m.ra_j2000);
                 self.dec_input = dms(m.dec_j2000);
+            }
+        });
+    }
+}
+
+fn solve_status(ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
+    let st = &state.solve;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Plate solving").strong());
+        ui.label(RichText::new(format!("({})", state.solver_settings.kind.label())).weak());
+        if st.busy {
+            ui.add(egui::Spinner::new());
+            if ui.button("Abort").clicked() {
+                actions.push(ToEngine::AbortSolve);
+            }
+        } else if ui
+            .button("Solve & sync")
+            .on_hover_text("Take a frame with the main camera, solve it and sync the mount")
+            .clicked()
+        {
+            actions.push(ToEngine::SolveAndSync);
+        }
+    });
+    if !st.message.is_empty() {
+        ui.label(&st.message);
+    }
+    if let Some(r) = &st.last {
+        egui::Grid::new("solution").num_columns(2).show(ui, |ui| {
+            ui.label("Centre (J2000)");
+            ui.label(RichText::new(format!("{}  {}", hms(r.ra_hours), dms(r.dec_deg))).monospace());
+            ui.end_row();
+            ui.label("Scale");
+            ui.label(format!("{:.2}\"/px, field {:.2}° × {:.2}°", r.pixel_scale, r.width_deg, r.height_deg));
+            ui.end_row();
+            ui.label("Rotation");
+            ui.label(format!("{:.1}°{}", r.rotation, if r.mirrored { " (mirrored)" } else { "" }));
+            ui.end_row();
+            if let Some(e) = r.pointing_error {
+                ui.label("Mount error");
+                ui.label(format!("{e:.1}'"));
+                ui.end_row();
             }
         });
     }

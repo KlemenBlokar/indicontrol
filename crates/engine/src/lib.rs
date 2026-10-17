@@ -8,6 +8,7 @@ mod core;
 mod frame;
 mod metadata;
 mod server;
+pub mod solver;
 mod state;
 
 use std::net::SocketAddr;

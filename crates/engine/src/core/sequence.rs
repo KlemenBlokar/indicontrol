@@ -49,6 +49,8 @@ enum Wait {
     Settle,
     /// Waiting for the target to reach the flip point.
     Meridian,
+    /// Slewing to and centring the target before the first frame.
+    CenterStart { restart_guiding: bool },
     Flip {
         phase: FlipPhase,
         restart_guiding: bool,
@@ -59,6 +61,8 @@ enum Wait {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FlipPhase {
     Slewing { seen_busy: bool },
+    /// Re-centring the target by plate solving (the slew that flips).
+    Centering,
     GuideSettle,
 }
 
@@ -100,6 +104,18 @@ impl Core {
             lights_since_dither: 0,
         });
         self.log(None, format!("{name} started"), LogLevel::Info);
+        let run = self.run.as_ref().expect("just created");
+        if let (Some(t), true) = (run.seq.target, run.seq.center_on_start) {
+            let restart_guiding = self.guider_is_guiding();
+            self.run.as_mut().expect("created").wait = Wait::CenterStart { restart_guiding };
+            if let Err(e) = self.start_solve(Some((t.ra_hours, t.dec_deg)), true) {
+                self.run = None;
+                self.send_sequence();
+                return Err(format!("could not centre the target: {e}"));
+            }
+            self.set_sequence_message("Centring the target");
+            return Ok(());
+        }
         self.sequence_next();
         Ok(())
     }
@@ -132,6 +148,7 @@ impl Core {
 
     pub(super) fn abort_sequence(&mut self) {
         if self.run.take().is_some() {
+            self.abort_solve();
             self.abort_capture();
             self.log(None, "Sequence aborted", LogLevel::Warning);
             self.send_sequence();
@@ -225,7 +242,7 @@ impl Core {
             )
         };
         self.send_sequence();
-        if let Err(e) = self.start_capture(req, true) {
+        if let Err(e) = self.start_capture(req, super::capture::Purpose::Sequence) {
             self.sequence_failed(e);
         }
     }
@@ -404,15 +421,32 @@ impl Core {
             LogLevel::Info,
         );
         let run = self.run.as_mut().expect("running");
+        let target = run.seq.target;
+        let center = run.seq.center_after_flip && target.is_some();
         run.wait = Wait::Flip {
-            phase: FlipPhase::Slewing { seen_busy: false },
+            phase: if center {
+                FlipPhase::Centering
+            } else {
+                FlipPhase::Slewing { seen_busy: false }
+            },
             restart_guiding,
             pier_before: m.pier_side.clone(),
         };
-        run.message = "Meridian flip: slewing".into();
+        run.message = if center {
+            "Meridian flip: slewing and centring".into()
+        } else {
+            "Meridian flip: slewing".into()
+        };
         let (id, tx) = (run.id, self.tx.clone());
         self.guider_stop();
-        if let Err(e) = self.mount_goto(m.ra_j2000, m.dec_j2000) {
+        // Slewing to the target (or the current position) makes a GEM flip.
+        let (ra, dec) = target.map_or((m.ra_j2000, m.dec_j2000), |t| (t.ra_hours, t.dec_deg));
+        let started = if center {
+            self.start_solve(Some((ra, dec)), true)
+        } else {
+            self.mount_goto(ra, dec)
+        };
+        if let Err(e) = started {
             return self.sequence_failed(format!("meridian flip failed: {e}"));
         }
         tokio::spawn(async move {
@@ -466,6 +500,51 @@ impl Core {
         }
         self.log(None, "Meridian flip complete", LogLevel::Info);
         self.sequence_next();
+    }
+
+    /// Plate-solve centring requested by the sequencer finished.
+    pub(super) fn sequence_center_done(&mut self, ok: bool) {
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        match run.wait.clone() {
+            Wait::CenterStart { restart_guiding } => {
+                if !ok {
+                    return self.sequence_failed("could not centre the target".into());
+                }
+                run.wait = Wait::None;
+                if restart_guiding {
+                    match self.guider_restart_after_flip() {
+                        Ok(()) => {
+                            let run = self.run.as_mut().expect("running");
+                            run.wait = Wait::Settle;
+                            run.message = "Restarting guiding".into();
+                            self.send_sequence();
+                            return;
+                        }
+                        Err(e) => self.log(None, format!("Could not restart guiding: {e}"), LogLevel::Warning),
+                    }
+                }
+                self.sequence_next();
+            }
+            Wait::Flip {
+                phase: FlipPhase::Centering,
+                ..
+            } => {
+                if !ok {
+                    self.log(None, "Re-centring after the flip failed — continuing", LogLevel::Warning);
+                }
+                self.flip_slew_done();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_sequence_message(&mut self, message: &str) {
+        if let Some(run) = &mut self.run {
+            run.message = message.into();
+        }
+        self.send_sequence();
     }
 
     pub(super) fn sequence_flipping(&self) -> bool {

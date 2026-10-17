@@ -124,6 +124,21 @@ to the same position so the mount changes pier side, restarts guiding with
 the flipped calibration, waits for it to settle and continues. A manual slew
 while guiding stops the guider.
 
+## Plate solving
+
+Plate solving uses an external solver on the engine's computer, chosen in
+the Mount tab: **ASTAP** (`astap` / `astap_cli`, fast, needs its star
+database) or **astrometry.net** (`solve-field`, needs index files for your
+field of view). The mount position and the pixel scale (from the camera
+pixel size and focal length) are passed as hints.
+
+- **Solve & sync** takes a frame with the main camera, solves it and syncs
+  the mount.
+- **Slew & center** slews, solves, syncs and slews again until the target
+  is within the tolerance (default 1′).
+- Sequences can have a target, centred before the first frame and again
+  after a meridian flip.
+
 ## Web UI
 
 Build the wasm UI with [trunk](https://trunkrs.dev) (needs the

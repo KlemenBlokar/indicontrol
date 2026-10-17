@@ -25,17 +25,29 @@ pub(crate) struct Job {
     ctx: Option<FrameContext>,
     /// Last broadcast remaining time, to throttle progress updates.
     last_remaining: f64,
-    /// Started by the sequencer, which is told about the outcome.
-    from_sequence: bool,
+    purpose: Purpose,
+}
+
+/// Who started a capture and wants to hear about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    User,
+    /// The sequencer is told about the outcome.
+    Sequence,
+    /// The raw frame also goes to the plate solver.
+    Solve,
 }
 
 impl Core {
-    pub(super) fn start_capture(&mut self, req: CaptureRequest, from_sequence: bool) -> Result<(), String> {
+    pub(super) fn start_capture(&mut self, req: CaptureRequest, purpose: Purpose) -> Result<(), String> {
         if self.job.is_some() {
             return Err("a capture is already running".into());
         }
-        if !from_sequence && self.run.is_some() {
+        if purpose == Purpose::User && self.run.is_some() {
             return Err("a sequence is running".into());
+        }
+        if purpose == Purpose::User && self.solving() {
+            return Err("plate solving is in progress".into());
         }
         if !(req.exposure >= 0.0 && req.exposure.is_finite()) {
             return Err("invalid exposure time".into());
@@ -111,7 +123,7 @@ impl Core {
             frames: 0,
             ctx: None,
             last_remaining: f64::INFINITY,
-            from_sequence,
+            purpose,
         });
         if needs_filter_change {
             self.set_capture_state(CaptureState::Preparing {
@@ -210,6 +222,12 @@ impl Core {
         let Some(ctx) = job.ctx.take() else {
             return;
         };
+        if job.purpose == Purpose::Solve {
+            self.solve_frame(blob.clone());
+        }
+        let Some(job) = &mut self.job else {
+            return;
+        };
         self.next_frame_id += 1;
         let input = ProcessInput {
             frame_id: self.next_frame_id,
@@ -259,7 +277,7 @@ impl Core {
                         self.fail_capture(e);
                     }
                 } else {
-                    let from_sequence = job.from_sequence;
+                    let from_sequence = job.purpose == Purpose::Sequence;
                     self.finish_capture();
                     if from_sequence {
                         self.sequence_frame_done(brightest);
@@ -319,11 +337,13 @@ impl Core {
 
     pub(super) fn fail_capture(&mut self, reason: String) {
         if let Some(job) = &self.job {
-            let from_sequence = job.from_sequence;
+            let purpose = job.purpose;
             self.log(None, format!("Capture failed: {reason}"), LogLevel::Error);
             self.finish_capture();
-            if from_sequence {
-                self.sequence_failed(reason);
+            match purpose {
+                Purpose::Sequence => self.sequence_failed(reason),
+                Purpose::Solve => self.solve_failed(reason),
+                Purpose::User => {}
             }
         }
     }

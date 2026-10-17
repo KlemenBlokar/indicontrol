@@ -246,6 +246,7 @@ impl App {
                 }
                 ToUi::ImagingSettings(s) => self.imaging.on_settings(s),
                 ToUi::GuiderSettings(s) => self.guider.on_settings(s),
+                ToUi::SolverSettings(s) => self.mount.on_solver_settings(s),
                 _ => {}
             }
             self.state.apply(msg);

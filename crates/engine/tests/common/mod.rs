@@ -24,6 +24,11 @@ pub const RATE: f64 = 20_000.0;
 
 /// Background 1000 + RATE·exposure ADU with mild noise, a few black and saturated pixels.
 pub fn test_frame(exposure: f64) -> Vec<u8> {
+    test_frame_with(exposure, &[])
+}
+
+/// [`test_frame`] with extra header cards.
+pub fn test_frame_with(exposure: f64, extra: &[Card]) -> Vec<u8> {
     let level = (1000.0 + RATE * exposure).min(60_000.0) as u16;
     let pixels: Vec<u16> = (0..W * H)
         .map(|i| match i {
@@ -46,6 +51,9 @@ pub fn test_frame(exposure: f64) -> Vec<u8> {
     ] {
         h.set(c);
     }
+    for c in extra {
+        h.set(c.clone());
+    }
     let data = pixels
         .iter()
         .flat_map(|&p| ((p as i32 - 32768) as i16).to_be_bytes())
@@ -60,7 +68,7 @@ const DEFS: &str = r#"
 <defSwitchVector device="Cam" name="CCD_FRAME_TYPE" group="Main" state="Idle" perm="rw" rule="OneOfMany"><defSwitch name="FRAME_LIGHT">On</defSwitch><defSwitch name="FRAME_DARK">Off</defSwitch></defSwitchVector>
 <defNumberVector device="Cam" name="CCD_GAIN" group="Main" state="Idle" perm="rw"><defNumber name="GAIN" format="%.0f" min="0" max="500" step="1">0</defNumber></defNumberVector>
 <defNumberVector device="Cam" name="CCD_TEMPERATURE" group="Main" state="Ok" perm="rw"><defNumber name="CCD_TEMPERATURE_VALUE" format="%.2f" min="-50" max="50" step="1">@TEMP@</defNumber></defNumberVector>
-<defNumberVector device="Cam" name="CCD_INFO" group="Info" state="Ok" perm="ro"><defNumber name="CCD_BITSPERPIXEL" format="%.0f" min="8" max="16" step="1">16</defNumber></defNumberVector>
+<defNumberVector device="Cam" name="CCD_INFO" group="Info" state="Ok" perm="ro"><defNumber name="CCD_BITSPERPIXEL" format="%.0f" min="8" max="16" step="1">16</defNumber><defNumber name="CCD_PIXEL_SIZE" format="%.2f" min="0" max="50" step="0">3.76</defNumber></defNumberVector>
 <defBLOBVector device="Cam" name="CCD1" group="Image" state="Idle" perm="ro"><defBLOB name="CCD1"/></defBLOBVector>
 <defSwitchVector device="Scope" name="CONNECTION" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="CONNECT">On</defSwitch><defSwitch name="DISCONNECT">Off</defSwitch></defSwitchVector>
 <defNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" group="Main" state="Ok" perm="rw"><defNumber name="RA" format="%010.6m" min="0" max="24" step="0">@RA@</defNumber><defNumber name="DEC" format="%010.6m" min="-90" max="90" step="0">-5.39</defNumber></defNumberVector>
@@ -76,7 +84,8 @@ const DEFS: &str = r#"
 <defBLOBVector device="GuideCam" name="CCD1" group="Image" state="Idle" perm="ro"><defBLOB name="CCD1"/></defBLOBVector>
 <defNumberVector device="Scope" name="TELESCOPE_TIMED_GUIDE_NS" group="Guide" state="Idle" perm="rw"><defNumber name="TIMED_GUIDE_N" format="%.0f" min="0" max="60000" step="1">0</defNumber><defNumber name="TIMED_GUIDE_S" format="%.0f" min="0" max="60000" step="1">0</defNumber></defNumberVector>
 <defNumberVector device="Scope" name="TELESCOPE_TIMED_GUIDE_WE" group="Guide" state="Idle" perm="rw"><defNumber name="TIMED_GUIDE_W" format="%.0f" min="0" max="60000" step="1">0</defNumber><defNumber name="TIMED_GUIDE_E" format="%.0f" min="0" max="60000" step="1">0</defNumber></defNumberVector>
-<defNumberVector device="Scope" name="TELESCOPE_INFO" group="Info" state="Ok" perm="rw"><defNumber name="GUIDER_FOCAL_LENGTH" format="%g" min="0" max="10000" step="0">240</defNumber></defNumberVector>
+<defNumberVector device="Scope" name="TELESCOPE_INFO" group="Info" state="Ok" perm="rw"><defNumber name="GUIDER_FOCAL_LENGTH" format="%g" min="0" max="10000" step="0">240</defNumber><defNumber name="TELESCOPE_FOCAL_LENGTH" format="%g" min="0" max="10000" step="0">500</defNumber></defNumberVector>
+<defSwitchVector device="Scope" name="ON_COORD_SET" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="TRACK">On</defSwitch><defSwitch name="SLEW">Off</defSwitch><defSwitch name="SYNC">Off</defSwitch></defSwitchVector>
 "#;
 
 /// Guide camera rotation relative to the mount axes, and pulse response.
@@ -85,6 +94,58 @@ pub const GUIDE_RATE: f64 = 0.05; // px per ms of pulse
 pub const GUIDE_DRIFT: f64 = 0.3; // px of RA drift per guide exposure
 const GW: usize = 160;
 const GH: usize = 120;
+
+/// Initial pointing error of the fake mount (hours, degrees): ~18' in Dec.
+pub const POINTING_ERROR: (f64, f64) = (0.01, 0.3);
+
+/// Write fake `astap` and `solve-field` executables that "solve" frames by
+/// reading the TRUERA/TRUEDEC cards the fake camera embeds.
+pub fn fake_solvers(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let common = r#"
+hdr=$(head -c 28800 "$f" | tr -c '[:print:]' ' ')
+val() { echo "$hdr" | sed -n "s/.*$1 *= *\([-0-9.E+]*\).*/\1/p" | head -n 1; }
+ra=$(val TRUERA); dec=$(val TRUEDEC)
+"#;
+    let astap = format!(
+        r#"#!/bin/sh
+f=""
+while [ $# -gt 0 ]; do case "$1" in -f) f="$2"; shift;; esac; shift; done
+{common}
+printf 'PLTSOLVD=T
+CRPIX1=32.5
+CRPIX2=24.5
+CRVAL1=%s
+CRVAL2=%s
+CD1_1=-0.00086
+CD1_2=0
+CD2_1=0
+CD2_2=0.00086
+' "$ra" "$dec" > "${{f%.*}}.ini"
+"#
+    );
+    let anet = format!(
+        r#"#!/bin/sh
+f="$1"; shift; d=.
+while [ $# -gt 0 ]; do case "$1" in --dir) d="$2"; shift;; esac; shift; done
+{common}
+card() {{ printf '%-80s' "$1"; }}
+out="$d/$(basename "$f" .fits).wcs"
+{{ card "SIMPLE  =                    T"; card "BITPIX  =                    8"; card "NAXIS   =                    0"
+   card "CRVAL1  = $ra"; card "CRVAL2  = $dec"; card "CRPIX1  = 32.5"; card "CRPIX2  = 24.5"
+   card "CD1_1   = -0.00086"; card "CD1_2   = 0.0"; card "CD2_1   = 0.0"; card "CD2_2   = 0.00086"; card "END"
+   printf '%1920s' ''; }} > "$out"
+"#
+    );
+    let write = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    (write("astap", &astap), write("solve-field", &anet))
+}
 
 /// Site longitude of the fake mount (east positive), matching GEOGRAPHIC_COORD.
 const SITE_LONG: f64 = 14.5;
@@ -175,6 +236,10 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
     let mut defined = false;
     let mut sky = GuideSky { x: 80.0, y: 60.0, frames: 0, flipped: false };
     let ra0 = (lst_now() - hour_angle_min / 60.0).rem_euclid(24.0);
+    // Mount model: reported position + pointing error = where it really points (JNow).
+    let mut reported = (ra0, -5.39);
+    let mut error = POINTING_ERROR;
+    let mut sync_mode = false;
     loop {
         let n = match sock.read(&mut buf).await {
             Ok(0) | Err(_) => return seen,
@@ -188,9 +253,25 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
             let defs = DEFS.replace("@TEMP@", &initial_temp.to_string()).replace("@RA@", &ra0.to_string());
             sock.write_all(defs.as_bytes()).await.unwrap();
         }
+        // Handle complete messages in the order they were sent.
         const END: &str = "</newNumberVector>";
-        while let Some(i) = pending.find(END) {
-            let chunk: String = pending.drain(..i + END.len()).collect();
+        const SW_END: &str = "</newSwitchVector>";
+        loop {
+            let next_sw = pending.find(SW_END).map(|i| i + SW_END.len());
+            let next_num = pending.find(END).map(|i| i + END.len());
+            let end = match (next_sw, next_num) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => break,
+            };
+            let chunk: String = pending.drain(..end).collect();
+            if chunk.ends_with(SW_END) {
+                // Coordinate mode switches (sync vs. slew).
+                if chunk.contains(r#"name="ON_COORD_SET""#) {
+                    sync_mode = chunk.contains(r#"<oneSwitch name="SYNC">On"#);
+                }
+                continue;
+            }
             let msg = &chunk[chunk.rfind("<newNumberVector").unwrap()..];
             if msg.contains(r#"name="FILTER_SLOT""#) {
                 let slot = number_in(msg, "FILTER_SLOT_VALUE");
@@ -206,9 +287,18 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
                     let m = format!(r#"<setNumberVector device="Cam" name="CCD_TEMPERATURE" state="{state}"><oneNumber name="CCD_TEMPERATURE_VALUE">{t}</oneNumber></setNumberVector>"#);
                     sock.write_all(m.as_bytes()).await.unwrap();
                 }
+            } else if msg.contains(r#"name="EQUATORIAL_EOD_COORD""#) && sync_mode {
+                // Sync: the mount now believes it points at these coordinates.
+                let (ra, dec) = (number_in(msg, "RA"), number_in(msg, "DEC"));
+                let truth = (reported.0 + error.0, reported.1 + error.1);
+                error = (truth.0 - ra, truth.1 - dec);
+                reported = (ra, dec);
+                let m = format!(r#"<setNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" state="Ok"><oneNumber name="RA">{ra}</oneNumber><oneNumber name="DEC">{dec}</oneNumber></setNumberVector>"#);
+                sock.write_all(m.as_bytes()).await.unwrap();
             } else if msg.contains(r#"name="EQUATORIAL_EOD_COORD""#) {
                 // Goto: slew, then choose the pier side from the hour angle like a GEM.
                 let (ra, dec) = (number_in(msg, "RA"), number_in(msg, "DEC"));
+                reported = (ra, dec);
                 sock.write_all(br#"<setNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" state="Busy"><oneNumber name="RA">0</oneNumber><oneNumber name="DEC">0</oneNumber></setNumberVector>"#).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let ha = (lst_now() - ra + 12.0).rem_euclid(24.0) - 12.0;
@@ -236,7 +326,14 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
                 sock.write_all(br#"<setNumberVector device="Cam" name="CCD_EXPOSURE" state="Busy"><oneNumber name="CCD_EXPOSURE_VALUE">1</oneNumber></setNumberVector>"#).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 sock.write_all(br#"<setNumberVector device="Cam" name="CCD_EXPOSURE" state="Ok"><oneNumber name="CCD_EXPOSURE_VALUE">0</oneNumber></setNumberVector>"#).await.unwrap();
-                let frame = test_frame(exposure);
+                // Where the camera really points, J2000, for the fake solvers.
+                let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                let jd = imaging::astro::julian_day(unix);
+                let (tra, tdec) = imaging::astro::precess(reported.0 + error.0, reported.1 + error.1, jd, imaging::astro::J2000);
+                let frame = test_frame_with(
+                    exposure,
+                    &[Card::new("TRUERA", tra * 15.0, ""), Card::new("TRUEDEC", tdec, "")],
+                );
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&frame);
                 let blob = format!(
                     r#"<setBLOBVector device="Cam" name="CCD1" state="Ok"><oneBLOB name="CCD1" size="{}" format=".fits">{b64}</oneBLOB></setBLOBVector>"#,

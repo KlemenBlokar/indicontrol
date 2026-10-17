@@ -160,6 +160,7 @@ impl Core {
             && self.mount_info().is_some_and(|m| m.slewing)
             && self.guider_is_guiding()
             && !self.sequence_flipping()
+            && !self.solving()
         {
             self.guider_stop();
             self.log(None, "Mount is slewing — guiding stopped", LogLevel::Warning);

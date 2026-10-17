@@ -57,14 +57,23 @@ pub struct SequenceView {
     pub draft: SequenceDraft,
     library_pick: Option<String>,
     feedback: Option<(String, bool)>,
+    target_ra: String,
+    target_dec: String,
 }
 
 impl SequenceView {
     pub fn new(draft: SequenceDraft) -> Self {
+        let (target_ra, target_dec) = draft
+            .sequence
+            .target
+            .map(|t| (crate::mount_view::hms(t.ra_hours), crate::mount_view::dms(t.dec_deg)))
+            .unwrap_or_default();
         Self {
             draft,
             library_pick: None,
             feedback: None,
+            target_ra,
+            target_dec,
         }
     }
 
@@ -92,6 +101,7 @@ impl SequenceView {
                     self.library(ui, state, actions);
                     ui.separator();
                     self.editor(ui, &filters);
+                    self.target(ui, state);
                     ui.separator();
                     self.presets(ui, &filters);
                 });
@@ -168,6 +178,12 @@ impl SequenceView {
                 .and_then(|p| state.library.iter().find(|s| &s.name == p));
             if ui.add_enabled(picked.is_some(), egui::Button::new("Load")).clicked() {
                 self.draft.sequence = picked.cloned().expect("enabled only when picked");
+                (self.target_ra, self.target_dec) = self
+                    .draft
+                    .sequence
+                    .target
+                    .map(|t| (crate::mount_view::hms(t.ra_hours), crate::mount_view::dms(t.dec_deg)))
+                    .unwrap_or_default();
             }
             if ui.add_enabled(picked.is_some(), egui::Button::new("Delete")).clicked() {
                 actions.push(ToEngine::DeleteSequence {
@@ -297,6 +313,38 @@ impl SequenceView {
                 seq.steps.clear();
             }
             ui.label(RichText::new(plan_summary(seq)).weak());
+        });
+    }
+
+    fn target(&mut self, ui: &mut egui::Ui, state: &UiState) {
+        let seq = &mut self.draft.sequence;
+        ui.horizontal(|ui| {
+            ui.label("Target (J2000)");
+            ui.add(egui::TextEdit::singleline(&mut self.target_ra).hint_text("RA 05:35:17").desired_width(90.0));
+            ui.add(egui::TextEdit::singleline(&mut self.target_dec).hint_text("Dec -05:23:28").desired_width(90.0));
+            if let Some(m) = &state.mount
+                && ui.small_button("From mount").clicked()
+            {
+                self.target_ra = crate::mount_view::hms(m.ra_j2000);
+                self.target_dec = crate::mount_view::dms(m.dec_j2000);
+            }
+            if ui.small_button("Clear").clicked() {
+                self.target_ra.clear();
+                self.target_dec.clear();
+            }
+        });
+        let ra = indi_link::parse_number(&self.target_ra).filter(|r| (0.0..24.0).contains(r));
+        let dec = indi_link::parse_number(&self.target_dec).filter(|d| (-90.0..=90.0).contains(d));
+        seq.target = ra.zip(dec).map(|(ra_hours, dec_deg)| protocol::Target { ra_hours, dec_deg });
+        let has_input = !self.target_ra.is_empty() || !self.target_dec.is_empty();
+        if has_input && seq.target.is_none() {
+            ui.colored_label(ORANGE, "Enter RA (h:m:s) and Dec (d:m:s) to use a target.");
+        }
+        ui.add_enabled_ui(seq.target.is_some(), |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut seq.center_on_start, "Slew & centre at start");
+                ui.checkbox(&mut seq.center_after_flip, "Re-centre after meridian flip");
+            });
         });
     }
 

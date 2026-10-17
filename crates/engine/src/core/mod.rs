@@ -5,6 +5,7 @@ mod capture;
 mod guider;
 mod mount;
 mod sequence;
+mod solve;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -45,6 +46,15 @@ pub(crate) enum CoreMsg {
     GuideTimeout { seq: u64 },
     SequenceRecheck { run_id: u64 },
     FlipTimeout { run_id: u64 },
+    SolveDone {
+        id: u64,
+        result: Box<Result<protocol::SolveResult, String>>,
+    },
+    SolveTimer {
+        id: u64,
+        epoch: u64,
+        timer: solve::SolveTimer,
+    },
 }
 
 /// A message to UIs: JSON text or a binary image preview.
@@ -87,6 +97,9 @@ pub(crate) struct Core {
     run: Option<sequence::Run>,
     next_run_id: u64,
     guider: guider::GuiderCore,
+    solve_job: Option<solve::SolveJob>,
+    next_solve_id: u64,
+    solve_status: protocol::SolveStatus,
 }
 
 impl Core {
@@ -112,6 +125,9 @@ impl Core {
             run: None,
             next_run_id: 0,
             guider: Default::default(),
+            solve_job: None,
+            next_solve_id: 0,
+            solve_status: Default::default(),
         };
         (core, tx)
     }
@@ -171,6 +187,8 @@ impl Core {
             CoreMsg::GuideTimeout { seq } => self.guider_timeout(seq),
             CoreMsg::SequenceRecheck { run_id } => self.sequence_recheck(run_id),
             CoreMsg::FlipTimeout { run_id } => self.flip_timeout(run_id),
+            CoreMsg::SolveDone { id, result } => self.solve_done(id, *result),
+            CoreMsg::SolveTimer { id, epoch, timer } => self.solve_on_timer(id, epoch, timer),
             CoreMsg::Retry { attempt } => {
                 if attempt == self.attempt && self.state.indi.autoconnect && self.client.is_none() {
                     self.connect();
@@ -224,7 +242,7 @@ impl Core {
                 Ok(())
             }
             ToEngine::Capture(req) => {
-                if let Err(e) = self.start_capture(req, false) {
+                if let Err(e) = self.start_capture(req, capture::Purpose::User) {
                     self.log(None, format!("Cannot capture: {e}"), LogLevel::Error);
                 }
                 Ok(())
@@ -287,6 +305,20 @@ impl Core {
             ToEngine::MountUnpark => self.mount_result(|c| c.mount_park(false)),
             ToEngine::MountAbort => self.mount_result(|c| c.mount_abort()),
             ToEngine::MountTracking { on } => self.mount_result(|c| c.mount_tracking(on)),
+            ToEngine::SolveAndSync => self.solve_result(|c| c.start_solve(None, false)),
+            ToEngine::CenterOn { ra_hours, dec_deg } => {
+                self.solve_result(|c| c.start_solve(Some((ra_hours, dec_deg)), false))
+            }
+            ToEngine::AbortSolve => {
+                self.abort_solve();
+                Ok(())
+            }
+            ToEngine::SetSolverSettings(settings) => {
+                self.state.solver = settings.clone();
+                self.save();
+                self.send(ToUi::SolverSettings(settings));
+                Ok(())
+            }
             ToEngine::GuiderClearCalibration => {
                 self.state.guider_calibration = None;
                 self.save();
@@ -359,6 +391,7 @@ impl Core {
                 }
                 self.capture_on_update(&device, &name);
                 self.mount_on_update(&device, &name);
+                self.solve_on_update(&device, &name);
                 self.sequence_on_update(&device, &name);
             }
             Event::Deleted { device, name } => self.send(ToUi::PropertyDeleted { device, name }),
@@ -423,6 +456,13 @@ impl Core {
         });
     }
 
+    fn solve_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
+        if let Err(e) = f(self) {
+            self.log(None, format!("Plate solving: {e}"), LogLevel::Error);
+        }
+        Ok(())
+    }
+
     fn mount_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
         if let Err(e) = f(self) {
             self.log(None, format!("Mount: {e}"), LogLevel::Error);
@@ -475,6 +515,8 @@ impl Core {
             ToUi::GuiderSettings(self.state.guider.clone()),
             self.guider_msg(),
             self.mount_msg(),
+            ToUi::SolverSettings(self.state.solver.clone()),
+            self.solve_msg(),
         ]
         .iter()
         .map(Outgoing::text)

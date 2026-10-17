@@ -14,10 +14,12 @@ pub mod equipment;
 pub mod guider;
 pub mod mount;
 pub mod sequence;
+pub mod solver;
 
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
 pub use mount::MountInfo;
+pub use solver::{SolveResult, SolveStatus, SolverKind, SolverSettings, Target};
 pub use sequence::{
     Exposure, FlatRecord, RunState, Sequence, SequenceOrder, SequenceStatus, SequenceStep,
 };
@@ -290,6 +292,8 @@ pub enum ToUi {
     GuideStep(GuideStep),
     GuiderSettings(GuiderSettings),
     Mount { info: Option<Box<MountInfo>> },
+    Solve { status: SolveStatus },
+    SolverSettings(SolverSettings),
 }
 
 /// UI → engine.
@@ -352,6 +356,12 @@ pub enum ToEngine {
     MountUnpark,
     MountAbort,
     MountTracking { on: bool },
+    /// Take a frame, plate solve it and sync the mount.
+    SolveAndSync,
+    /// Slew to J2000 coordinates, then solve/sync/re-slew until centred.
+    CenterOn { ra_hours: f64, dec_deg: f64 },
+    AbortSolve,
+    SetSolverSettings(SolverSettings),
 }
 
 macro_rules! json_codec {
@@ -393,6 +403,8 @@ pub struct UiState {
     /// Recent guide steps, oldest first.
     pub guide_history: VecDeque<GuideStep>,
     pub mount: Option<MountInfo>,
+    pub solve: SolveStatus,
+    pub solver_settings: SolverSettings,
 }
 
 impl Default for UiState {
@@ -416,6 +428,8 @@ impl Default for UiState {
             guider_settings: GuiderSettings::default(),
             guide_history: VecDeque::new(),
             mount: None,
+            solve: SolveStatus::default(),
+            solver_settings: SolverSettings::default(),
         }
     }
 }
@@ -483,6 +497,8 @@ impl UiState {
             }
             ToUi::GuiderSettings(s) => self.guider_settings = s,
             ToUi::Mount { info } => self.mount = info.map(|i| *i),
+            ToUi::Solve { status } => self.solve = status,
+            ToUi::SolverSettings(s) => self.solver_settings = s,
         }
     }
 
@@ -630,6 +646,7 @@ mod tests {
             }),
             ToUi::GuiderSettings(GuiderSettings::default()),
             ToUi::Mount { info: None },
+            ToUi::Solve { status: SolveStatus::default() },
         ] {
             assert_eq!(ToUi::from_json(&m.to_json()).unwrap(), m);
         }
@@ -644,6 +661,8 @@ mod tests {
             ToEngine::GuiderDither,
             ToEngine::MountGoto { ra_hours: 5.5, dec_deg: -5.4 },
             ToEngine::MountTracking { on: false },
+            ToEngine::CenterOn { ra_hours: 5.5, dec_deg: -5.4 },
+            ToEngine::SetSolverSettings(SolverSettings::default()),
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);

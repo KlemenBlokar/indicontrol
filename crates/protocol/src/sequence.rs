@@ -95,6 +95,12 @@ pub struct Sequence {
     pub meridian_flip: bool,
     /// Minutes past the meridian at which to flip.
     pub flip_minutes_past: f64,
+    /// Target to slew to and centre (plate solving).
+    pub target: Option<crate::Target>,
+    /// Slew to and centre the target before the first frame.
+    pub center_on_start: bool,
+    /// Re-centre the target after a meridian flip.
+    pub center_after_flip: bool,
 }
 
 impl Default for Sequence {
@@ -107,6 +113,9 @@ impl Default for Sequence {
             dither_every: 3,
             meridian_flip: true,
             flip_minutes_past: 5.0,
+            target: None,
+            center_on_start: true,
+            center_after_flip: true,
         }
     }
 }
