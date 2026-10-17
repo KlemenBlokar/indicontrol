@@ -5,7 +5,8 @@ use indexmap::IndexMap;
 use crate::parser::{IndiMessage, SetValue};
 use crate::types::*;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Device {
     pub name: String,
     pub properties: IndexMap<String, Property>,
@@ -53,7 +54,8 @@ pub enum Change {
     None,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cache {
     pub devices: IndexMap<String, Device>,
 }

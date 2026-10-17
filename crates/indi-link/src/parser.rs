@@ -303,6 +303,7 @@ fn convert_def(node: Node, kind: PropertyKind) -> Result<IndiMessage, ParseError
             ),
             PropertyKind::Blob => ElementValue::Blob(BlobValue {
                 format: String::new(),
+                size: 0,
                 data: Arc::new(Vec::new()),
             }),
         };
@@ -383,6 +384,7 @@ fn convert_set(node: Node, kind: PropertyKind) -> Result<IndiMessage, ParseError
                 })?;
                 SetValue::Blob(BlobValue {
                     format: format.strip_suffix(".z").unwrap_or(&format).to_owned(),
+                    size: data.len(),
                     data: Arc::new(data),
                 })
             }

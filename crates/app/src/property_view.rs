@@ -1,7 +1,7 @@
 //! Generic INDI property editor widgets.
 //!
-//! Widgets never talk to the client directly; they push [`Action`]s which the
-//! app executes after the cache lock has been released.
+//! Widgets never talk to the engine directly; they push [`ToEngine`] commands
+//! which the app sends after drawing.
 
 use std::collections::HashMap;
 
@@ -9,27 +9,7 @@ use eframe::egui::{self, Color32, RichText};
 use indi_link::{
     ElementValue, Property, PropertyKind, PropertyState, SwitchRule, format_number, parse_number,
 };
-
-#[derive(Debug, Clone)]
-pub enum Action {
-    ConnectDevice(String),
-    DisconnectDevice(String),
-    Text {
-        device: String,
-        name: String,
-        values: Vec<(String, String)>,
-    },
-    Number {
-        device: String,
-        name: String,
-        values: Vec<(String, f64)>,
-    },
-    Switch {
-        device: String,
-        name: String,
-        values: Vec<(String, bool)>,
-    },
-}
+use protocol::ToEngine;
 
 /// Pending user input for text/number elements, keyed by (device, property, element).
 #[derive(Default)]
@@ -71,7 +51,7 @@ pub fn state_dot(ui: &mut egui::Ui, state: PropertyState) -> egui::Response {
     response.on_hover_text(state.to_string())
 }
 
-pub fn show_property(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &mut Vec<Action>) {
+pub fn show_property(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &mut Vec<ToEngine>) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -98,7 +78,7 @@ pub fn show_property(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions
     });
 }
 
-fn show_editable(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &mut Vec<Action>) {
+fn show_editable(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &mut Vec<ToEngine>) {
     let writable = p.perm.writable();
     let mut submit = false;
     let mut invalid = false;
@@ -171,7 +151,7 @@ fn show_editable(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &m
                     _ => None,
                 })
                 .collect();
-            actions.push(Action::Text {
+            actions.push(ToEngine::SetText {
                 device,
                 name,
                 values,
@@ -192,7 +172,7 @@ fn show_editable(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &m
                     _ => None,
                 })
                 .collect();
-            actions.push(Action::Number {
+            actions.push(ToEngine::SetNumber {
                 device,
                 name,
                 values,
@@ -203,7 +183,7 @@ fn show_editable(ui: &mut egui::Ui, p: &Property, edits: &mut Edits, actions: &m
     edits.clear(p);
 }
 
-fn show_switches(ui: &mut egui::Ui, p: &Property, actions: &mut Vec<Action>) {
+fn show_switches(ui: &mut egui::Ui, p: &Property, actions: &mut Vec<ToEngine>) {
     let writable = p.perm.writable();
     ui.horizontal_wrapped(|ui| {
         for el in &p.elements {
@@ -232,7 +212,7 @@ fn show_switches(ui: &mut egui::Ui, p: &Property, actions: &mut Vec<Action>) {
                 SwitchRule::OneOfMany => vec![(el.name.clone(), true)],
                 SwitchRule::AtMostOne | SwitchRule::AnyOfMany => vec![(el.name.clone(), !on)],
             };
-            actions.push(Action::Switch {
+            actions.push(ToEngine::SetSwitch {
                 device: p.device.clone(),
                 name: p.name.clone(),
                 values,
@@ -256,10 +236,10 @@ fn show_lights(ui: &mut egui::Ui, p: &Property) {
 fn show_blobs(ui: &mut egui::Ui, p: &Property) {
     for el in &p.elements {
         if let ElementValue::Blob(b) = &el.value {
-            let info = if b.data.is_empty() {
+            let info = if b.size == 0 {
                 "no data received".to_owned()
             } else {
-                format!("{} — {}", b.format, human_bytes(b.data.len()))
+                format!("{} — {}", b.format, human_bytes(b.size))
             };
             ui.horizontal(|ui| {
                 ui.label(&el.label).on_hover_text(&el.name);

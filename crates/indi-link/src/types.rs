@@ -3,6 +3,7 @@
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PropertyKind {
     Text,
     Number,
@@ -36,6 +37,7 @@ impl PropertyKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PropertyState {
     #[default]
     Idle,
@@ -68,6 +70,7 @@ impl fmt::Display for PropertyState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Permission {
     ReadOnly,
     WriteOnly,
@@ -91,6 +94,7 @@ impl Permission {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SwitchRule {
     #[default]
     OneOfMany,
@@ -110,6 +114,7 @@ impl SwitchRule {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NumberValue {
     pub value: f64,
     pub min: f64,
@@ -120,14 +125,20 @@ pub struct NumberValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlobValue {
     /// e.g. ".fits", ".fits.z" (zlib-compressed), ".stream".
     pub format: String,
+    /// Payload size in bytes (kept when `data` is not transferred).
+    pub size: usize,
     /// Decoded (and decompressed, if `.z`) payload. Empty until a BLOB arrives.
+    /// Never serialized: images travel separately from property state.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub data: std::sync::Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ElementValue {
     Text(String),
     Number(NumberValue),
@@ -137,6 +148,7 @@ pub enum ElementValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Element {
     pub name: String,
     pub label: String,
@@ -144,6 +156,7 @@ pub struct Element {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Property {
     pub device: String,
     pub name: String,

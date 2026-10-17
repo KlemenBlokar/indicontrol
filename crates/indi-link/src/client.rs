@@ -19,8 +19,6 @@ use crate::cache::{Cache, Change};
 use crate::parser::{IndiMessage, Parser, SetValue};
 use crate::types::PropertyKind;
 
-pub const DEFAULT_PORT: u16 = 7624;
-
 /// Notifications emitted by the client. The current property values are
 /// always available from [`Client::cache`]; events only say what changed.
 #[derive(Debug, Clone)]

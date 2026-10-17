@@ -1,299 +1,361 @@
-//! Main window: connection bar, equipment roles, device browser, property editor, log.
+//! Main window: engine/INDI connection bar, equipment roles, device browser,
+//! property editor, log. All state comes from the engine over [`EngineLink`].
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, RichText};
-use indi_link::{Cache, Client, ClientError, Device, Event, IndexMap, interface};
-use tokio::sync::mpsc::UnboundedReceiver;
+use indi_link::{Device, IndexMap, PropertyState, interface};
+use protocol::{IndiStatus, LogEntry, LogLevel, Roles, ToEngine, ToUi, UiState};
+use serde::{Deserialize, Serialize};
 
-use crate::property_view::{self, Action, Edits, human_bytes};
-use crate::settings::Settings;
+use crate::link::{EngineLink, LinkState};
+use crate::property_view::{self, Edits};
 
-const MAX_LOG: usize = 5000;
-
-type ConnectResult = Result<(Client, UnboundedReceiver<Event>), ClientError>;
-
-enum Connection {
-    Disconnected,
-    Connecting(std_mpsc::Receiver<ConnectResult>),
-    Connected {
-        client: Client,
-        events: UnboundedReceiver<Event>,
-    },
+/// Which engine the UI talks to (native builds only; the web UI always uses
+/// the engine that served it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EngineChoice {
+    /// Engine embedded in this process.
+    Local,
+    /// `host[:port]` or `ws://` URL of a standalone engine.
+    Remote(String),
 }
 
-struct LogEntry {
-    time: String,
-    device: Option<String>,
-    text: String,
-    error: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct UiSettings {
+    night_mode: bool,
+    engine: EngineChoice,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            night_mode: false,
+            engine: EngineChoice::Local,
+        }
+    }
+}
+
+/// Startup options from the command line.
+#[derive(Debug, Default)]
+pub struct StartOptions {
+    pub engine: Option<EngineChoice>,
+    /// INDI server for the embedded engine to connect to on start.
+    pub local_indi: Option<(String, u16)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LocalEngine {
+    runtime: tokio::runtime::Runtime,
+    handle: Option<engine::EngineHandle>,
+    indi: Option<(String, u16)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LocalEngine {
+    fn ws_url(&mut self) -> Result<String, String> {
+        if self.handle.is_none() {
+            let config = engine::EngineConfig {
+                listen: ([127, 0, 0, 1], 0).into(),
+                web_root: None,
+                state_file: engine::default_state_file(),
+                indi: self.indi.take(),
+            };
+            let handle = self
+                .runtime
+                .block_on(engine::start(config))
+                .map_err(|e| format!("could not start local engine: {e}"))?;
+            self.handle = Some(handle);
+        }
+        Ok(self.handle.as_ref().expect("started above").ws_url())
+    }
+
+    fn stop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.shutdown();
+        }
+    }
 }
 
 pub struct App {
-    runtime: tokio::runtime::Runtime,
-    settings: Settings,
-    connection: Connection,
-    /// Copy of the client cache, refreshed whenever the server changes something.
-    snapshot: Cache,
-    log: VecDeque<LogEntry>,
+    settings: UiSettings,
+    link: Option<EngineLink>,
+    link_error: Option<String>,
+    state: UiState,
     selected_device: Option<String>,
     selected_group: HashMap<String, String>,
     edits: Edits,
+    indi_host: String,
+    indi_port: u16,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    engine_input: String,
     applied_night_mode: Option<bool>,
-    connect_on_start: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    local: LocalEngine,
 }
 
 impl App {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        runtime: tokio::runtime::Runtime,
-        autoconnect: Option<(String, u16)>,
-    ) -> Self {
-        let mut settings: Settings = cc
+    pub fn new(cc: &eframe::CreationContext<'_>, options: StartOptions) -> Self {
+        let mut settings: UiSettings = cc
             .storage
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
-        let connect_on_start = autoconnect.is_some();
-        if let Some((host, port)) = autoconnect {
-            settings.host = host;
-            settings.port = port;
+        if let Some(engine) = options.engine {
+            settings.engine = engine;
         }
-        Self {
-            runtime,
+        let engine_input = match &settings.engine {
+            EngineChoice::Remote(addr) => addr.clone(),
+            EngineChoice::Local => String::new(),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let _ = options.local_indi;
+        let mut app = Self {
             settings,
-            connection: Connection::Disconnected,
-            snapshot: Cache::default(),
-            log: VecDeque::new(),
+            link: None,
+            link_error: None,
+            state: UiState::default(),
             selected_device: None,
             selected_group: HashMap::new(),
             edits: Edits::default(),
+            indi_host: "localhost".into(),
+            indi_port: indi_link::DEFAULT_PORT,
+            engine_input,
             applied_night_mode: None,
-            connect_on_start,
+            #[cfg(not(target_arch = "wasm32"))]
+            local: LocalEngine {
+                runtime: tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .thread_name("engine")
+                    .build()
+                    .expect("failed to start tokio runtime"),
+                handle: None,
+                indi: options.local_indi,
+            },
+        };
+        app.connect_engine(&cc.egui_ctx);
+        app
+    }
+
+    fn connect_engine(&mut self, ctx: &egui::Context) {
+        self.link = None;
+        self.state = UiState::default();
+        match self.engine_url() {
+            Ok(url) => {
+                self.link_error = None;
+                self.link = Some(EngineLink::new(url, ctx));
+            }
+            Err(e) => self.link_error = Some(e),
         }
     }
 
-    fn log(&mut self, device: Option<String>, text: impl Into<String>, error: bool) {
-        if self.log.len() >= MAX_LOG {
-            self.log.pop_front();
+    #[cfg(not(target_arch = "wasm32"))]
+    fn engine_url(&mut self) -> Result<String, String> {
+        match &self.settings.engine {
+            EngineChoice::Local => self.local.ws_url(),
+            EngineChoice::Remote(addr) => {
+                self.local.stop();
+                Ok(protocol::engine_url(addr))
+            }
         }
-        self.log.push_back(LogEntry {
-            time: chrono::Local::now().format("%H:%M:%S").to_string(),
-            device,
+    }
+
+    /// The web UI talks to the engine that served the page.
+    #[cfg(target_arch = "wasm32")]
+    fn engine_url(&mut self) -> Result<String, String> {
+        let location = web_sys::window().ok_or("no window")?.location();
+        let host = location.host().map_err(|_| "no host")?;
+        let secure = location.protocol().is_ok_and(|p| p == "https:");
+        let scheme = if secure { "wss" } else { "ws" };
+        Ok(format!("{scheme}://{host}{}", protocol::WS_PATH))
+    }
+
+    fn engine_label(&self) -> String {
+        if cfg!(target_arch = "wasm32") {
+            return "Engine".into();
+        }
+        match &self.settings.engine {
+            EngineChoice::Local => "Local engine".into(),
+            EngineChoice::Remote(_) => self
+                .link
+                .as_ref()
+                .map(|l| l.url.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn local_log(&mut self, text: impl Into<String>) {
+        self.state.push_log(LogEntry {
+            time: String::new(),
+            device: None,
             text: text.into(),
-            error,
+            level: LogLevel::Error,
         });
     }
 
-    fn start_connect(&mut self, ctx: &egui::Context) {
-        let addr = (self.settings.host.trim().to_owned(), self.settings.port);
-        let (tx, rx) = std_mpsc::channel();
-        let ctx = ctx.clone();
-        let waker_ctx = ctx.clone();
-        self.runtime.spawn(async move {
-            let waker = Arc::new(move || waker_ctx.request_repaint());
-            let _ = tx.send(Client::connect_with_waker(addr, waker).await);
-            ctx.request_repaint();
-        });
-        self.log(
-            None,
-            format!("Connecting to {}:{}…", self.settings.host, self.settings.port),
-            false,
-        );
-        self.connection = Connection::Connecting(rx);
-    }
-
-    fn disconnect(&mut self) {
-        if let Connection::Connected { client, .. } = &self.connection {
-            client.disconnect();
-            self.log(None, "Disconnected", false);
-        }
-        self.connection = Connection::Disconnected;
-        self.snapshot.clear();
-    }
-
-    fn poll_connection(&mut self) {
-        let Connection::Connecting(rx) = &self.connection else {
+    fn poll_link(&mut self) {
+        let Some(link) = &mut self.link else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok((client, events))) => {
-                self.log(
-                    None,
-                    format!("Connected to {}:{}", self.settings.host, self.settings.port),
-                    false,
-                );
-                self.connection = Connection::Connected { client, events };
+        for msg in link.poll() {
+            if let ToUi::IndiStatus { host, port, .. } = &msg {
+                self.indi_host.clone_from(host);
+                self.indi_port = *port;
             }
-            Ok(Err(e)) => {
-                self.log(None, e.to_string(), true);
-                self.connection = Connection::Disconnected;
-            }
-            Err(std_mpsc::TryRecvError::Empty) => {}
-            Err(std_mpsc::TryRecvError::Disconnected) => {
-                self.connection = Connection::Disconnected;
-            }
+            self.state.apply(msg);
         }
     }
 
-    fn poll_events(&mut self) {
-        let Connection::Connected { client, events } = &mut self.connection else {
+    fn send_all(&mut self, actions: Vec<ToEngine>) {
+        let Some(link) = &mut self.link else {
             return;
         };
-        let mut received = Vec::new();
-        while let Ok(ev) = events.try_recv() {
-            received.push(ev);
-        }
-        if received.is_empty() {
-            return;
-        }
-        self.snapshot = client.cache().clone();
-        let mut lost = None;
-        for ev in received {
-            match ev {
-                Event::Message { device, text, .. } => self.log(device, text, false),
-                Event::Blob {
-                    device,
-                    element,
-                    format,
-                    data,
-                    ..
-                } => self.log(
-                    Some(device),
-                    format!("Received {element} ({format}, {})", human_bytes(data.len())),
-                    false,
-                ),
-                Event::Disconnected(reason) => lost = Some(reason),
-                Event::Defined { .. } | Event::Updated { .. } | Event::Deleted { .. } => {}
-            }
-        }
-        if let Some(reason) = lost {
-            let text = match reason {
-                Some(r) => format!("Connection lost: {r}"),
-                None => "Server closed the connection".to_owned(),
-            };
-            self.log(None, text, true);
-            self.connection = Connection::Disconnected;
-            self.snapshot.clear();
+        if let Some(err) = actions.iter().find_map(|a| link.send(a).err()) {
+            self.local_log(err);
         }
     }
 
-    fn execute(&mut self, actions: Vec<Action>) {
-        let Connection::Connected { client, .. } = &self.connection else {
-            return;
-        };
-        let mut errors = Vec::new();
-        for action in actions {
-            let result = match &action {
-                Action::ConnectDevice(d) => client.connect_device(d),
-                Action::DisconnectDevice(d) => client.disconnect_device(d),
-                Action::Text {
-                    device,
-                    name,
-                    values,
-                } => {
-                    let v: Vec<(&str, &str)> =
-                        values.iter().map(|(e, v)| (e.as_str(), v.as_str())).collect();
-                    client.send_text(device, name, &v)
-                }
-                Action::Number {
-                    device,
-                    name,
-                    values,
-                } => {
-                    let v: Vec<(&str, f64)> = values.iter().map(|(e, v)| (e.as_str(), *v)).collect();
-                    client.send_number(device, name, &v)
-                }
-                Action::Switch {
-                    device,
-                    name,
-                    values,
-                } => {
-                    let v: Vec<(&str, bool)> = values.iter().map(|(e, v)| (e.as_str(), *v)).collect();
-                    client.send_switch(device, name, &v)
-                }
-            };
-            if let Err(e) = result {
-                errors.push(e.to_string());
-            }
-        }
-        for e in errors {
-            self.log(None, e, true);
-        }
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("indicontrol").strong());
             ui.separator();
-            let editable = matches!(self.connection, Connection::Disconnected);
-            ui.label("Server");
-            ui.add_enabled(
-                editable,
-                egui::TextEdit::singleline(&mut self.settings.host).desired_width(160.0),
-            );
-            ui.add_enabled(
-                editable,
-                egui::DragValue::new(&mut self.settings.port).range(1..=65535),
-            );
-            match &self.connection {
-                Connection::Disconnected => {
-                    if ui.button("Connect").clicked() {
-                        self.start_connect(ui.ctx());
+
+            // Engine link.
+            let (state, hover) = match self.link.as_ref().map(|l| &l.state) {
+                Some(LinkState::Open) => (PropertyState::Ok, "connected".to_owned()),
+                Some(LinkState::Connecting) => (PropertyState::Busy, "connecting…".to_owned()),
+                Some(LinkState::Closed(e)) => (PropertyState::Alert, format!("{e} — retrying")),
+                None => (
+                    PropertyState::Alert,
+                    self.link_error.clone().unwrap_or_default(),
+                ),
+            };
+            property_view::state_dot(ui, state).on_hover_text(&hover);
+            ui.label(self.engine_label()).on_hover_text(&hover);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.engine_menu(ui);
+            ui.separator();
+
+            // INDI server, as seen by the engine.
+            let usable = self.link.as_ref().is_some_and(EngineLink::is_open);
+            ui.add_enabled_ui(usable, |ui| {
+                ui.label("INDI");
+                let disconnected =
+                    matches!(self.state.indi_status, IndiStatus::Disconnected { .. });
+                ui.add_enabled(
+                    disconnected,
+                    egui::TextEdit::singleline(&mut self.indi_host).desired_width(140.0),
+                );
+                ui.add_enabled(
+                    disconnected,
+                    egui::DragValue::new(&mut self.indi_port).range(1..=65535),
+                );
+                match &self.state.indi_status {
+                    IndiStatus::Disconnected { error } => {
+                        if ui.button("Connect").clicked() {
+                            actions.push(ToEngine::ConnectIndi {
+                                host: self.indi_host.trim().to_owned(),
+                                port: self.indi_port,
+                            });
+                        }
+                        if let Some(e) = error {
+                            ui.label(RichText::new(e).color(Color32::from_rgb(220, 60, 60)));
+                        }
+                    }
+                    IndiStatus::Connecting => {
+                        ui.add(egui::Spinner::new());
+                        if ui.button("Cancel").clicked() {
+                            actions.push(ToEngine::DisconnectIndi);
+                        }
+                    }
+                    IndiStatus::Connected => {
+                        if ui.button("Disconnect").clicked() {
+                            actions.push(ToEngine::DisconnectIndi);
+                        }
+                        ui.label(
+                            RichText::new(format!("{} devices", self.state.cache.devices.len()))
+                                .weak(),
+                        );
                     }
                 }
-                Connection::Connecting(_) => {
-                    ui.add(egui::Spinner::new());
-                    ui.label("Connecting…");
-                }
-                Connection::Connected { .. } => {
-                    if ui.button("Disconnect").clicked() {
-                        self.disconnect();
-                    }
-                    ui.label(
-                        RichText::new(format!("{} devices", self.snapshot.devices.len())).weak(),
-                    );
-                }
-            }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.settings.night_mode, "Night mode");
             });
         });
     }
 
-    fn equipment_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn engine_menu(&mut self, ui: &mut egui::Ui) {
+        let mut apply = None;
+        ui.menu_button("Change…", |ui| {
+            if ui
+                .radio(
+                    self.settings.engine == EngineChoice::Local,
+                    "Local engine (inside this app)",
+                )
+                .clicked()
+            {
+                apply = Some(EngineChoice::Local);
+            }
+            ui.label("Remote engine:");
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.engine_input)
+                        .hint_text("host[:port]")
+                        .desired_width(180.0),
+                );
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let valid = !self.engine_input.trim().is_empty();
+                let clicked = ui
+                    .add_enabled(valid, egui::Button::new("Connect"))
+                    .clicked();
+                if valid && (clicked || enter) {
+                    apply = Some(EngineChoice::Remote(self.engine_input.trim().to_owned()));
+                }
+            });
+            if apply.is_some() {
+                ui.close();
+            }
+        });
+        if let Some(choice) = apply {
+            self.settings.engine = choice;
+            self.connect_engine(ui.ctx());
+        }
+    }
+
+    fn equipment_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
         ui.heading("Equipment");
+        let mut roles = self.state.roles.clone();
         egui::Grid::new("roles").num_columns(2).show(ui, |ui| {
-            let devices = &self.snapshot.devices;
-            let roles = &mut self.settings.roles;
-            for (label, slot, flag) in [
-                ("Main camera", &mut roles.main_camera, interface::CCD),
-                ("Guide camera", &mut roles.guide_camera, interface::CCD),
-                ("Mount", &mut roles.mount, interface::TELESCOPE),
-                ("Filter wheel", &mut roles.filter_wheel, interface::FILTER),
-                ("Focuser", &mut roles.focuser, interface::FOCUSER),
-            ] {
+            let devices = &self.state.cache.devices;
+            for (label, slot, flag) in role_slots(&mut roles) {
                 ui.label(label);
                 role_combo(ui, label, slot, devices, flag);
                 ui.end_row();
             }
         });
+        if roles != self.state.roles {
+            self.state.roles = roles.clone();
+            actions.push(ToEngine::SetRoles(roles));
+        }
 
         ui.separator();
         ui.heading("Devices");
-        if self.snapshot.devices.is_empty() {
+        if self.state.cache.devices.is_empty() {
             ui.label(RichText::new("No devices — connect to an INDI server.").weak());
         }
         egui::ScrollArea::vertical().id_salt("devices").show(ui, |ui| {
-            for dev in self.snapshot.devices.values() {
+            for dev in self.state.cache.devices.values() {
                 ui.horizontal(|ui| {
                     let connected = dev.is_connected();
                     property_view::state_dot(
                         ui,
                         if connected {
-                            indi_link::PropertyState::Ok
+                            PropertyState::Ok
                         } else {
-                            indi_link::PropertyState::Idle
+                            PropertyState::Idle
                         },
                     );
                     let selected = self.selected_device.as_deref() == Some(dev.name.as_str());
@@ -301,13 +363,13 @@ impl App {
                         self.selected_device = Some(dev.name.clone());
                     }
                     if dev.properties.contains_key("CONNECTION") {
-                        let (text, action) = if connected {
-                            ("Disconnect", Action::DisconnectDevice(dev.name.clone()))
-                        } else {
-                            ("Connect", Action::ConnectDevice(dev.name.clone()))
-                        };
-                        if ui.small_button(text).clicked() {
-                            actions.push(action);
+                        let device = dev.name.clone();
+                        if connected {
+                            if ui.small_button("Disconnect").clicked() {
+                                actions.push(ToEngine::DisconnectDevice { device });
+                            }
+                        } else if ui.small_button("Connect").clicked() {
+                            actions.push(ToEngine::ConnectDevice { device });
                         }
                     }
                 });
@@ -319,11 +381,20 @@ impl App {
         });
     }
 
-    fn device_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    fn device_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
+        if let Some(v) = self.state.version_mismatch {
+            ui.colored_label(
+                Color32::from_rgb(230, 160, 40),
+                format!(
+                    "Engine speaks protocol v{v}, this UI v{} — update one of them.",
+                    protocol::PROTOCOL_VERSION
+                ),
+            );
+        }
         let Some(dev) = self
             .selected_device
             .as_ref()
-            .and_then(|name| self.snapshot.devices.get(name))
+            .and_then(|name| self.state.cache.devices.get(name))
         else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Select a device to view its properties.").weak());
@@ -373,7 +444,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Log").strong());
             if ui.small_button("Clear").clicked() {
-                self.log.clear();
+                self.state.log.clear();
             }
         });
         egui::ScrollArea::vertical()
@@ -381,15 +452,17 @@ impl App {
             .stick_to_bottom(true)
             .auto_shrink(false)
             .show(ui, |ui| {
-                for entry in &self.log {
+                for entry in &self.state.log {
                     let mut text = format!("{} ", entry.time);
                     if let Some(d) = &entry.device {
                         text += &format!("[{d}] ");
                     }
                     text += &entry.text;
                     let mut rt = RichText::new(text).monospace();
-                    if entry.error {
-                        rt = rt.color(Color32::from_rgb(220, 60, 60));
+                    match entry.level {
+                        LogLevel::Error => rt = rt.color(Color32::from_rgb(220, 60, 60)),
+                        LogLevel::Warning => rt = rt.color(Color32::from_rgb(230, 160, 40)),
+                        LogLevel::Info => {}
                     }
                     ui.label(rt);
                 }
@@ -398,14 +471,10 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if std::mem::take(&mut self.connect_on_start) {
-            self.start_connect(ctx);
-        }
-        self.poll_connection();
-        self.poll_events();
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_link();
         if self.selected_device.is_none() {
-            self.selected_device = self.snapshot.devices.keys().next().cloned();
+            self.selected_device = self.state.cache.devices.keys().next().cloned();
         }
     }
 
@@ -414,8 +483,9 @@ impl eframe::App for App {
             apply_theme(ui.ctx(), self.settings.night_mode);
             self.applied_night_mode = Some(self.settings.night_mode);
         }
+        let usable = self.link.as_ref().is_some_and(EngineLink::is_open);
         let mut actions = Vec::new();
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &mut actions));
         egui::Panel::bottom("log")
             .resizable(true)
             .default_size(160.0)
@@ -423,16 +493,36 @@ impl eframe::App for App {
         egui::Panel::left("equipment")
             .resizable(true)
             .default_size(280.0)
-            .show(ui, |ui| self.equipment_panel(ui, &mut actions));
-        egui::CentralPanel::default().show(ui, |ui| self.device_view(ui, &mut actions));
+            .show(ui, |ui| {
+                ui.add_enabled_ui(usable, |ui| self.equipment_panel(ui, &mut actions));
+            });
+        egui::CentralPanel::default().show(ui, |ui| {
+            if !usable {
+                ui.colored_label(
+                    Color32::from_rgb(230, 160, 40),
+                    "Not connected to the engine.",
+                );
+            }
+            ui.add_enabled_ui(usable, |ui| self.device_view(ui, &mut actions));
+        });
         if !actions.is_empty() {
-            self.execute(actions);
+            self.send_all(actions);
         }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
+}
+
+fn role_slots(roles: &mut Roles) -> [(&'static str, &mut Option<String>, u32); 5] {
+    [
+        ("Main camera", &mut roles.main_camera, interface::CCD),
+        ("Guide camera", &mut roles.guide_camera, interface::CCD),
+        ("Mount", &mut roles.mount, interface::TELESCOPE),
+        ("Filter wheel", &mut roles.filter_wheel, interface::FILTER),
+        ("Focuser", &mut roles.focuser, interface::FOCUSER),
+    ]
 }
 
 fn role_combo(
@@ -515,4 +605,3 @@ fn apply_theme(ctx: &egui::Context, night: bool) {
     }
     ctx.set_visuals(v);
 }
-
