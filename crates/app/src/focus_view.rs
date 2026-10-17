@@ -1,5 +1,6 @@
 //! Focus tab: focuser control, autofocus and its V-curve.
 
+use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points, VLine};
 use protocol::equipment;
@@ -38,8 +39,7 @@ impl FocusView {
         ui.heading("Focuser");
         let dev = state.roles.focuser.as_ref().and_then(|f| state.cache.devices.get(f));
         let Some(dev) = dev else {
-            ui.colored_label(
-                Color32::from_rgb(230, 160, 40),
+            ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)),
                 match &state.roles.focuser {
                     None => "Assign a focuser in Equipment.",
                     Some(_) => "The focuser is offline.",
@@ -156,6 +156,7 @@ fn v_curve(ui: &mut egui::Ui, state: &UiState) {
         });
         return;
     }
+    let (point_c, fit_c, best_c) = (theme::c(ui, POINT_COLOR), theme::c(ui, FIT_COLOR), theme::c(ui, BEST_COLOR));
     let points: PlotPoints = af.points.iter().map(|&(x, y)| [x, y]).collect();
     let curve: PlotPoints = af.curve.iter().map(|&(x, y)| [x, y]).collect();
     Plot::new("v_curve")
@@ -168,13 +169,18 @@ fn v_curve(ui: &mut egui::Ui, state: &UiState) {
                 Points::new("samples", points)
                     .shape(MarkerShape::Circle)
                     .radius(4.0)
-                    .color(POINT_COLOR),
+                    .color(point_c),
             );
             if !af.curve.is_empty() {
-                plot.line(Line::new("fit", curve).color(FIT_COLOR).width(1.5));
+                plot.line(
+                    Line::new("fit", curve)
+                        .color(fit_c)
+                        .width(1.5)
+                        .style(egui_plot::LineStyle::dashed_dense()),
+                );
             }
             if let Some(best) = af.best {
-                plot.vline(VLine::new("best", best).color(BEST_COLOR));
+                plot.vline(VLine::new("best", best).color(best_c));
             }
         });
 }

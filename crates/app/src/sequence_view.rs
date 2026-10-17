@@ -1,5 +1,6 @@
 //! Sequence tab: step editor, presets, library, run controls and progress.
 
+use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use protocol::equipment;
 use protocol::sequence::presets;
@@ -137,7 +138,7 @@ impl SequenceView {
                     }
                 }
             }
-            if ui.button(RichText::new("■ Abort").color(RED)).clicked() {
+            if ui.button(RichText::new("■ Abort").color(theme::c(ui, RED))).clicked() {
                 actions.push(ToEngine::AbortSequence);
             }
             let name = if status.sequence.name.is_empty() { "Sequence" } else { &status.sequence.name };
@@ -355,7 +356,7 @@ impl SequenceView {
         seq.target = ra.zip(dec).map(|(ra_hours, dec_deg)| protocol::Target { ra_hours, dec_deg });
         let has_input = !self.target_ra.is_empty() || !self.target_dec.is_empty();
         if has_input && seq.target.is_none() {
-            ui.colored_label(ORANGE, "Enter RA (h:m:s) and Dec (d:m:s) to use a target.");
+            ui.colored_label(theme::c(ui, ORANGE), "Enter RA (h:m:s) and Dec (d:m:s) to use a target.");
         }
         ui.add_enabled_ui(seq.target.is_some(), |ui| {
             ui.horizontal(|ui| {
@@ -465,7 +466,7 @@ impl SequenceView {
                 self.feedback = feedback;
             }
             if let Some((msg, error)) = &self.feedback {
-                ui.colored_label(if *error { ORANGE } else { ui.visuals().weak_text_color() }, msg);
+                ui.colored_label(theme::c(ui, if *error { ORANGE } else { ui.visuals().weak_text_color() }), msg);
             }
         });
     }

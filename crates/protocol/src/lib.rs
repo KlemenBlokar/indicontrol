@@ -300,6 +300,8 @@ pub enum ToUi {
     SolverSettings(SolverSettings),
     Autofocus { status: AutofocusStatus },
     FocusSettings(FocusSettings),
+    /// Saved equipment profiles and the one last loaded or saved.
+    Profiles { names: Vec<String>, active: Option<String> },
 }
 
 /// UI → engine.
@@ -375,6 +377,10 @@ pub enum ToEngine {
     Autofocus,
     AbortAutofocus,
     SetFocusSettings(FocusSettings),
+    /// Save the current rig (INDI server, roles, all settings) under a name.
+    SaveProfile { name: String },
+    LoadProfile { name: String },
+    DeleteProfile { name: String },
 }
 
 macro_rules! json_codec {
@@ -420,6 +426,8 @@ pub struct UiState {
     pub solver_settings: SolverSettings,
     pub autofocus: AutofocusStatus,
     pub focus_settings: FocusSettings,
+    pub profiles: Vec<String>,
+    pub active_profile: Option<String>,
 }
 
 impl Default for UiState {
@@ -447,6 +455,8 @@ impl Default for UiState {
             solver_settings: SolverSettings::default(),
             autofocus: AutofocusStatus::default(),
             focus_settings: FocusSettings::default(),
+            profiles: Vec::new(),
+            active_profile: None,
         }
     }
 }
@@ -518,6 +528,10 @@ impl UiState {
             ToUi::SolverSettings(s) => self.solver_settings = s,
             ToUi::Autofocus { status } => self.autofocus = status,
             ToUi::FocusSettings(s) => self.focus_settings = s,
+            ToUi::Profiles { names, active } => {
+                self.profiles = names;
+                self.active_profile = active;
+            }
         }
     }
 
@@ -684,6 +698,7 @@ mod tests {
             ToEngine::SetSolverSettings(SolverSettings::default()),
             ToEngine::FocuserMove { steps: -100 },
             ToEngine::SetFocusSettings(FocusSettings::default()),
+            ToEngine::LoadProfile { name: "Esprit".into() },
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);

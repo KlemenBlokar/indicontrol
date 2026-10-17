@@ -257,7 +257,19 @@ pub async fn fake_indi(listener: TcpListener, initial_temp: f64) -> String {
 /// Like [`fake_indi`], with the mount `hour_angle_min` minutes from the
 /// meridian (positive: past it) on the west side of the pier.
 pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_min: f64) -> String {
-    let (mut sock, _) = listener.accept().await.unwrap();
+    let (sock, _) = listener.accept().await.unwrap();
+    serve(sock, initial_temp, hour_angle_min).await
+}
+
+/// Like [`fake_indi`], but accepts any number of (re)connections.
+pub async fn fake_indi_multi(listener: TcpListener, initial_temp: f64) {
+    loop {
+        let (sock, _) = listener.accept().await.unwrap();
+        tokio::spawn(serve(sock, initial_temp, -120.0));
+    }
+}
+
+async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> String {
     let (mut seen, mut pending) = (String::new(), String::new());
     let mut buf = vec![0u8; 65536];
     let mut defined = false;

@@ -6,6 +6,7 @@ mod link;
 mod mount_view;
 mod property_view;
 mod sequence_view;
+mod theme;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {

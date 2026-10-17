@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use tokio::task::JoinHandle;
 
-pub use state::{IndiSettings, PersistedState, default_output_dir, default_state_file};
+pub use state::{IndiSettings, PersistedState, Profile, default_output_dir, default_state_file};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {

@@ -25,6 +25,21 @@ impl Default for IndiSettings {
     }
 }
 
+/// A saved rig: everything that differs between setups.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    pub name: String,
+    pub indi: IndiSettings,
+    pub roles: Roles,
+    pub imaging: ImagingSettings,
+    pub guider: GuiderSettings,
+    pub guider_calibration: Option<Calibration>,
+    pub solver: SolverSettings,
+    pub focus: FocusSettings,
+    pub flat_exposures: Vec<FlatRecord>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
@@ -38,6 +53,38 @@ pub struct PersistedState {
     pub guider_calibration: Option<Calibration>,
     pub solver: SolverSettings,
     pub focus: FocusSettings,
+    pub profiles: Vec<Profile>,
+    pub active_profile: Option<String>,
+}
+
+impl PersistedState {
+    /// The current rig as a profile.
+    pub fn snapshot(&self, name: &str) -> Profile {
+        Profile {
+            name: name.to_owned(),
+            indi: self.indi.clone(),
+            roles: self.roles.clone(),
+            imaging: self.imaging.clone(),
+            guider: self.guider.clone(),
+            guider_calibration: self.guider_calibration.clone(),
+            solver: self.solver.clone(),
+            focus: self.focus.clone(),
+            flat_exposures: self.flat_exposures.clone(),
+        }
+    }
+
+    pub fn apply(&mut self, p: &Profile) {
+        self.indi = p.indi.clone();
+        self.roles = p.roles.clone();
+        self.imaging = p.imaging.clone();
+        self.guider = p.guider.clone();
+        self.guider_calibration = p.guider_calibration.clone();
+        self.solver = p.solver.clone();
+        self.focus = p.focus.clone();
+        self.flat_exposures = p.flat_exposures.clone();
+        self.active_profile = Some(p.name.clone());
+        self.fill_defaults();
+    }
 }
 
 /// `~/Pictures/indicontrol` (or `~/indicontrol` without a pictures dir).

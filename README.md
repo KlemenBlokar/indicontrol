@@ -151,6 +151,18 @@ camera frame reports its star count and HFR.
 Sequences can refocus at the start, after N light frames, on a filter
 change, after a meridian flip, or when the focuser temperature has changed.
 
+## Profiles and night mode
+
+**Profiles** (top of the Equipment panel) save a whole rig under a name:
+INDI server, device roles, imaging, guiding, solver and focus settings, the
+guide calibration and remembered flat exposures. Loading one switches
+everything, reconnecting to its INDI server if needed. Profiles live on the
+engine, so every UI sees them.
+
+**Night mode** turns the interface red: text and widgets, but also previews
+and the guide image (tinted red), plots and status colours (mapped to reds of
+similar brightness, with dashed/dotted lines where colour told series apart).
+
 ## Web UI
 
 Build the wasm UI with [trunk](https://trunkrs.dev) (needs the

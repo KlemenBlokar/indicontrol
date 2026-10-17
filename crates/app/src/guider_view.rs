@@ -1,5 +1,6 @@
 //! Guiding tab: guide image with star selection, error graph, controls, settings.
 
+use crate::theme;
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use protocol::guider::DecMode;
@@ -71,7 +72,11 @@ impl GuiderView {
         let avail = ui.available_size();
         let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y).max(0.05);
         let response = ui
-            .add(egui::Image::new((tex.id(), tex_size * scale)).sense(egui::Sense::click()))
+            .add(
+                egui::Image::new((tex.id(), tex_size * scale))
+                    .tint(theme::image_tint(ui))
+                    .sense(egui::Sense::click()),
+            )
             .on_hover_text("Click a star to guide on it");
         let rect = response.rect;
         // Frame pixels → screen. The preview may be smaller than the frame.
@@ -82,16 +87,17 @@ impl GuiderView {
                 rect.top() + (y as f32 + 0.5) / fh * rect.height(),
             )
         };
+        let (lock_c, star_c) = (theme::c(ui, LOCK_COLOR), theme::c(ui, STAR_COLOR));
         let painter = ui.painter_at(rect);
         if let Some((lx, ly)) = g.lock {
             let p = to_screen(lx, ly);
             let r = 14.0;
-            painter.line_segment([p - egui::vec2(r, 0.0), p + egui::vec2(r, 0.0)], Stroke::new(1.0, LOCK_COLOR));
-            painter.line_segment([p - egui::vec2(0.0, r), p + egui::vec2(0.0, r)], Stroke::new(1.0, LOCK_COLOR));
+            painter.line_segment([p - egui::vec2(r, 0.0), p + egui::vec2(r, 0.0)], Stroke::new(1.0, lock_c));
+            painter.line_segment([p - egui::vec2(0.0, r), p + egui::vec2(0.0, r)], Stroke::new(1.0, lock_c));
         }
         if let Some(s) = &g.star {
             let r = (s.hfd as f32 / fw * rect.width() * 1.5).max(8.0);
-            painter.circle_stroke(to_screen(s.x, s.y), r, Stroke::new(1.5, STAR_COLOR));
+            painter.circle_stroke(to_screen(s.x, s.y), r, Stroke::new(1.5, star_c));
         }
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
@@ -209,7 +215,7 @@ fn controls(ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
     ui.heading("Guider");
     match (&state.roles.guide_camera, &g.camera) {
         (None, _) => {
-            ui.colored_label(Color32::from_rgb(230, 160, 40), "Assign a guide camera in Equipment.");
+            ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)), "Assign a guide camera in Equipment.");
         }
         (Some(c), _) => {
             ui.label(RichText::new(c).strong());
@@ -254,7 +260,7 @@ fn controls(ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
     if g.settling {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new());
-            ui.colored_label(LOCK_COLOR, "Settling…");
+            ui.colored_label(theme::c(ui, LOCK_COLOR), "Settling…");
         });
     }
 }
@@ -268,10 +274,10 @@ fn status_details(ui: &mut egui::Ui, g: &GuiderStatus, actions: &mut Vec<ToEngin
     egui::Grid::new("guide_status").num_columns(2).show(ui, |ui| {
         if g.stats.samples > 0 {
             ui.label("RMS RA");
-            ui.label(RichText::new(fmt(g.stats.ra_rms)).color(RA_COLOR));
+            ui.label(RichText::new(fmt(g.stats.ra_rms)).color(theme::c(ui, RA_COLOR)));
             ui.end_row();
             ui.label("RMS Dec");
-            ui.label(RichText::new(fmt(g.stats.dec_rms)).color(DEC_COLOR));
+            ui.label(RichText::new(fmt(g.stats.dec_rms)).color(theme::c(ui, DEC_COLOR)));
             ui.end_row();
             ui.label("RMS total");
             ui.label(RichText::new(fmt(g.stats.total_rms)).strong());
@@ -332,6 +338,7 @@ fn graph(ui: &mut egui::Ui, state: &UiState) {
         .iter()
         .map(|s| s.ra_px.abs().max(s.dec_px.abs()) * k)
         .fold(if scale.is_some() { 2.0 } else { 1.0 }, f64::max);
+    let (ra_c, dec_c, zero_c) = (theme::c(ui, RA_COLOR), theme::c(ui, DEC_COLOR), theme::c(ui, Color32::GRAY));
     Plot::new("guide_graph")
         .legend(egui_plot::Legend::default())
         .include_y(-extent)
@@ -339,9 +346,15 @@ fn graph(ui: &mut egui::Ui, state: &UiState) {
         .y_axis_label(unit)
         .allow_scroll(false)
         .show(ui, |plot| {
-            plot.hline(HLine::new("", 0.0).color(Color32::GRAY));
-            plot.line(Line::new("RA", ra).color(RA_COLOR).width(1.5));
-            plot.line(Line::new("Dec", dec).color(DEC_COLOR).width(1.5));
+            plot.hline(HLine::new("", 0.0).color(zero_c));
+            plot.line(Line::new("RA", ra).color(ra_c).width(1.5));
+            // Dashed so RA and Dec stay distinguishable in the all-red night theme.
+            plot.line(
+                Line::new("Dec", dec)
+                    .color(dec_c)
+                    .width(1.5)
+                    .style(egui_plot::LineStyle::dashed_dense()),
+            );
         });
 }
 

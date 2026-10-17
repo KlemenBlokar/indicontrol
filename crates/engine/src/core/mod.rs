@@ -349,6 +349,40 @@ impl Core {
                 self.send(ToUi::FocusSettings(settings));
                 Ok(())
             }
+            ToEngine::SaveProfile { name } => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    self.log(None, "Give the profile a name", LogLevel::Error);
+                } else {
+                    let p = self.state.snapshot(&name);
+                    let list = &mut self.state.profiles;
+                    match list.iter_mut().find(|x| x.name == name) {
+                        Some(existing) => *existing = p,
+                        None => list.push(p),
+                    }
+                    list.sort_by_key(|p| p.name.to_lowercase());
+                    self.state.active_profile = Some(name.clone());
+                    self.save();
+                    self.log(None, format!("Profile '{name}' saved"), LogLevel::Info);
+                    self.send(self.profiles_msg());
+                }
+                Ok(())
+            }
+            ToEngine::LoadProfile { name } => {
+                if let Err(e) = self.load_profile(&name) {
+                    self.log(None, format!("Cannot load profile: {e}"), LogLevel::Error);
+                }
+                Ok(())
+            }
+            ToEngine::DeleteProfile { name } => {
+                self.state.profiles.retain(|p| p.name != name);
+                if self.state.active_profile.as_deref() == Some(name.as_str()) {
+                    self.state.active_profile = None;
+                }
+                self.save();
+                self.send(self.profiles_msg());
+                Ok(())
+            }
             ToEngine::GuiderClearCalibration => {
                 self.state.guider_calibration = None;
                 self.save();
@@ -487,6 +521,57 @@ impl Core {
         });
     }
 
+    fn profiles_msg(&self) -> ToUi {
+        ToUi::Profiles {
+            names: self.state.profiles.iter().map(|p| p.name.clone()).collect(),
+            active: self.state.active_profile.clone(),
+        }
+    }
+
+    fn load_profile(&mut self, name: &str) -> Result<(), String> {
+        if self.run.is_some() || self.job.is_some() || self.solving() || self.focusing() {
+            return Err("stop the running sequence, capture, solve or autofocus first".into());
+        }
+        let profile = self
+            .state
+            .profiles
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| format!("no profile named '{name}'"))?;
+        self.guider_stop();
+        let old_server = (self.state.indi.host.clone(), self.state.indi.port);
+        self.state.apply(&profile);
+        self.save();
+        self.log(None, format!("Profile '{name}' loaded"), LogLevel::Info);
+        for msg in [
+            ToUi::Roles(self.state.roles.clone()),
+            ToUi::ImagingSettings(self.state.imaging.clone()),
+            ToUi::GuiderSettings(self.state.guider.clone()),
+            ToUi::SolverSettings(self.state.solver.clone()),
+            ToUi::FocusSettings(self.state.focus.clone()),
+            self.profiles_msg(),
+            self.mount_msg(),
+            self.status_msg(),
+        ] {
+            self.send(msg);
+        }
+        self.send_guider();
+        // A different INDI server: reconnect (or disconnect) accordingly.
+        if (self.state.indi.host.clone(), self.state.indi.port) != old_server || self.client.is_none() {
+            if self.state.indi.autoconnect {
+                self.failures = 0;
+                self.connect();
+            } else if self.client.take().is_some() {
+                self.attempt += 1;
+                self.indi_events = None;
+                self.set_status(IndiStatus::Disconnected { error: None });
+                self.send(ToUi::Devices(Cache::default()));
+            }
+        }
+        Ok(())
+    }
+
     fn focus_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
         if let Err(e) = f(self) {
             self.log(None, format!("Focuser: {e}"), LogLevel::Error);
@@ -557,6 +642,7 @@ impl Core {
             self.solve_msg(),
             ToUi::FocusSettings(self.state.focus.clone()),
             self.focus_msg(),
+            self.profiles_msg(),
         ]
         .iter()
         .map(Outgoing::text)

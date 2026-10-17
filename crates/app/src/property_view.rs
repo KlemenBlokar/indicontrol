@@ -46,8 +46,8 @@ pub fn state_color(state: PropertyState) -> Color32 {
 pub fn state_dot(ui: &mut egui::Ui, state: PropertyState) -> egui::Response {
     let size = ui.text_style_height(&egui::TextStyle::Body);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), size * 0.35, state_color(state));
+    let color = crate::theme::c(ui, state_color(state));
+    ui.painter().circle_filled(rect.center(), size * 0.35, color);
     response.on_hover_text(state.to_string())
 }
 

@@ -1,6 +1,7 @@
 //! Main window: engine/INDI connection bar, equipment roles, device browser,
 //! property editor, log. All state comes from the engine over [`EngineLink`].
 
+use crate::theme;
 use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, RichText};
@@ -114,6 +115,8 @@ pub struct App {
     applied_night_mode: Option<bool>,
     imaging: ImagingView,
     sequence: SequenceView,
+    profile_pick: Option<String>,
+    profile_name: String,
     guider: GuiderView,
     mount: MountView,
     focus: FocusView,
@@ -142,6 +145,8 @@ impl App {
             settings,
             imaging,
             sequence,
+            profile_pick: None,
+            profile_name: String::new(),
             guider: GuiderView::new(),
             mount: MountView::default(),
             focus: FocusView::default(),
@@ -311,7 +316,7 @@ impl App {
                             });
                         }
                         if let Some(e) = error {
-                            ui.label(RichText::new(e).color(Color32::from_rgb(220, 60, 60)));
+                            ui.label(RichText::new(e).color(theme::c(ui, Color32::from_rgb(220, 60, 60))));
                         }
                     }
                     IndiStatus::Connecting => {
@@ -376,7 +381,61 @@ impl App {
         }
     }
 
+    fn profiles(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
+        let names = &self.state.profiles;
+        if self.profile_pick.as_ref().is_some_and(|p| !names.contains(p)) {
+            self.profile_pick = None;
+        }
+        if self.profile_pick.is_none() {
+            self.profile_pick = self.state.active_profile.clone();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Profile");
+            egui::ComboBox::from_id_salt("profile")
+                .selected_text(self.profile_pick.as_deref().unwrap_or("—"))
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for n in names {
+                        ui.selectable_value(&mut self.profile_pick, Some(n.clone()), n);
+                    }
+                });
+            let picked = self.profile_pick.clone();
+            if ui
+                .add_enabled(picked.is_some(), egui::Button::new("Load").small())
+                .on_hover_text("Switch roles, settings, calibration and INDI server")
+                .clicked()
+            {
+                actions.push(ToEngine::LoadProfile { name: picked.clone().expect("enabled") });
+            }
+            if ui.add_enabled(picked.is_some(), egui::Button::new("Delete").small()).clicked() {
+                actions.push(ToEngine::DeleteProfile { name: picked.expect("enabled") });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_name)
+                    .hint_text(self.state.active_profile.as_deref().unwrap_or("profile name"))
+                    .desired_width(140.0),
+            );
+            let name = if self.profile_name.trim().is_empty() {
+                self.state.active_profile.clone().unwrap_or_default()
+            } else {
+                self.profile_name.trim().to_owned()
+            };
+            if ui
+                .add_enabled(!name.is_empty(), egui::Button::new("Save").small())
+                .on_hover_text("Save the current rig under this name")
+                .clicked()
+            {
+                actions.push(ToEngine::SaveProfile { name });
+                self.profile_name.clear();
+            }
+        });
+        ui.separator();
+    }
+
     fn equipment_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
+        self.profiles(ui, actions);
         ui.heading("Equipment");
         let mut roles = self.state.roles.clone();
         egui::Grid::new("roles").num_columns(2).show(ui, |ui| {
@@ -434,8 +493,7 @@ impl App {
 
     fn device_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
         if let Some(v) = self.state.version_mismatch {
-            ui.colored_label(
-                Color32::from_rgb(230, 160, 40),
+            ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)),
                 format!(
                     "Engine speaks protocol v{v}, this UI v{} — update one of them.",
                     protocol::PROTOCOL_VERSION
@@ -511,8 +569,8 @@ impl App {
                     text += &entry.text;
                     let mut rt = RichText::new(text).monospace();
                     match entry.level {
-                        LogLevel::Error => rt = rt.color(Color32::from_rgb(220, 60, 60)),
-                        LogLevel::Warning => rt = rt.color(Color32::from_rgb(230, 160, 40)),
+                        LogLevel::Error => rt = rt.color(theme::c(ui, Color32::from_rgb(220, 60, 60))),
+                        LogLevel::Warning => rt = rt.color(theme::c(ui, Color32::from_rgb(230, 160, 40))),
                         LogLevel::Info => {}
                     }
                     ui.label(rt);
@@ -530,6 +588,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::theme::set_night(ui.ctx(), self.settings.night_mode);
         if self.applied_night_mode != Some(self.settings.night_mode) {
             apply_theme(ui.ctx(), self.settings.night_mode);
             self.applied_night_mode = Some(self.settings.night_mode);
@@ -549,8 +608,7 @@ impl eframe::App for App {
             });
         egui::CentralPanel::default().show(ui, |ui| {
             if !usable {
-                ui.colored_label(
-                    Color32::from_rgb(230, 160, 40),
+                ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)),
                     "Not connected to the engine.",
                 );
             }

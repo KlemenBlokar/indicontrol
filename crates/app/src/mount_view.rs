@@ -1,5 +1,6 @@
 //! Mount tab: position, meridian timing, tracking, park and goto.
 
+use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use indi_link::{format_number, parse_number};
 use protocol::{MountInfo, SolverKind, SolverSettings, ToEngine, UiState};
@@ -41,9 +42,9 @@ impl MountView {
             ui.heading(&m.name);
             if m.slewing {
                 ui.add(egui::Spinner::new());
-                ui.colored_label(ORANGE, "Slewing");
+                ui.colored_label(theme::c(ui, ORANGE), "Slewing");
             }
-            if ui.button(RichText::new("■ Abort motion").color(RED)).clicked() {
+            if ui.button(RichText::new("■ Abort motion").color(theme::c(ui, RED))).clicked() {
                 actions.push(ToEngine::MountAbort);
             }
         });
@@ -269,7 +270,7 @@ fn position(ui: &mut egui::Ui, m: &MountInfo) {
         if let Some(alt) = m.alt {
             ui.label("Altitude");
             let text = RichText::new(format!("{alt:.1}°"));
-            ui.label(if alt < 15.0 { text.color(ORANGE) } else { text });
+            ui.label(if alt < 15.0 { text.color(theme::c(ui, ORANGE)) } else { text });
             ui.end_row();
         }
         if let Some(ha) = m.hour_angle {

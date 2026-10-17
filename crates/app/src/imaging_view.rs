@@ -1,5 +1,6 @@
 //! Imaging tab: capture controls, preview, histogram and clipping checks.
 
+use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{HoverPosition, Line, Plot, PlotPoints, VLine};
 use protocol::equipment::{self, Control};
@@ -129,10 +130,10 @@ impl ImagingView {
         let wheel = state.roles.filter_wheel.as_ref().and_then(|w| devices.get(w));
         match (&state.roles.main_camera, camera) {
             (None, _) => {
-                ui.colored_label(ORANGE, "Assign a main camera in Equipment.");
+                ui.colored_label(theme::c(ui, ORANGE), "Assign a main camera in Equipment.");
             }
             (Some(name), None) => {
-                ui.colored_label(ORANGE, format!("{name} is offline."));
+                ui.colored_label(theme::c(ui, ORANGE), format!("{name} is offline."));
             }
             (Some(name), Some(cam)) => {
                 ui.label(RichText::new(name).strong());
@@ -223,7 +224,7 @@ impl ImagingView {
         let repeat = f.repeat;
         ui.horizontal(|ui| {
             if busy {
-                if ui.button(RichText::new("Abort").color(RED)).clicked() {
+                if ui.button(RichText::new("Abort").color(theme::c(ui, RED))).clicked() {
                     actions.push(ToEngine::AbortCapture);
                 }
             } else {
@@ -320,7 +321,8 @@ impl ImagingView {
             egui::Scene::new()
                 .zoom_range(0.05..=16.0)
                 .show(ui, &mut self.scene_rect, |ui| {
-                    ui.put(image_rect, egui::Image::new((texture.id(), size)));
+                    let tint = theme::image_tint(ui);
+                    ui.put(image_rect, egui::Image::new((texture.id(), size)).tint(tint));
                 });
         });
     }
@@ -332,7 +334,11 @@ impl ImagingView {
             ui.checkbox(&mut self.form.log_histogram, "Log scale");
         });
         let log = self.form.log_histogram;
-        let colors = channel_colors(&a.channels, ui.visuals().text_color());
+        let colors: Vec<Color32> = channel_colors(&a.channels, ui.visuals().text_color())
+            .into_iter()
+            .map(|c| theme::c(ui, c))
+            .collect();
+        let zero_c = theme::c(ui, RED.gamma_multiply(0.6));
         let half_bin = a.bin_start(1) / 2.0;
         Plot::new("histogram")
             .height(220.0)
@@ -366,10 +372,16 @@ impl ImagingView {
                         })
                         .collect();
                     let name = a.channels.get(i).map_or("?", |c| c.name.as_str());
-                    plot.line(Line::new(name, points).color(colors[i]).width(1.5));
+                    // Distinct styles keep channels apart in the all-red night theme.
+                    let style = match name {
+                        "G" => egui_plot::LineStyle::dashed_dense(),
+                        "B" => egui_plot::LineStyle::dotted_dense(),
+                        _ => egui_plot::LineStyle::Solid,
+                    };
+                    plot.line(Line::new(name, points).color(colors[i]).width(1.5).style(style));
                 }
-                plot.vline(VLine::new("0", 0.0).color(RED.gamma_multiply(0.6)));
-                plot.vline(VLine::new("saturation", a.adc_max as f64).color(RED.gamma_multiply(0.6)));
+                plot.vline(VLine::new("0", 0.0).color(zero_c));
+                plot.vline(VLine::new("saturation", a.adc_max as f64).color(zero_c));
             });
 
         ui.add_space(4.0);
@@ -476,8 +488,7 @@ fn clipping_report(ui: &mut egui::Ui, a: &protocol::Analysis) {
     let mut ok = true;
     if zero > 0 {
         ok = false;
-        ui.colored_label(
-            RED,
+        ui.colored_label(theme::c(ui, RED),
             format!(
                 "⚠ Black clipping: {zero} px at 0 ({}). Raise the offset.",
                 percent(zero as f64 / pixels as f64)
@@ -485,21 +496,19 @@ fn clipping_report(ui: &mut egui::Ui, a: &protocol::Analysis) {
         );
     } else if headroom < 3.0 {
         ok = false;
-        ui.colored_label(
-            ORANGE,
+        ui.colored_label(theme::c(ui, ORANGE),
             format!("Dark end only {headroom:.1}σ above 0 — consider a higher offset."),
         );
     }
     let sat = saturated as f64 / pixels as f64;
     if sat > 0.01 {
         ok = false;
-        ui.colored_label(
-            RED,
+        ui.colored_label(theme::c(ui, RED),
             format!("⚠ {} saturated — shorten the exposure or lower the gain.", percent(sat)),
         );
     } else if sat > 0.001 {
         ok = false;
-        ui.colored_label(ORANGE, format!("{} saturated — check bright stars.", percent(sat)));
+        ui.colored_label(theme::c(ui, ORANGE), format!("{} saturated — check bright stars.", percent(sat)));
     } else if saturated > 0 {
         ui.label(
             RichText::new(format!("{saturated} saturated px (typically star cores)."))
@@ -512,7 +521,7 @@ fn clipping_report(ui: &mut egui::Ui, a: &protocol::Analysis) {
         } else {
             "✔ No clipping.".into()
         };
-        ui.colored_label(GREEN, note);
+        ui.colored_label(theme::c(ui, GREEN), note);
     }
 }
 
@@ -590,7 +599,9 @@ mod tests {
     #[test]
     fn renders_mono_and_colour_frames() {
         let ctx = egui::Context::default();
-        for (cfa, clipping) in [(None, true), (Cfa::parse("RGGB", 0, 0), false)] {
+        for (i, (cfa, clipping)) in [(None, true), (Cfa::parse("RGGB", 0, 0), false)].into_iter().enumerate() {
+            // Second pass in night mode.
+            crate::theme::set_night(&ctx, i == 1);
             let (state, jpeg) = frame_state(cfa, clipping);
             let mut view = ImagingView::new(CaptureForm::default());
             view.on_preview(&ctx, 1, &jpeg);
