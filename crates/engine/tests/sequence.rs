@@ -152,6 +152,9 @@ async fn interleaved_lights_pause_resume_and_library() {
         object: "M 42".into(),
         order: protocol::SequenceOrder::Interleaved,
         steps,
+        dither_every: 0,
+        meridian_flip: false,
+        ..Default::default()
     };
 
     // Library round trip.

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::guider_view::GuiderView;
 use crate::imaging_view::{CaptureForm, ImagingView};
 use crate::link::{EngineLink, Incoming, LinkState};
+use crate::mount_view::MountView;
 use crate::property_view::{self, Edits};
 use crate::sequence_view::{SequenceDraft, SequenceView};
 
@@ -29,6 +30,7 @@ enum View {
     Imaging,
     Sequence,
     Guiding,
+    Mount,
     Devices,
 }
 
@@ -111,6 +113,7 @@ pub struct App {
     imaging: ImagingView,
     sequence: SequenceView,
     guider: GuiderView,
+    mount: MountView,
     #[cfg(not(target_arch = "wasm32"))]
     local: LocalEngine,
 }
@@ -137,6 +140,7 @@ impl App {
             imaging,
             sequence,
             guider: GuiderView::new(),
+            mount: MountView::default(),
             link: None,
             link_error: None,
             state: UiState::default(),
@@ -549,6 +553,7 @@ impl eframe::App for App {
                     (View::Imaging, "Imaging"),
                     (View::Sequence, "Sequence"),
                     (View::Guiding, "Guiding"),
+                    (View::Mount, "Mount"),
                     (View::Devices, "Devices"),
                 ] {
                     ui.selectable_value(&mut self.settings.view, view, RichText::new(label).heading());
@@ -579,6 +584,7 @@ impl eframe::App for App {
                 View::Imaging => self.imaging.ui(ui, &self.state, &mut actions),
                 View::Sequence => self.sequence.ui(ui, &self.state, &mut self.imaging, &mut actions),
                 View::Guiding => self.guider.ui(ui, &self.state, &mut actions),
+                View::Mount => self.mount.ui(ui, &self.state, &mut actions),
                 View::Devices => self.device_view(ui, &mut actions),
             });
         });

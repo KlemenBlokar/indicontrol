@@ -82,13 +82,33 @@ pub enum SequenceOrder {
     Interleaved,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sequence {
     pub name: String,
     pub object: String,
     pub order: SequenceOrder,
     pub steps: Vec<SequenceStep>,
+    /// Dither after every N light frames while guiding (0 = never).
+    pub dither_every: u32,
+    /// Flip the mount when the target passes the meridian.
+    pub meridian_flip: bool,
+    /// Minutes past the meridian at which to flip.
+    pub flip_minutes_past: f64,
+}
+
+impl Default for Sequence {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            object: String::new(),
+            order: SequenceOrder::ByStep,
+            steps: Vec::new(),
+            dither_every: 3,
+            meridian_flip: true,
+            flip_minutes_past: 5.0,
+        }
+    }
 }
 
 impl Sequence {

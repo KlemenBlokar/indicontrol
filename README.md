@@ -103,7 +103,26 @@ guide camera's ST-4 port.
 - The graph shows RA/Dec error in arcseconds once the pixel scale is known.
   Pixel size and focal length come from INDI or the settings.
 
-Not yet: dithering, settling, meridian-flip handling, multi-star guiding.
+- **Dither** moves the lock position randomly by up to the dither amount
+  along the mount axes, then waits until the error stays below the settle
+  threshold for the settle time (or gives up after the timeout).
+- After a **meridian flip** the saved calibration is reused, turned by 180°
+  (Dec reversal can be switched off for mounts that reverse Dec themselves).
+
+Not yet: multi-star guiding, backlash compensation.
+
+## Mount and meridian flips
+
+The Mount tab shows J2000/JNow position, altitude, hour angle, time to the
+meridian and pier side, and controls tracking, park and goto.
+
+Sequences can **dither every N light frames** while guiding, waiting for
+guiding to settle before the next frame. With **meridian flip** enabled, a
+light frame is never started if it would run past the flip point (default
+5 min after the meridian); the sequence waits, then stops guiding, re-slews
+to the same position so the mount changes pier side, restarts guiding with
+the flipped calibration, waits for it to settle and continues. A manual slew
+while guiding stops the guider.
 
 ## Web UI
 

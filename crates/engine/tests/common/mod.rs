@@ -63,7 +63,7 @@ const DEFS: &str = r#"
 <defNumberVector device="Cam" name="CCD_INFO" group="Info" state="Ok" perm="ro"><defNumber name="CCD_BITSPERPIXEL" format="%.0f" min="8" max="16" step="1">16</defNumber></defNumberVector>
 <defBLOBVector device="Cam" name="CCD1" group="Image" state="Idle" perm="ro"><defBLOB name="CCD1"/></defBLOBVector>
 <defSwitchVector device="Scope" name="CONNECTION" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="CONNECT">On</defSwitch><defSwitch name="DISCONNECT">Off</defSwitch></defSwitchVector>
-<defNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" group="Main" state="Ok" perm="rw"><defNumber name="RA" format="%010.6m" min="0" max="24" step="0">5.59</defNumber><defNumber name="DEC" format="%010.6m" min="-90" max="90" step="0">-5.39</defNumber></defNumberVector>
+<defNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" group="Main" state="Ok" perm="rw"><defNumber name="RA" format="%010.6m" min="0" max="24" step="0">@RA@</defNumber><defNumber name="DEC" format="%010.6m" min="-90" max="90" step="0">-5.39</defNumber></defNumberVector>
 <defNumberVector device="Scope" name="GEOGRAPHIC_COORD" group="Site" state="Ok" perm="rw"><defNumber name="LAT" format="%g" min="-90" max="90" step="0">46.05</defNumber><defNumber name="LONG" format="%g" min="0" max="360" step="0">14.5</defNumber><defNumber name="ELEV" format="%g" min="-200" max="10000" step="0">300</defNumber></defNumberVector>
 <defSwitchVector device="Scope" name="TELESCOPE_PIER_SIDE" group="Main" state="Ok" perm="ro" rule="AtMostOne"><defSwitch name="PIER_WEST">On</defSwitch><defSwitch name="PIER_EAST">Off</defSwitch></defSwitchVector>
 <defSwitchVector device="Wheel" name="CONNECTION" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="CONNECT">On</defSwitch><defSwitch name="DISCONNECT">Off</defSwitch></defSwitchVector>
@@ -86,14 +86,33 @@ pub const GUIDE_DRIFT: f64 = 0.3; // px of RA drift per guide exposure
 const GW: usize = 160;
 const GH: usize = 120;
 
+/// Site longitude of the fake mount (east positive), matching GEOGRAPHIC_COORD.
+const SITE_LONG: f64 = 14.5;
+
+/// Local sidereal time (hours) at the fake site, now.
+pub fn lst_now() -> f64 {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let jd = imaging::astro::julian_day(unix);
+    ((imaging::astro::gmst_deg(jd) + SITE_LONG) / 15.0).rem_euclid(24.0)
+}
+
 /// Simulated sky as seen by the guide camera.
 struct GuideSky {
     x: f64,
     y: f64,
     frames: usize,
+    /// After a meridian flip the camera is turned 180° relative to the sky.
+    flipped: bool,
 }
 
 impl GuideSky {
+    fn theta(&self) -> f64 {
+        GUIDE_THETA_DEG + if self.flipped { 180.0 } else { 0.0 }
+    }
+
     fn mv(&mut self, angle_deg: f64, px: f64) {
         let a = angle_deg.to_radians();
         self.x += a.cos() * px;
@@ -101,14 +120,14 @@ impl GuideSky {
     }
 
     fn pulse(&mut self, n: f64, s: f64, w: f64, e: f64) {
-        self.mv(GUIDE_THETA_DEG, GUIDE_RATE * (w - e));
-        self.mv(GUIDE_THETA_DEG + 90.0, GUIDE_RATE * (n - s));
+        self.mv(self.theta(), GUIDE_RATE * (w - e));
+        self.mv(self.theta() + 90.0, GUIDE_RATE * (n - s));
     }
 
     /// Render the next guide frame (drift is applied per exposure).
     fn frame(&mut self) -> Vec<u8> {
         self.frames += 1;
-        self.mv(GUIDE_THETA_DEG, GUIDE_DRIFT);
+        self.mv(self.theta(), GUIDE_DRIFT);
         let pixels: Vec<u16> = (0..GW * GH)
             .map(|i| {
                 let (x, y) = ((i % GW) as f64, (i / GW) as f64);
@@ -141,13 +160,21 @@ fn number_in(msg: &str, element: &str) -> f64 {
     msg[at..msg[at..].find('<').unwrap() + at].trim().parse().unwrap()
 }
 
-/// Fake indiserver starting with the sensor at `initial_temp`. Returns everything the client sent.
+/// Fake indiserver starting with the sensor at `initial_temp`, the mount two
+/// hours east of the meridian. Returns everything the client sent.
 pub async fn fake_indi(listener: TcpListener, initial_temp: f64) -> String {
+    fake_indi_at(listener, initial_temp, -120.0).await
+}
+
+/// Like [`fake_indi`], with the mount `hour_angle_min` minutes from the
+/// meridian (positive: past it) on the west side of the pier.
+pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_min: f64) -> String {
     let (mut sock, _) = listener.accept().await.unwrap();
     let (mut seen, mut pending) = (String::new(), String::new());
     let mut buf = vec![0u8; 65536];
     let mut defined = false;
-    let mut sky = GuideSky { x: 80.0, y: 60.0, frames: 0 };
+    let mut sky = GuideSky { x: 80.0, y: 60.0, frames: 0, flipped: false };
+    let ra0 = (lst_now() - hour_angle_min / 60.0).rem_euclid(24.0);
     loop {
         let n = match sock.read(&mut buf).await {
             Ok(0) | Err(_) => return seen,
@@ -158,7 +185,8 @@ pub async fn fake_indi(listener: TcpListener, initial_temp: f64) -> String {
         pending.push_str(text);
         if !defined && pending.contains("<getProperties") {
             defined = true;
-            sock.write_all(DEFS.replace("@TEMP@", &initial_temp.to_string()).as_bytes()).await.unwrap();
+            let defs = DEFS.replace("@TEMP@", &initial_temp.to_string()).replace("@RA@", &ra0.to_string());
+            sock.write_all(defs.as_bytes()).await.unwrap();
         }
         const END: &str = "</newNumberVector>";
         while let Some(i) = pending.find(END) {
@@ -178,6 +206,19 @@ pub async fn fake_indi(listener: TcpListener, initial_temp: f64) -> String {
                     let m = format!(r#"<setNumberVector device="Cam" name="CCD_TEMPERATURE" state="{state}"><oneNumber name="CCD_TEMPERATURE_VALUE">{t}</oneNumber></setNumberVector>"#);
                     sock.write_all(m.as_bytes()).await.unwrap();
                 }
+            } else if msg.contains(r#"name="EQUATORIAL_EOD_COORD""#) {
+                // Goto: slew, then choose the pier side from the hour angle like a GEM.
+                let (ra, dec) = (number_in(msg, "RA"), number_in(msg, "DEC"));
+                sock.write_all(br#"<setNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" state="Busy"><oneNumber name="RA">0</oneNumber><oneNumber name="DEC">0</oneNumber></setNumberVector>"#).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let ha = (lst_now() - ra + 12.0).rem_euclid(24.0) - 12.0;
+                let east = ha >= 0.0;
+                sky.flipped = east;
+                let (w, e) = if east { ("Off", "On") } else { ("On", "Off") };
+                let m = format!(
+                    r#"<setSwitchVector device="Scope" name="TELESCOPE_PIER_SIDE" state="Ok"><oneSwitch name="PIER_WEST">{w}</oneSwitch><oneSwitch name="PIER_EAST">{e}</oneSwitch></setSwitchVector><setNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" state="Ok"><oneNumber name="RA">{ra}</oneNumber><oneNumber name="DEC">{dec}</oneNumber></setNumberVector>"#
+                );
+                sock.write_all(m.as_bytes()).await.unwrap();
             } else if msg.contains(r#"name="TELESCOPE_TIMED_GUIDE_NS""#) {
                 sky.pulse(number_in(msg, "TIMED_GUIDE_N"), number_in(msg, "TIMED_GUIDE_S"), 0.0, 0.0);
             } else if msg.contains(r#"name="TELESCOPE_TIMED_GUIDE_WE""#) {

@@ -3,6 +3,7 @@
 
 mod capture;
 mod guider;
+mod mount;
 mod sequence;
 
 use std::collections::VecDeque;
@@ -42,6 +43,8 @@ pub(crate) enum CoreMsg {
     },
     GuideNext { seq: u64 },
     GuideTimeout { seq: u64 },
+    SequenceRecheck { run_id: u64 },
+    FlipTimeout { run_id: u64 },
 }
 
 /// A message to UIs: JSON text or a binary image preview.
@@ -166,6 +169,8 @@ impl Core {
             CoreMsg::GuideFrame { seq, result } => self.guider_frame(seq, *result),
             CoreMsg::GuideNext { seq } => self.guider_next(seq),
             CoreMsg::GuideTimeout { seq } => self.guider_timeout(seq),
+            CoreMsg::SequenceRecheck { run_id } => self.sequence_recheck(run_id),
+            CoreMsg::FlipTimeout { run_id } => self.flip_timeout(run_id),
             CoreMsg::Retry { attempt } => {
                 if attempt == self.attempt && self.state.indi.autoconnect && self.client.is_none() {
                     self.connect();
@@ -204,6 +209,8 @@ impl Core {
                 self.state.roles = roles.clone();
                 self.save();
                 self.send(ToUi::Roles(roles));
+                self.send(self.mount_msg());
+                self.send_guider();
                 Ok(())
             }
             ToEngine::SetImagingSettings(settings) => {
@@ -274,6 +281,12 @@ impl Core {
             ToEngine::GuiderAutoSelect => self.guider_result(|c| c.guider_select(None)),
             ToEngine::GuiderCalibrate => self.guider_result(|c| c.guider_calibrate(false)),
             ToEngine::GuiderGuide => self.guider_result(|c| c.guider_guide()),
+            ToEngine::GuiderDither => self.guider_result(|c| c.guider_dither()),
+            ToEngine::MountGoto { ra_hours, dec_deg } => self.mount_result(|c| c.mount_goto(ra_hours, dec_deg)),
+            ToEngine::MountPark => self.mount_result(|c| c.mount_park(true)),
+            ToEngine::MountUnpark => self.mount_result(|c| c.mount_park(false)),
+            ToEngine::MountAbort => self.mount_result(|c| c.mount_abort()),
+            ToEngine::MountTracking { on } => self.mount_result(|c| c.mount_tracking(on)),
             ToEngine::GuiderClearCalibration => {
                 self.state.guider_calibration = None;
                 self.save();
@@ -345,6 +358,7 @@ impl Core {
                     self.send(ToUi::PropertyUpdated(p));
                 }
                 self.capture_on_update(&device, &name);
+                self.mount_on_update(&device, &name);
                 self.sequence_on_update(&device, &name);
             }
             Event::Deleted { device, name } => self.send(ToUi::PropertyDeleted { device, name }),
@@ -409,6 +423,13 @@ impl Core {
         });
     }
 
+    fn mount_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
+        if let Err(e) = f(self) {
+            self.log(None, format!("Mount: {e}"), LogLevel::Error);
+        }
+        Ok(())
+    }
+
     fn guider_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
         if let Err(e) = f(self) {
             self.log(None, format!("Guider: {e}"), LogLevel::Error);
@@ -453,6 +474,7 @@ impl Core {
             self.sequence_msg(),
             ToUi::GuiderSettings(self.state.guider.clone()),
             self.guider_msg(),
+            self.mount_msg(),
         ]
         .iter()
         .map(Outgoing::text)

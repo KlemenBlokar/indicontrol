@@ -3,8 +3,10 @@
 
 pub mod calibration;
 pub mod guide;
+pub mod settle;
 pub mod star;
 
 pub use calibration::{CalStep, Calibration, CalibrationSettings, Calibrator};
 pub use guide::{Correction, DecMode, GuideController, GuideDir, GuideParams, GuideStats};
+pub use settle::{DitherRng, SettleOutcome, SettleTracker, dither_offset};
 pub use star::{Background, Frame, Star};

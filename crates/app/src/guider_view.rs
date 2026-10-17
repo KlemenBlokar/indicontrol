@@ -162,6 +162,34 @@ impl GuiderView {
                 ui.label("Search radius");
                 ui.add(egui::DragValue::new(&mut s.search_radius).range(3.0..=100.0).suffix(" px"));
                 ui.end_row();
+
+                ui.label(RichText::new("Dither & settle").strong());
+                ui.end_row();
+                ui.label("Dither");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut s.dither_px).range(0.5..=50.0).speed(0.1).suffix(" px"));
+                    ui.checkbox(&mut s.dither_ra_only, "RA only");
+                });
+                ui.end_row();
+                ui.label("Settled below");
+                ui.add(egui::DragValue::new(&mut s.settle_px).range(0.1..=20.0).speed(0.05).suffix(" px"));
+                ui.end_row();
+                ui.label("for");
+                ui.add(egui::DragValue::new(&mut s.settle_time).range(0.0..=300.0).suffix(" s"));
+                ui.end_row();
+                ui.label("Give up after");
+                ui.add(egui::DragValue::new(&mut s.settle_timeout).range(5.0..=1800.0).suffix(" s"));
+                ui.end_row();
+
+                ui.label(RichText::new("Meridian flip").strong());
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut s.flip_calibration, "Reuse calibration (flip it)");
+                ui.end_row();
+                ui.label("");
+                ui.add_enabled(s.flip_calibration, egui::Checkbox::new(&mut s.flip_dec, "Also reverse Dec"))
+                    .on_hover_text("Uncheck if your mount reverses Dec itself after a flip");
+                ui.end_row();
             });
             let changed = *s != state.guider_settings;
             ui.horizontal(|ui| {
@@ -213,10 +241,22 @@ fn controls(ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         {
             actions.push(ToEngine::GuiderGuide);
         }
+        if ui
+            .add_enabled(g.state == GuiderState::Guiding && !g.settling, egui::Button::new("Dither"))
+            .clicked()
+        {
+            actions.push(ToEngine::GuiderDither);
+        }
         if ui.add_enabled(!idle, egui::Button::new("Stop")).clicked() {
             actions.push(ToEngine::GuiderStop);
         }
     });
+    if g.settling {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new());
+            ui.colored_label(LOCK_COLOR, "Settling…");
+        });
+    }
 }
 
 fn status_details(ui: &mut egui::Ui, g: &GuiderStatus, actions: &mut Vec<ToEngine>) {
@@ -361,6 +401,7 @@ mod tests {
             }),
             pixel_scale: Some(3.2),
             stats: GuideStats { ra_rms: 0.2, dec_rms: 0.15, total_rms: 0.25, samples: 50 },
+            settling: true,
             message: "Guiding".into(),
         };
         for i in 0..300 {

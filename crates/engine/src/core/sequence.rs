@@ -4,8 +4,9 @@
 use std::time::Duration;
 
 use protocol::equipment::{self, Control};
+use guiding::SettleOutcome;
 use protocol::{
-    CaptureRequest, Exposure, FlatRecord, LogLevel, RunState, Sequence, SequenceOrder,
+    CaptureRequest, Exposure, FlatRecord, FrameType, LogLevel, RunState, Sequence, SequenceOrder,
     SequenceStatus, ToUi,
 };
 
@@ -15,6 +16,9 @@ const TEMPERATURE_TOLERANCE: f64 = 0.5;
 const TEMPERATURE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Test exposures allowed to find a flat exposure before giving up.
 const MAX_FLAT_TESTS: u32 = 10;
+const FLIP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Sidereal hours per solar hour.
+const SIDEREAL_RATE: f64 = 1.002_737_9;
 
 pub(crate) struct Run {
     id: u64,
@@ -26,6 +30,7 @@ pub(crate) struct Run {
     paused: bool,
     flat: Vec<FlatState>,
     message: String,
+    lights_since_dither: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,11 +40,26 @@ struct FlatState {
     tests: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Wait {
     None,
     Temperature { step: usize, target: f64 },
     Frame { step: usize, test: bool, exposure: f64 },
+    /// Guiding is settling after a dither.
+    Settle,
+    /// Waiting for the target to reach the flip point.
+    Meridian,
+    Flip {
+        phase: FlipPhase,
+        restart_guiding: bool,
+        pier_before: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FlipPhase {
+    Slewing { seen_busy: bool },
+    GuideSettle,
 }
 
 impl Core {
@@ -77,6 +97,7 @@ impl Core {
             paused: false,
             flat: vec![FlatState::default(); n],
             message: String::new(),
+            lights_since_dither: 0,
         });
         self.log(None, format!("{name} started"), LogLevel::Info);
         self.sequence_next();
@@ -87,7 +108,7 @@ impl Core {
         let Some(run) = &mut self.run else {
             return;
         };
-        if run.wait == Wait::None || matches!(run.wait, Wait::Temperature { .. }) {
+        if matches!(run.wait, Wait::None | Wait::Temperature { .. } | Wait::Meridian) {
             run.paused = true;
             run.wait = Wait::None;
             run.message = "Paused".into();
@@ -170,11 +191,16 @@ impl Core {
             }
         }
 
+        if s.frame_type == FrameType::Light && self.before_light(&s) {
+            return;
+        }
+
         let (exposure, test) = match self.resolve_exposure(step) {
             Ok(v) => v,
             Err(e) => return self.sequence_failed(e),
         };
         let run = self.run.as_mut().expect("checked");
+        run.wait = Wait::None;
         let req = CaptureRequest {
             exposure,
             frame_type: s.frame_type,
@@ -254,6 +280,9 @@ impl Core {
             return;
         };
         run.wait = Wait::None;
+        if run.seq.steps[step].frame_type == FrameType::Light {
+            run.lights_since_dither += 1;
+        }
         let Exposure::AutoFlat {
             target,
             tolerance,
@@ -316,11 +345,198 @@ impl Core {
         self.sequence_next();
     }
 
-    /// Property updates relevant to the sequencer (sensor temperature).
+    /// Meridian flip and dither checks before a light frame.
+    /// Returns true if the sequencer is now waiting for something.
+    fn before_light(&mut self, step: &protocol::SequenceStep) -> bool {
+        let run = self.run.as_ref().expect("running");
+        if run.seq.meridian_flip
+            && let Some(m) = self.mount_info()
+            && m.pier_side.as_deref() == Some("WEST")
+            && let Some(ha) = m.hour_angle
+        {
+            let limit = run.seq.flip_minutes_past / 60.0;
+            let exposure_h = step.exposure.seconds().unwrap_or(0.0) / 3600.0;
+            if ha >= limit {
+                self.start_flip(m);
+                return true;
+            }
+            // Don't start an exposure that would run past the flip point.
+            if ha > -1.0 && ha + exposure_h * SIDEREAL_RATE > limit {
+                let wait_s = (limit - ha) * 3600.0 / SIDEREAL_RATE;
+                let run = self.run.as_mut().expect("running");
+                run.wait = Wait::Meridian;
+                run.message = format!("Waiting {:.0} min for the meridian flip", (wait_s / 60.0).ceil());
+                let (id, tx) = (run.id, self.tx.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs_f64(wait_s.max(1.0))).await;
+                    let _ = tx.send(CoreMsg::SequenceRecheck { run_id: id });
+                });
+                self.send_sequence();
+                return true;
+            }
+        }
+
+        let run = self.run.as_ref().expect("running");
+        if run.seq.dither_every > 0 && run.lights_since_dither >= run.seq.dither_every && self.guider_is_guiding() {
+            self.run.as_mut().expect("running").lights_since_dither = 0;
+            match self.guider_dither() {
+                Ok(()) => {
+                    let run = self.run.as_mut().expect("running");
+                    run.wait = Wait::Settle;
+                    run.message = "Dithering — waiting for guiding to settle".into();
+                    self.send_sequence();
+                    return true;
+                }
+                Err(e) => self.log(None, format!("Dither skipped: {e}"), LogLevel::Warning),
+            }
+        }
+        false
+    }
+
+    fn start_flip(&mut self, m: protocol::MountInfo) {
+        let restart_guiding = self.guider_is_guiding();
+        self.log(
+            None,
+            format!(
+                "Meridian flip: target is {:.0} min past the meridian",
+                m.hour_angle.unwrap_or(0.0) * 60.0 / SIDEREAL_RATE
+            ),
+            LogLevel::Info,
+        );
+        let run = self.run.as_mut().expect("running");
+        run.wait = Wait::Flip {
+            phase: FlipPhase::Slewing { seen_busy: false },
+            restart_guiding,
+            pier_before: m.pier_side.clone(),
+        };
+        run.message = "Meridian flip: slewing".into();
+        let (id, tx) = (run.id, self.tx.clone());
+        self.guider_stop();
+        if let Err(e) = self.mount_goto(m.ra_j2000, m.dec_j2000) {
+            return self.sequence_failed(format!("meridian flip failed: {e}"));
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(FLIP_TIMEOUT).await;
+            let _ = tx.send(CoreMsg::FlipTimeout { run_id: id });
+        });
+        self.send_sequence();
+    }
+
+    fn flip_slew_done(&mut self) {
+        let Some(Run {
+            wait: Wait::Flip {
+                restart_guiding,
+                pier_before,
+                ..
+            },
+            ..
+        }) = &self.run
+        else {
+            return;
+        };
+        let (restart, before) = (*restart_guiding, pier_before.clone());
+        let after = self.mount_info().and_then(|m| m.pier_side);
+        if after == before {
+            self.log(
+                None,
+                "Meridian flip: the mount did not change pier side — check its meridian limits",
+                LogLevel::Warning,
+            );
+        }
+        if restart {
+            match self.guider_restart_after_flip() {
+                Ok(()) => {
+                    let run = self.run.as_mut().expect("running");
+                    if let Wait::Flip { phase, .. } = &mut run.wait {
+                        *phase = FlipPhase::GuideSettle;
+                    }
+                    run.message = "Meridian flip: restarting guiding".into();
+                    self.send_sequence();
+                    return;
+                }
+                Err(e) => self.log(None, format!("Could not restart guiding after the flip: {e}"), LogLevel::Warning),
+            }
+        }
+        self.finish_flip();
+    }
+
+    fn finish_flip(&mut self) {
+        if let Some(run) = &mut self.run {
+            run.wait = Wait::None;
+        }
+        self.log(None, "Meridian flip complete", LogLevel::Info);
+        self.sequence_next();
+    }
+
+    pub(super) fn sequence_flipping(&self) -> bool {
+        self.run.as_ref().is_some_and(|r| matches!(r.wait, Wait::Flip { .. }))
+    }
+
+    /// The guider finished settling (after a dither or restart).
+    pub(super) fn sequence_on_settled(&mut self, _outcome: SettleOutcome) {
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        match run.wait {
+            Wait::Settle => {
+                run.wait = Wait::None;
+                self.sequence_next();
+            }
+            Wait::Flip {
+                phase: FlipPhase::GuideSettle,
+                ..
+            } => self.finish_flip(),
+            _ => {}
+        }
+    }
+
+    pub(super) fn sequence_recheck(&mut self, run_id: u64) {
+        if let Some(run) = &mut self.run
+            && run.id == run_id
+            && run.wait == Wait::Meridian
+        {
+            run.wait = Wait::None;
+            self.sequence_next();
+        }
+    }
+
+    pub(super) fn flip_timeout(&mut self, run_id: u64) {
+        if self.run.as_ref().is_some_and(|r| r.id == run_id && matches!(r.wait, Wait::Flip { .. })) {
+            self.sequence_failed("meridian flip did not complete in 10 minutes".into());
+        }
+    }
+
+    /// Property updates relevant to the sequencer (sensor temperature, flip slews).
     pub(super) fn sequence_on_update(&mut self, device: &str, name: &str) {
         let Some(run) = &self.run else {
             return;
         };
+        if matches!(run.wait, Wait::Flip { phase: FlipPhase::Slewing { .. }, .. }) {
+            if self.state.roles.mount.as_deref() == Some(device) && name == "EQUATORIAL_EOD_COORD" {
+                let slewing = self.mount_info().is_some_and(|m| m.slewing);
+                let mut done = false;
+                if let Some(Run {
+                    wait:
+                        Wait::Flip {
+                            phase: FlipPhase::Slewing { seen_busy },
+                            ..
+                        },
+                    ..
+                }) = &mut self.run
+                {
+                    if slewing {
+                        *seen_busy = true;
+                    } else if *seen_busy {
+                        done = true;
+                    }
+                }
+                if done {
+                    self.flip_slew_done();
+                }
+            }
+            return;
+        }
+        let run = self.run.as_ref().expect("checked");
         let Wait::Temperature { target, .. } = run.wait else {
             return;
         };
@@ -504,6 +720,7 @@ mod tests {
             paused: false,
             flat: vec![FlatState::default(); n],
             message: String::new(),
+            lights_since_dither: 0,
         }
     }
 

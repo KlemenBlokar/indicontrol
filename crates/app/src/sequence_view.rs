@@ -198,6 +198,17 @@ impl SequenceView {
             ui.end_row();
         });
         ui.horizontal(|ui| {
+            ui.label("Dither every");
+            ui.add(egui::DragValue::new(&mut seq.dither_every).range(0..=100));
+            ui.label(if seq.dither_every == 0 { "(off)" } else { "light frames, when guiding" });
+            ui.separator();
+            ui.checkbox(&mut seq.meridian_flip, "Meridian flip");
+            ui.add_enabled(
+                seq.meridian_flip,
+                egui::DragValue::new(&mut seq.flip_minutes_past).range(0.0..=60.0).suffix(" min past"),
+            );
+        });
+        ui.horizontal(|ui| {
             ui.label("Order");
             ui.selectable_value(&mut seq.order, SequenceOrder::ByStep, "Step by step")
                 .on_hover_text("All frames of a step, then the next step");

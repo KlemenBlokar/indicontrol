@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod equipment;
 pub mod guider;
+pub mod mount;
 pub mod sequence;
 
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
+pub use mount::MountInfo;
 pub use sequence::{
     Exposure, FlatRecord, RunState, Sequence, SequenceOrder, SequenceStatus, SequenceStep,
 };
@@ -287,6 +289,7 @@ pub enum ToUi {
     Guider { status: Box<GuiderStatus> },
     GuideStep(GuideStep),
     GuiderSettings(GuiderSettings),
+    Mount { info: Option<Box<MountInfo>> },
 }
 
 /// UI → engine.
@@ -341,6 +344,14 @@ pub enum ToEngine {
     GuiderGuide,
     GuiderClearCalibration,
     SetGuiderSettings(GuiderSettings),
+    /// Shift the lock position and wait for guiding to settle.
+    GuiderDither,
+    /// Slew to J2000 coordinates and track.
+    MountGoto { ra_hours: f64, dec_deg: f64 },
+    MountPark,
+    MountUnpark,
+    MountAbort,
+    MountTracking { on: bool },
 }
 
 macro_rules! json_codec {
@@ -381,6 +392,7 @@ pub struct UiState {
     pub guider_settings: GuiderSettings,
     /// Recent guide steps, oldest first.
     pub guide_history: VecDeque<GuideStep>,
+    pub mount: Option<MountInfo>,
 }
 
 impl Default for UiState {
@@ -403,6 +415,7 @@ impl Default for UiState {
             guider: GuiderStatus::default(),
             guider_settings: GuiderSettings::default(),
             guide_history: VecDeque::new(),
+            mount: None,
         }
     }
 }
@@ -469,6 +482,7 @@ impl UiState {
                 self.guide_history.push_back(step);
             }
             ToUi::GuiderSettings(s) => self.guider_settings = s,
+            ToUi::Mount { info } => self.mount = info.map(|i| *i),
         }
     }
 
@@ -615,6 +629,7 @@ mod tests {
                 star_lost: false,
             }),
             ToUi::GuiderSettings(GuiderSettings::default()),
+            ToUi::Mount { info: None },
         ] {
             assert_eq!(ToUi::from_json(&m.to_json()).unwrap(), m);
         }
@@ -626,6 +641,9 @@ mod tests {
             ToEngine::AbortCapture,
             ToEngine::GuiderSelectStar { x: 1.5, y: 2.0 },
             ToEngine::GuiderGuide,
+            ToEngine::GuiderDither,
+            ToEngine::MountGoto { ra_hours: 5.5, dec_deg: -5.4 },
+            ToEngine::MountTracking { on: false },
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);

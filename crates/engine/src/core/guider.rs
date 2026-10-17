@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use guiding::{CalStep, Calibrator, Frame, GuideController, GuideStats, Star};
+use guiding::{
+    CalStep, Calibration, Calibrator, DitherRng, Frame, GuideController, GuideStats, SettleOutcome,
+    SettleTracker, Star, dither_offset,
+};
 use imaging::{Fits, Image, analyze, encode_jpeg, make_preview};
 use protocol::equipment;
 use protocol::preview_frame::{self, Kind};
@@ -37,6 +40,10 @@ pub(crate) struct GuiderCore {
     message: String,
     guide_after_calibration: bool,
     last_preview: Option<Outgoing>,
+    /// Calibration in use (flipped if the mount changed pier side).
+    active_calibration: Option<Calibration>,
+    settle: Option<SettleTracker>,
+    rng: DitherRng,
 }
 
 #[derive(Default)]
@@ -233,7 +240,7 @@ impl Core {
 
         let max_lost = self.state.guider.max_lost_frames;
         let declination = self.mount_declination();
-        let calibration = self.state.guider_calibration.clone();
+        let calibration = self.guider.active_calibration.clone();
         let g = &mut self.guider;
         match &mut g.mode {
             Mode::Idle => {}
@@ -279,7 +286,8 @@ impl Core {
                         } else {
                             LogLevel::Info
                         };
-                        self.state.guider_calibration = Some(c);
+                        self.state.guider_calibration = Some(c.clone());
+                        self.guider.active_calibration = Some(c);
                         self.save();
                         self.log(None, text, level);
                         let g = &mut self.guider;
@@ -312,7 +320,11 @@ impl Core {
                     };
                     let lost = g.lost;
                     g.message = format!("Star lost ({lost} frames)");
+                    let settled = g.settle.as_mut().and_then(|t| t.update(elapsed, None));
                     self.send(ToUi::GuideStep(step));
+                    if let Some(outcome) = settled {
+                        self.guider_settled(outcome);
+                    }
                     if lost >= max_lost {
                         return self.guider_fail_to_loop("Guide star lost".into());
                     }
@@ -330,6 +342,13 @@ impl Core {
                 }
                 let stats = GuideStats::from_errors(g.errors.iter().copied());
                 g.message = format!("Guiding — RMS {:.2} px", stats.total_rms);
+                let settled = g
+                    .settle
+                    .as_mut()
+                    .and_then(|t| t.update(elapsed, Some(c.ra_px.hypot(c.dec_px))));
+                if g.settle.is_some() {
+                    g.message = format!("Settling — error {:.2} px", c.ra_px.hypot(c.dec_px));
+                }
                 let step = GuideStep {
                     frame: g.steps,
                     time: elapsed,
@@ -343,6 +362,9 @@ impl Core {
                 let pulses: Vec<(GuideDir, f64)> = [c.ra, c.dec].into_iter().flatten().collect();
                 let longest = pulses.iter().map(|p| p.1).fold(0.0, f64::max);
                 self.send(ToUi::GuideStep(step));
+                if let Some(outcome) = settled {
+                    self.guider_settled(outcome);
+                }
                 self.send_guider();
                 match self.guide_pulse(&pulses) {
                     Ok(()) => self.guide_next_after(longest),
@@ -448,18 +470,9 @@ impl Core {
     }
 
     pub(super) fn guider_guide(&mut self) -> Result<(), String> {
-        let Some(cal) = &self.state.guider_calibration else {
+        if self.state.guider_calibration.is_none() {
             self.log(None, "No calibration yet — calibrating first", LogLevel::Info);
             return self.guider_calibrate(true);
-        };
-        if let (Some(side), Some(now)) = (&cal.pier_side, self.mount_pier_side())
-            && *side != now
-        {
-            self.log(
-                None,
-                format!("Calibrated on the {side} side, mount is now {now} — recalibrate if guiding misbehaves"),
-                LogLevel::Warning,
-            );
         }
         if self.guider.star.is_none() {
             self.guider.select = Some(Select::Auto);
@@ -470,7 +483,11 @@ impl Core {
     }
 
     fn guider_start_guiding(&mut self) {
+        let active = self.calibration_for_pier_side();
+        let settings = self.state.guider.clone();
         let g = &mut self.guider;
+        g.active_calibration = active;
+        g.settle = Some(SettleTracker::new(settings.settle_px, settings.settle_time, settings.settle_timeout, 0.0));
         g.mode = Mode::Guiding(GuideController::new(self.state.guider.params.clone()));
         g.lock = g.star.map(|s| (s.x, s.y)).or(g.lock);
         g.errors.clear();
@@ -482,6 +499,75 @@ impl Core {
         self.send_guider();
     }
 
+    /// After a meridian flip the field has rotated: pick a star afresh.
+    pub(super) fn guider_restart_after_flip(&mut self) -> Result<(), String> {
+        self.guider.star = None;
+        self.guider.lock = None;
+        self.guider_guide()
+    }
+
+    /// The stored calibration, turned 180° if the mount is now on the other
+    /// side of the pier.
+    fn calibration_for_pier_side(&mut self) -> Option<Calibration> {
+        let cal = self.state.guider_calibration.clone()?;
+        let (Some(side), Some(now)) = (cal.pier_side.clone(), self.mount_pier_side()) else {
+            return Some(cal);
+        };
+        if side == now {
+            return Some(cal);
+        }
+        if self.state.guider.flip_calibration {
+            self.log(
+                None,
+                format!("Calibrated on the {side} side, now {now}: using the flipped calibration"),
+                LogLevel::Info,
+            );
+            Some(cal.flipped(self.state.guider.flip_dec))
+        } else {
+            self.log(
+                None,
+                format!("Calibrated on the {side} side, mount is now {now} — recalibrate"),
+                LogLevel::Warning,
+            );
+            Some(cal)
+        }
+    }
+
+    /// Move the lock position by a random offset and wait for guiding to settle.
+    pub(super) fn guider_dither(&mut self) -> Result<(), String> {
+        let settings = self.state.guider.clone();
+        let g = &mut self.guider;
+        if !matches!(g.mode, Mode::Guiding(_)) {
+            return Err("dithering needs active guiding".into());
+        }
+        let (Some(cal), Some((lx, ly))) = (&g.active_calibration, g.lock) else {
+            return Err("no calibration or lock position".into());
+        };
+        let (dx, dy) = dither_offset(cal, settings.dither_px, settings.dither_ra_only, &mut g.rng);
+        g.lock = Some((lx + dx, ly + dy));
+        let now = g.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        g.settle = Some(SettleTracker::new(settings.settle_px, settings.settle_time, settings.settle_timeout, now));
+        g.message = "Dithering".into();
+        self.log(None, format!("Dither by ({dx:+.1}, {dy:+.1}) px"), LogLevel::Info);
+        self.send_guider();
+        Ok(())
+    }
+
+    fn guider_settled(&mut self, outcome: SettleOutcome) {
+        self.guider.settle = None;
+        match outcome {
+            SettleOutcome::Settled => self.log(None, "Guiding settled", LogLevel::Info),
+            SettleOutcome::TimedOut => {
+                self.log(None, "Guiding did not settle in time — continuing", LogLevel::Warning)
+            }
+        }
+        self.sequence_on_settled(outcome);
+    }
+
+    pub(super) fn guider_is_guiding(&self) -> bool {
+        matches!(self.guider.mode, Mode::Guiding(_))
+    }
+
     pub(super) fn guider_stop(&mut self) {
         let g = &mut self.guider;
         if matches!(g.mode, Mode::Idle) {
@@ -489,6 +575,7 @@ impl Core {
         }
         let was_guiding = matches!(g.mode, Mode::Guiding(_));
         g.mode = Mode::Idle;
+        g.settle = None;
         g.seq += 1;
         if std::mem::take(&mut g.exposing)
             && let (Some(c), Some(cam)) = (&self.client, &g.camera)
@@ -514,6 +601,7 @@ impl Core {
 
     /// Drop back to looping after a calibration/guiding failure.
     fn guider_fail_to_loop(&mut self, reason: String) {
+        let was_settling = self.guider.settle.take().is_some();
         let g = &mut self.guider;
         g.mode = Mode::Looping;
         g.guide_after_calibration = false;
@@ -521,6 +609,9 @@ impl Core {
         self.log(None, reason, LogLevel::Error);
         self.send_guider();
         self.guide_expose();
+        if was_settling {
+            self.sequence_on_settled(SettleOutcome::TimedOut);
+        }
     }
 
     fn mount_declination(&self) -> Option<f64> {
@@ -576,9 +667,10 @@ impl Core {
                 frame_size: g.frame_size,
                 star: g.star,
                 lock: g.lock,
-                calibration: self.state.guider_calibration.clone(),
+                calibration: g.active_calibration.clone().or_else(|| self.state.guider_calibration.clone()),
                 pixel_scale: self.guide_pixel_scale(),
                 stats: GuideStats::from_errors(g.errors.iter().copied()),
+                settling: g.settle.is_some(),
                 message: g.message.clone(),
             }),
         }

@@ -33,6 +33,19 @@ pub struct GuiderSettings {
     pub max_lost_frames: u32,
     /// Pause after a pulse before the next exposure (ms).
     pub settle_ms: f64,
+    /// Maximum dither offset along each axis (guide pixels).
+    pub dither_px: f64,
+    pub dither_ra_only: bool,
+    /// Settled when the error stays below this (guide pixels)…
+    pub settle_px: f64,
+    /// …for this long (seconds).
+    pub settle_time: f64,
+    /// Give up waiting for settling after this long (seconds).
+    pub settle_timeout: f64,
+    /// Reuse the calibration after a meridian flip by turning it 180°.
+    pub flip_calibration: bool,
+    /// Also reverse Dec when flipping (uncheck if the mount reverses Dec itself).
+    pub flip_dec: bool,
 }
 
 impl Default for GuiderSettings {
@@ -47,6 +60,13 @@ impl Default for GuiderSettings {
             search_radius: 15.0,
             max_lost_frames: 10,
             settle_ms: 100.0,
+            dither_px: 3.0,
+            dither_ra_only: false,
+            settle_px: 1.5,
+            settle_time: 10.0,
+            settle_timeout: 60.0,
+            flip_calibration: true,
+            flip_dec: true,
         }
     }
 }
@@ -72,6 +92,8 @@ pub struct GuiderStatus {
     pub pixel_scale: Option<f64>,
     /// Recent guiding errors (pixels).
     pub stats: GuideStats,
+    /// Waiting for guiding to settle (after a dither or start).
+    pub settling: bool,
     pub message: String,
 }
 
@@ -86,6 +108,7 @@ impl Default for GuiderStatus {
             calibration: None,
             pixel_scale: None,
             stats: GuideStats::default(),
+            settling: false,
             message: String::new(),
         }
     }

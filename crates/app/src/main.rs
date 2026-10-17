@@ -2,6 +2,7 @@ mod app;
 mod guider_view;
 mod imaging_view;
 mod link;
+mod mount_view;
 mod property_view;
 mod sequence_view;
 

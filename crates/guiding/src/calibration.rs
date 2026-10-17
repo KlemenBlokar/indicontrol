@@ -42,6 +42,35 @@ impl Calibration {
         (deg - 90.0).abs().min((deg - 270.0).abs())
     }
 
+    /// The same calibration after a meridian flip: the camera has turned 180°
+    /// relative to the sky, so both axes point the other way in the image.
+    /// `flip_dec = false` is for mounts that already reverse Dec themselves.
+    pub fn flipped(&self, flip_dec: bool) -> Calibration {
+        let pi = std::f64::consts::PI;
+        Calibration {
+            ra_angle: (self.ra_angle + pi).rem_euclid(std::f64::consts::TAU),
+            dec_angle: if flip_dec {
+                (self.dec_angle + pi).rem_euclid(std::f64::consts::TAU)
+            } else {
+                self.dec_angle
+            },
+            pier_side: self.pier_side.as_deref().map(|p| match p {
+                "EAST" => "WEST".to_owned(),
+                "WEST" => "EAST".to_owned(),
+                other => other.to_owned(),
+            }),
+            ..self.clone()
+        }
+    }
+
+    /// Camera-frame offset for a dither of `ra`/`dec` pixels along the mount axes.
+    pub fn mount_to_camera(&self, ra: f64, dec: f64) -> (f64, f64) {
+        (
+            ra * self.ra_angle.cos() + dec * self.dec_angle.cos(),
+            ra * self.ra_angle.sin() + dec * self.dec_angle.sin(),
+        )
+    }
+
     /// RA rate adjusted for the current declination (RA moves slower near the pole).
     pub fn ra_rate_at(&self, declination: Option<f64>) -> f64 {
         match (self.declination, declination) {
@@ -246,6 +275,21 @@ mod tests {
         assert!((cal(30.0, 120.0).orthogonality_error()).abs() < 1e-9);
         assert!((cal(30.0, 110.0).orthogonality_error() - 10.0).abs() < 1e-9);
         assert!((cal(10.0, -80.0).orthogonality_error()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flip_and_axis_mapping() {
+        let mut c = cal(30.0, 120.0);
+        c.pier_side = Some("WEST".into());
+        let f = c.flipped(true);
+        assert!((f.ra_angle.to_degrees() - 210.0).abs() < 1e-9);
+        assert!((f.dec_angle.to_degrees() - 300.0).abs() < 1e-9);
+        assert_eq!(f.pier_side.as_deref(), Some("EAST"));
+        assert!((c.flipped(false).dec_angle - c.dec_angle).abs() < 1e-12);
+        assert_eq!(f.flipped(true).pier_side.as_deref(), Some("WEST"));
+        let (dx, dy) = c.mount_to_camera(2.0, -1.0);
+        let (ra, dec) = c.to_mount(dx, dy);
+        assert!((ra - 2.0).abs() < 1e-9 && (dec + 1.0).abs() < 1e-9);
     }
 
     #[test]

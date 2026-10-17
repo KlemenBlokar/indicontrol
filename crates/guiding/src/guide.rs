@@ -359,6 +359,20 @@ mod tests {
     }
 
     #[test]
+    fn flipped_calibration_guides_after_meridian_flip() {
+        let mut sim = SimMount::new(37.0);
+        let cal = calibrate(&mut sim);
+        // Meridian flip: the camera turns 180° relative to the sky.
+        sim.theta += std::f64::consts::PI;
+        let guided = run_guiding(&mut sim, Some(&cal.flipped(true)), 200);
+        assert!(guided.total_rms < 0.8, "flipped guiding rms {guided:?}");
+        // Using the unflipped calibration would push the star away.
+        let mut sim2 = SimMount::new(37.0 + 180.0);
+        let wrong = run_guiding(&mut sim2, Some(&cal), 60);
+        assert!(wrong.total_rms > 5.0, "unflipped should diverge: {wrong:?}");
+    }
+
+    #[test]
     fn dec_resists_switching() {
         let cal = Calibration {
             ra_angle: 0.0,
