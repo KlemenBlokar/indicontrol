@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use protocol::{ImagingSettings, Roles};
+use protocol::{FlatRecord, ImagingSettings, Roles, Sequence};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +30,9 @@ pub struct PersistedState {
     pub indi: IndiSettings,
     pub roles: Roles,
     pub imaging: ImagingSettings,
+    pub sequences: Vec<Sequence>,
+    /// Exposures found by flat auto-exposure, for matching dark flats.
+    pub flat_exposures: Vec<FlatRecord>,
 }
 
 /// `~/Pictures/indicontrol` (or `~/indicontrol` without a pictures dir).

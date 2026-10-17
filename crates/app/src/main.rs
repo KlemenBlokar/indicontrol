@@ -2,6 +2,7 @@ mod app;
 mod imaging_view;
 mod link;
 mod property_view;
+mod sequence_view;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {

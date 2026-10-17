@@ -285,7 +285,7 @@ impl ImagingView {
         });
     }
 
-    fn image_panel(&mut self, ui: &mut egui::Ui, state: &UiState) {
+    pub fn image_panel(&mut self, ui: &mut egui::Ui, state: &UiState) {
         let Some((id, texture)) = &self.texture else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Capture a frame to see it here.").weak());

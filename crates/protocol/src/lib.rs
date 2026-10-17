@@ -11,8 +11,12 @@ use indi_link::{Cache, Device, Property};
 use serde::{Deserialize, Serialize};
 
 pub mod equipment;
+pub mod sequence;
 
 pub use imaging::{Analysis, ChannelStats};
+pub use sequence::{
+    Exposure, FlatRecord, RunState, Sequence, SequenceOrder, SequenceStatus, SequenceStep,
+};
 pub use indi_link;
 
 /// Bump on any incompatible message change.
@@ -257,6 +261,10 @@ pub enum ToUi {
     },
     Frame(Box<FrameInfo>),
     ImagingSettings(ImagingSettings),
+    /// Current sequence run, if any.
+    Sequence { status: Option<Box<SequenceStatus>> },
+    /// Sequences saved on the engine.
+    SequenceLibrary { sequences: Vec<Sequence> },
 }
 
 /// UI → engine.
@@ -293,6 +301,13 @@ pub enum ToEngine {
     Capture(CaptureRequest),
     AbortCapture,
     SetImagingSettings(ImagingSettings),
+    StartSequence(Sequence),
+    PauseSequence,
+    ResumeSequence,
+    AbortSequence,
+    /// Save (or replace, by name) a sequence in the engine's library.
+    SaveSequence(Sequence),
+    DeleteSequence { name: String },
 }
 
 macro_rules! json_codec {
@@ -327,6 +342,8 @@ pub struct UiState {
     pub frames_captured: u32,
     pub last_frame: Option<FrameInfo>,
     pub imaging: ImagingSettings,
+    pub sequence: Option<SequenceStatus>,
+    pub library: Vec<Sequence>,
 }
 
 impl Default for UiState {
@@ -344,6 +361,8 @@ impl Default for UiState {
             frames_captured: 0,
             last_frame: None,
             imaging: ImagingSettings::default(),
+            sequence: None,
+            library: Vec::new(),
         }
     }
 }
@@ -399,6 +418,8 @@ impl UiState {
             }
             ToUi::Frame(info) => self.last_frame = Some(*info),
             ToUi::ImagingSettings(s) => self.imaging = s,
+            ToUi::Sequence { status } => self.sequence = status.map(|s| *s),
+            ToUi::SequenceLibrary { sequences } => self.library = sequences,
         }
     }
 
@@ -508,6 +529,39 @@ mod tests {
             frames: 2,
         };
         assert_eq!(ToUi::from_json(&st.to_json()).unwrap(), st);
+    }
+
+    #[test]
+    fn sequence_messages_round_trip() {
+        let seq = Sequence {
+            name: "LRGB".into(),
+            steps: vec![SequenceStep::default(), sequence::presets::bias(10, Some(-10.0))],
+            ..Default::default()
+        };
+        let status = SequenceStatus {
+            sequence: seq.clone(),
+            state: RunState::Running,
+            current_step: Some(1),
+            done: vec![3, 0],
+            message: "x".into(),
+        };
+        for m in [
+            ToUi::Sequence { status: None },
+            ToUi::Sequence { status: Some(Box::new(status)) },
+            ToUi::SequenceLibrary { sequences: vec![] },
+            ToUi::SequenceLibrary { sequences: vec![seq.clone()] },
+        ] {
+            assert_eq!(ToUi::from_json(&m.to_json()).unwrap(), m);
+        }
+        for c in [
+            ToEngine::StartSequence(seq.clone()),
+            ToEngine::SaveSequence(seq),
+            ToEngine::DeleteSequence { name: "x".into() },
+            ToEngine::PauseSequence,
+            ToEngine::AbortCapture,
+        ] {
+            assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);
+        }
     }
 
     #[test]

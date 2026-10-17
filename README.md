@@ -66,6 +66,25 @@ The histogram panel shows linear or log histograms per channel, with
 counts of pixels at 0 (black clipping: raise the offset), how far the dark
 end of the signal sits above 0 in noise sigmas, and saturated pixels.
 
+## Sequences
+
+The Sequence tab builds a list of steps, each with frame type, filter,
+exposure, count, and optional binning, gain, offset and sensor temperature.
+Steps run one after another or interleaved (LRGBLRGB…). Presets add
+LRGB or SHO lights (filters are found by name in the wheel), exposure
+bracketing, darks, bias, flats and dark flats.
+
+- **Flats** use automatic exposure. Test frames, which are not saved, adjust
+  the exposure until the brightest channel's median sits at the target
+  (45 % ± 5 % by default). Sky flats keep adjusting as the light changes.
+- **Dark flats** reuse the exposure found for flats with the same filter,
+  binning and gain. The engine remembers it across sessions.
+- **Temperature**: a step with a temperature cools the sensor and waits
+  until it is within 0.5 °C of the target before exposing.
+
+Sequences are saved on the engine, so every connected UI shares them.
+Pause takes effect after the current frame.
+
 ## Web UI
 
 Build the wasm UI with [trunk](https://trunkrs.dev) (needs the

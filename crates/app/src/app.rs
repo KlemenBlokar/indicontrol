@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::imaging_view::{CaptureForm, ImagingView};
 use crate::link::{EngineLink, Incoming, LinkState};
 use crate::property_view::{self, Edits};
+use crate::sequence_view::{SequenceDraft, SequenceView};
 
 /// Which engine the UI talks to (native builds only; the web UI always uses
 /// the engine that served it).
@@ -25,6 +26,7 @@ pub enum EngineChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum View {
     Imaging,
+    Sequence,
     Devices,
 }
 
@@ -35,6 +37,7 @@ struct UiSettings {
     engine: EngineChoice,
     view: View,
     capture: CaptureForm,
+    sequence: SequenceDraft,
 }
 
 impl Default for UiSettings {
@@ -44,6 +47,7 @@ impl Default for UiSettings {
             engine: EngineChoice::Local,
             view: View::Imaging,
             capture: CaptureForm::default(),
+            sequence: SequenceDraft::default(),
         }
     }
 }
@@ -103,6 +107,7 @@ pub struct App {
     engine_input: String,
     applied_night_mode: Option<bool>,
     imaging: ImagingView,
+    sequence: SequenceView,
     #[cfg(not(target_arch = "wasm32"))]
     local: LocalEngine,
 }
@@ -123,9 +128,11 @@ impl App {
         #[cfg(target_arch = "wasm32")]
         let _ = options.local_indi;
         let imaging = ImagingView::new(settings.capture.clone());
+        let sequence = SequenceView::new(settings.sequence.clone());
         let mut app = Self {
             settings,
             imaging,
+            sequence,
             link: None,
             link_error: None,
             state: UiState::default(),
@@ -529,12 +536,30 @@ impl eframe::App for App {
                 );
             }
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.settings.view, View::Imaging, RichText::new("Imaging").heading());
-                ui.selectable_value(&mut self.settings.view, View::Devices, RichText::new("Devices").heading());
+                for (view, label) in [
+                    (View::Imaging, "Imaging"),
+                    (View::Sequence, "Sequence"),
+                    (View::Devices, "Devices"),
+                ] {
+                    ui.selectable_value(&mut self.settings.view, view, RichText::new(label).heading());
+                }
+                if let Some(s) = &self.state.sequence
+                    && self.settings.view != View::Sequence
+                {
+                    ui.label(
+                        RichText::new(format!(
+                            "Sequence: {} / {} frames",
+                            s.frames_done(),
+                            s.sequence.planned_frames()
+                        ))
+                        .weak(),
+                    );
+                }
             });
             ui.separator();
             ui.add_enabled_ui(usable, |ui| match self.settings.view {
                 View::Imaging => self.imaging.ui(ui, &self.state, &mut actions),
+                View::Sequence => self.sequence.ui(ui, &self.state, &mut self.imaging, &mut actions),
                 View::Devices => self.device_view(ui, &mut actions),
             });
         });
@@ -545,6 +570,7 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings.capture = self.imaging.form.clone();
+        self.settings.sequence = self.sequence.draft.clone();
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
 }

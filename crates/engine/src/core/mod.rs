@@ -2,6 +2,7 @@
 //! engine state. UI sessions and helper tasks talk to it through [`CoreMsg`].
 
 mod capture;
+mod sequence;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ pub(crate) enum CoreMsg {
     },
     CaptureTimeout { job_id: u64, frame: u32 },
     FilterTimeout { job_id: u64 },
+    TemperatureTimeout { run_id: u64, step: usize },
 }
 
 /// A message to UIs: JSON text or a binary image preview.
@@ -72,6 +74,8 @@ pub(crate) struct Core {
     next_frame_id: u64,
     /// Latest frame info + preview, replayed to new UIs.
     last_frame: Option<(Outgoing, Outgoing)>,
+    run: Option<sequence::Run>,
+    next_run_id: u64,
 }
 
 impl Core {
@@ -94,6 +98,8 @@ impl Core {
             next_job_id: 0,
             next_frame_id: 0,
             last_frame: None,
+            run: None,
+            next_run_id: 0,
         };
         (core, tx)
     }
@@ -147,6 +153,7 @@ impl Core {
             CoreMsg::FrameDone { job_id, result } => self.frame_done(job_id, *result),
             CoreMsg::CaptureTimeout { job_id, frame } => self.capture_timeout(job_id, frame),
             CoreMsg::FilterTimeout { job_id } => self.filter_timeout(job_id),
+            CoreMsg::TemperatureTimeout { run_id, step } => self.temperature_timeout(run_id, step),
             CoreMsg::Retry { attempt } => {
                 if attempt == self.attempt && self.state.indi.autoconnect && self.client.is_none() {
                     self.connect();
@@ -168,6 +175,7 @@ impl Core {
             }
             ToEngine::DisconnectIndi => {
                 self.fail_capture("disconnected from INDI".into());
+                self.sequence_failed("disconnected from INDI".into());
                 self.state.indi.autoconnect = false;
                 self.save();
                 self.attempt += 1;
@@ -196,13 +204,60 @@ impl Core {
                 Ok(())
             }
             ToEngine::Capture(req) => {
-                if let Err(e) = self.start_capture(req) {
+                if let Err(e) = self.start_capture(req, false) {
                     self.log(None, format!("Cannot capture: {e}"), LogLevel::Error);
                 }
                 Ok(())
             }
             ToEngine::AbortCapture => {
-                self.abort_capture();
+                if self.run.is_some() {
+                    self.abort_sequence();
+                } else {
+                    self.abort_capture();
+                }
+                Ok(())
+            }
+            ToEngine::StartSequence(seq) => {
+                if let Err(e) = self.start_sequence(seq) {
+                    self.log(None, format!("Cannot start sequence: {e}"), LogLevel::Error);
+                }
+                Ok(())
+            }
+            ToEngine::PauseSequence => {
+                self.pause_sequence();
+                Ok(())
+            }
+            ToEngine::ResumeSequence => {
+                self.resume_sequence();
+                Ok(())
+            }
+            ToEngine::AbortSequence => {
+                self.abort_sequence();
+                Ok(())
+            }
+            ToEngine::SaveSequence(seq) => {
+                if seq.name.trim().is_empty() {
+                    self.log(None, "Give the sequence a name before saving", LogLevel::Error);
+                } else {
+                    let lib = &mut self.state.sequences;
+                    match lib.iter_mut().find(|s| s.name == seq.name) {
+                        Some(existing) => *existing = seq,
+                        None => lib.push(seq),
+                    }
+                    lib.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    self.save();
+                    self.send(ToUi::SequenceLibrary {
+                        sequences: self.state.sequences.clone(),
+                    });
+                }
+                Ok(())
+            }
+            ToEngine::DeleteSequence { name } => {
+                self.state.sequences.retain(|s| s.name != name);
+                self.save();
+                self.send(ToUi::SequenceLibrary {
+                        sequences: self.state.sequences.clone(),
+                    });
                 Ok(())
             }
             ToEngine::ConnectDevice { device } => self.with_client(|c| c.connect_device(&device)),
@@ -255,6 +310,7 @@ impl Core {
                     self.send(ToUi::PropertyUpdated(p));
                 }
                 self.capture_on_update(&device, &name);
+                self.sequence_on_update(&device, &name);
             }
             Event::Deleted { device, name } => self.send(ToUi::PropertyDeleted { device, name }),
             Event::Message { device, text, .. } => self.log(device, text, LogLevel::Info),
@@ -266,6 +322,7 @@ impl Core {
             } => self.capture_on_blob(&device, format, data),
             Event::Disconnected(reason) => {
                 self.fail_capture("INDI connection lost".into());
+                self.sequence_failed("INDI connection lost".into());
                 self.client = None;
                 self.indi_events = None;
                 let error = reason.unwrap_or_else(|| "server closed the connection".into());
@@ -342,6 +399,10 @@ impl Core {
             ToUi::ImagingSettings(self.state.imaging.clone()),
             ToUi::Devices(devices),
             self.capture_msg(),
+            ToUi::SequenceLibrary {
+                sequences: self.state.sequences.clone(),
+            },
+            self.sequence_msg(),
         ]
         .iter()
         .map(Outgoing::text)

@@ -24,12 +24,17 @@ pub(crate) struct Job {
     ctx: Option<FrameContext>,
     /// Last broadcast remaining time, to throttle progress updates.
     last_remaining: f64,
+    /// Started by the sequencer, which is told about the outcome.
+    from_sequence: bool,
 }
 
 impl Core {
-    pub(super) fn start_capture(&mut self, req: CaptureRequest) -> Result<(), String> {
+    pub(super) fn start_capture(&mut self, req: CaptureRequest, from_sequence: bool) -> Result<(), String> {
         if self.job.is_some() {
             return Err("a capture is already running".into());
+        }
+        if !from_sequence && self.run.is_some() {
+            return Err("a sequence is running".into());
         }
         if !(req.exposure >= 0.0 && req.exposure.is_finite()) {
             return Err("invalid exposure time".into());
@@ -105,6 +110,7 @@ impl Core {
             frames: 0,
             ctx: None,
             last_remaining: f64::INFINITY,
+            from_sequence,
         });
         if needs_filter_change {
             self.set_capture_state(CaptureState::Preparing {
@@ -229,6 +235,13 @@ impl Core {
         let current = self.job.as_ref().is_some_and(|j| j.id == job_id);
         match result {
             Ok(out) => {
+                let a = &out.info.analysis;
+                let brightest = a
+                    .channels
+                    .iter()
+                    .map(|c| c.median)
+                    .fold(0.0, f64::max)
+                    / a.adc_max.max(1) as f64;
                 let text = match &out.info.path {
                     Some(p) => format!("Saved {p}"),
                     None => format!("Captured {} ({}×{})", out.info.camera, out.info.width, out.info.height),
@@ -245,7 +258,11 @@ impl Core {
                         self.fail_capture(e);
                     }
                 } else {
+                    let from_sequence = job.from_sequence;
                     self.finish_capture();
+                    if from_sequence {
+                        self.sequence_frame_done(brightest);
+                    }
                 }
             }
             Err(e) => {
@@ -300,9 +317,13 @@ impl Core {
     }
 
     pub(super) fn fail_capture(&mut self, reason: String) {
-        if self.job.is_some() {
+        if let Some(job) = &self.job {
+            let from_sequence = job.from_sequence;
             self.log(None, format!("Capture failed: {reason}"), LogLevel::Error);
             self.finish_capture();
+            if from_sequence {
+                self.sequence_failed(reason);
+            }
         }
     }
 
