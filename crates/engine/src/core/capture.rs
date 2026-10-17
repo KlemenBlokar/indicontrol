@@ -36,6 +36,8 @@ pub(crate) enum Purpose {
     Sequence,
     /// The raw frame also goes to the plate solver.
     Solve,
+    /// Autofocus measures the stars.
+    Focus,
 }
 
 impl Core {
@@ -48,6 +50,9 @@ impl Core {
         }
         if purpose == Purpose::User && self.solving() {
             return Err("plate solving is in progress".into());
+        }
+        if purpose == Purpose::User && self.focusing() {
+            return Err("autofocus is running".into());
         }
         if !(req.exposure >= 0.0 && req.exposure.is_finite()) {
             return Err("invalid exposure time".into());
@@ -236,6 +241,7 @@ impl Core {
             ctx,
             settings: self.state.imaging.clone(),
             save: job.req.save,
+            star_aperture: self.state.focus.aperture,
         };
         let (job_id, tx) = (job.id, self.tx.clone());
         self.set_capture_state(CaptureState::Processing);
@@ -254,6 +260,7 @@ impl Core {
         let current = self.job.as_ref().is_some_and(|j| j.id == job_id);
         match result {
             Ok(out) => {
+                let stars = out.info.stars;
                 let a = &out.info.analysis;
                 let brightest = a
                     .channels
@@ -277,10 +284,13 @@ impl Core {
                         self.fail_capture(e);
                     }
                 } else {
-                    let from_sequence = job.purpose == Purpose::Sequence;
+                    let purpose = job.purpose;
                     self.finish_capture();
-                    if from_sequence {
-                        self.sequence_frame_done(brightest);
+                    match purpose {
+                        Purpose::Sequence => self.sequence_frame_done(brightest),
+                        Purpose::Focus => self.focus_frame_done(stars),
+                        Purpose::Solve => self.solve_capture_done(),
+                        Purpose::User => {}
                     }
                 }
             }
@@ -343,6 +353,7 @@ impl Core {
             match purpose {
                 Purpose::Sequence => self.sequence_failed(reason),
                 Purpose::Solve => self.solve_failed(reason),
+                Purpose::Focus => self.focus_failed(reason),
                 Purpose::User => {}
             }
         }

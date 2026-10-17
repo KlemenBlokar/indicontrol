@@ -1,4 +1,5 @@
 mod app;
+mod focus_view;
 mod guider_view;
 mod imaging_view;
 mod link;

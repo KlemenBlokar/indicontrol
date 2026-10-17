@@ -14,27 +14,50 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
-pub const W: usize = 64;
-pub const H: usize = 48;
+pub const W: usize = 160;
+pub const H: usize = 120;
 pub const ZEROS: usize = 7;
 pub const SATURATED: usize = 5;
 
 /// ADU per second of exposure: the fake sky/flat panel brightness.
 pub const RATE: f64 = 20_000.0;
 
-/// Background 1000 + RATE·exposure ADU with mild noise, a few black and saturated pixels.
-pub fn test_frame(exposure: f64) -> Vec<u8> {
-    test_frame_with(exposure, &[])
+/// Focuser position of best focus, and where the fake focuser starts.
+pub const FOCUS_BEST: f64 = 5000.0;
+pub const FOCUS_START: f64 = 4600.0;
+
+/// Star size (Gaussian sigma, px) at a focuser position: a V-curve.
+pub fn star_sigma(focus: f64) -> f64 {
+    (1.2f64.powi(2) + ((focus - FOCUS_BEST) / 120.0).powi(2)).sqrt()
 }
 
-/// [`test_frame`] with extra header cards.
-pub fn test_frame_with(exposure: f64, extra: &[Card]) -> Vec<u8> {
-    let level = (1000.0 + RATE * exposure).min(60_000.0) as u16;
+/// Background 1000 + RATE·exposure ADU with mild noise, 12 stars, a few black
+/// and saturated pixels. Stars are sized for the focuser at [`FOCUS_START`].
+pub fn test_frame(exposure: f64) -> Vec<u8> {
+    test_frame_with(exposure, FOCUS_START, &[])
+}
+
+/// [`test_frame`] at a focuser position, with extra header cards.
+pub fn test_frame_with(exposure: f64, focus: f64, extra: &[Card]) -> Vec<u8> {
+    let level = (1000.0 + RATE * exposure).min(60_000.0);
+    let sigma = star_sigma(focus);
+    // Constant flux: peak falls as stars spread out.
+    let peak = 4000.0 * 1.44 / (sigma * sigma);
+    let stars: Vec<(f64, f64)> = (0..12)
+        .map(|i| (32.0 + (i % 4) as f64 * 32.0, 32.0 + (i / 4) as f64 * 28.0))
+        .collect();
     let pixels: Vec<u16> = (0..W * H)
         .map(|i| match i {
             i if i < ZEROS => 0,
             i if i >= W * H - SATURATED => 65535,
-            i => level + ((i * 7919) % 41) as u16,
+            i => {
+                let (x, y) = ((i % W) as f64, (i / W) as f64);
+                let star: f64 = stars
+                    .iter()
+                    .map(|&(sx, sy)| peak * (-((x - sx).powi(2) + (y - sy).powi(2)) / (2.0 * sigma * sigma)).exp())
+                    .sum();
+                (level + ((i * 7919) % 41) as f64 + star).min(65000.0) as u16
+            }
         })
         .collect();
     let mut h = Header::default();
@@ -82,6 +105,10 @@ const DEFS: &str = r#"
 <defNumberVector device="GuideCam" name="CCD_EXPOSURE" group="Main" state="Idle" perm="rw"><defNumber name="CCD_EXPOSURE_VALUE" format="%.2f" min="0" max="3600" step="1">1</defNumber></defNumberVector>
 <defNumberVector device="GuideCam" name="CCD_INFO" group="Info" state="Ok" perm="ro"><defNumber name="CCD_PIXEL_SIZE" format="%.2f" min="0" max="50" step="0">3.75</defNumber></defNumberVector>
 <defBLOBVector device="GuideCam" name="CCD1" group="Image" state="Idle" perm="ro"><defBLOB name="CCD1"/></defBLOBVector>
+<defSwitchVector device="Focuser" name="CONNECTION" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="CONNECT">On</defSwitch><defSwitch name="DISCONNECT">Off</defSwitch></defSwitchVector>
+<defTextVector device="Focuser" name="DRIVER_INFO" group="Info" perm="ro"><defText name="DRIVER_INTERFACE">8</defText></defTextVector>
+<defNumberVector device="Focuser" name="ABS_FOCUS_POSITION" group="Main" state="Ok" perm="rw"><defNumber name="FOCUS_ABSOLUTE_POSITION" format="%.0f" min="0" max="10000" step="1">@FOCUS@</defNumber></defNumberVector>
+<defNumberVector device="Focuser" name="FOCUS_TEMPERATURE" group="Main" state="Ok" perm="ro"><defNumber name="TEMPERATURE" format="%.1f" min="-50" max="50" step="0">12.5</defNumber></defNumberVector>
 <defNumberVector device="Scope" name="TELESCOPE_TIMED_GUIDE_NS" group="Guide" state="Idle" perm="rw"><defNumber name="TIMED_GUIDE_N" format="%.0f" min="0" max="60000" step="1">0</defNumber><defNumber name="TIMED_GUIDE_S" format="%.0f" min="0" max="60000" step="1">0</defNumber></defNumberVector>
 <defNumberVector device="Scope" name="TELESCOPE_TIMED_GUIDE_WE" group="Guide" state="Idle" perm="rw"><defNumber name="TIMED_GUIDE_W" format="%.0f" min="0" max="60000" step="1">0</defNumber><defNumber name="TIMED_GUIDE_E" format="%.0f" min="0" max="60000" step="1">0</defNumber></defNumberVector>
 <defNumberVector device="Scope" name="TELESCOPE_INFO" group="Info" state="Ok" perm="rw"><defNumber name="GUIDER_FOCAL_LENGTH" format="%g" min="0" max="10000" step="0">240</defNumber><defNumber name="TELESCOPE_FOCAL_LENGTH" format="%g" min="0" max="10000" step="0">500</defNumber></defNumberVector>
@@ -114,8 +141,8 @@ f=""
 while [ $# -gt 0 ]; do case "$1" in -f) f="$2"; shift;; esac; shift; done
 {common}
 printf 'PLTSOLVD=T
-CRPIX1=32.5
-CRPIX2=24.5
+CRPIX1=80.5
+CRPIX2=60.5
 CRVAL1=%s
 CRVAL2=%s
 CD1_1=-0.00086
@@ -133,7 +160,7 @@ while [ $# -gt 0 ]; do case "$1" in --dir) d="$2"; shift;; esac; shift; done
 card() {{ printf '%-80s' "$1"; }}
 out="$d/$(basename "$f" .fits).wcs"
 {{ card "SIMPLE  =                    T"; card "BITPIX  =                    8"; card "NAXIS   =                    0"
-   card "CRVAL1  = $ra"; card "CRVAL2  = $dec"; card "CRPIX1  = 32.5"; card "CRPIX2  = 24.5"
+   card "CRVAL1  = $ra"; card "CRVAL2  = $dec"; card "CRPIX1  = 80.5"; card "CRPIX2  = 60.5"
    card "CD1_1   = -0.00086"; card "CD1_2   = 0.0"; card "CD2_1   = 0.0"; card "CD2_2   = 0.00086"; card "END"
    printf '%1920s' ''; }} > "$out"
 "#
@@ -240,6 +267,7 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
     let mut reported = (ra0, -5.39);
     let mut error = POINTING_ERROR;
     let mut sync_mode = false;
+    let mut focus = FOCUS_START;
     loop {
         let n = match sock.read(&mut buf).await {
             Ok(0) | Err(_) => return seen,
@@ -250,7 +278,10 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
         pending.push_str(text);
         if !defined && pending.contains("<getProperties") {
             defined = true;
-            let defs = DEFS.replace("@TEMP@", &initial_temp.to_string()).replace("@RA@", &ra0.to_string());
+            let defs = DEFS
+                .replace("@TEMP@", &initial_temp.to_string())
+                .replace("@RA@", &ra0.to_string())
+                .replace("@FOCUS@", &focus.to_string());
             sock.write_all(defs.as_bytes()).await.unwrap();
         }
         // Handle complete messages in the order they were sent.
@@ -309,6 +340,12 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
                     r#"<setSwitchVector device="Scope" name="TELESCOPE_PIER_SIDE" state="Ok"><oneSwitch name="PIER_WEST">{w}</oneSwitch><oneSwitch name="PIER_EAST">{e}</oneSwitch></setSwitchVector><setNumberVector device="Scope" name="EQUATORIAL_EOD_COORD" state="Ok"><oneNumber name="RA">{ra}</oneNumber><oneNumber name="DEC">{dec}</oneNumber></setNumberVector>"#
                 );
                 sock.write_all(m.as_bytes()).await.unwrap();
+            } else if msg.contains(r#"name="ABS_FOCUS_POSITION""#) {
+                focus = number_in(msg, "FOCUS_ABSOLUTE_POSITION");
+                sock.write_all(br#"<setNumberVector device="Focuser" name="ABS_FOCUS_POSITION" state="Busy"><oneNumber name="FOCUS_ABSOLUTE_POSITION">0</oneNumber></setNumberVector>"#).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let m = format!(r#"<setNumberVector device="Focuser" name="ABS_FOCUS_POSITION" state="Ok"><oneNumber name="FOCUS_ABSOLUTE_POSITION">{focus}</oneNumber></setNumberVector>"#);
+                sock.write_all(m.as_bytes()).await.unwrap();
             } else if msg.contains(r#"name="TELESCOPE_TIMED_GUIDE_NS""#) {
                 sky.pulse(number_in(msg, "TIMED_GUIDE_N"), number_in(msg, "TIMED_GUIDE_S"), 0.0, 0.0);
             } else if msg.contains(r#"name="TELESCOPE_TIMED_GUIDE_WE""#) {
@@ -332,6 +369,7 @@ pub async fn fake_indi_at(listener: TcpListener, initial_temp: f64, hour_angle_m
                 let (tra, tdec) = imaging::astro::precess(reported.0 + error.0, reported.1 + error.1, jd, imaging::astro::J2000);
                 let frame = test_frame_with(
                     exposure,
+                    focus,
                     &[Card::new("TRUERA", tra * 15.0, ""), Card::new("TRUEDEC", tdec, "")],
                 );
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&frame);

@@ -31,6 +31,8 @@ pub struct Frame<'a> {
     pub height: usize,
     pub data: &'a [u16],
     pub bg: Background,
+    /// Measurement aperture radius (px). Larger for defocused stars.
+    pub aperture: f64,
 }
 
 impl<'a> Frame<'a> {
@@ -47,7 +49,13 @@ impl<'a> Frame<'a> {
                 sigma: c.sigma().max(1.0),
                 saturation: analysis.adc_max as f64 * 0.95,
             },
+            aperture: 7.0,
         }
+    }
+
+    pub fn with_aperture(mut self, aperture: f64) -> Self {
+        self.aperture = aperture.max(3.0);
+        self
     }
 
     fn at(&self, x: usize, y: usize) -> f64 {
@@ -80,12 +88,12 @@ impl<'a> Frame<'a> {
 
     /// Centroid and photometry around an approximate position.
     pub fn measure_at(&self, x: f64, y: f64) -> Option<Star> {
-        const APERTURE: f64 = 7.0;
+        let aperture = self.aperture;
         let (mut cx, mut cy) = (x, y);
         let mut result = None;
         // Re-centre the aperture a few times for sub-pixel accuracy.
         for _ in 0..4 {
-            let m = self.moments(cx, cy, APERTURE)?;
+            let m = self.moments(cx, cy, aperture)?;
             let moved = (m.x - cx).hypot(m.y - cy);
             cx = m.x;
             cy = m.y;
@@ -108,7 +116,6 @@ impl<'a> Frame<'a> {
         let r2 = aperture * aperture;
         let (mut sum, mut sx, mut sy, mut peak, mut npix) = (0.0, 0.0, 0.0, 0.0f64, 0usize);
         let mut raw_peak = 0.0f64;
-        let mut pixels = Vec::new();
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let (dx, dy) = (x as f64 - cx, y as f64 - cy);
@@ -124,31 +131,50 @@ impl<'a> Frame<'a> {
                 sy += v * y as f64;
                 peak = peak.max(v);
                 npix += 1;
-                pixels.push((d2.sqrt(), v));
             }
         }
         if sum <= 0.0 {
             return None;
         }
         let (x, y) = (sx / sum, sy / sum);
-        // Half-flux diameter: flux-weighted mean distance from the centroid, ×2.
-        let mut weighted = 0.0;
+        // Half-flux radius: grow a circle around the centroid until it holds
+        // half of the total flux. Background noise is not clipped here, so it
+        // averages out instead of inflating the size of big apertures.
+        let mut ring: Vec<(f64, f64)> = Vec::with_capacity(npix);
         for yy in y0..=y1 {
             for xx in x0..=x1 {
                 let d = (xx as f64 - x).hypot(yy as f64 - y);
                 if d * d <= r2 {
-                    weighted += (self.at(xx, yy) - self.bg.level).max(0.0) * d;
+                    ring.push((d, self.at(xx, yy) - self.bg.level));
                 }
             }
+        }
+        ring.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: f64 = ring.iter().map(|p| p.1).sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut acc = 0.0;
+        let mut hfr = aperture;
+        let mut prev_d = 0.0;
+        for &(d, v) in &ring {
+            if acc + v >= total / 2.0 && v > 0.0 {
+                // Interpolate within this pixel's contribution.
+                let f = ((total / 2.0 - acc) / v).clamp(0.0, 1.0);
+                hfr = prev_d + (d - prev_d) * f;
+                break;
+            }
+            acc += v;
+            prev_d = d;
         }
         let noise = self.bg.sigma * (npix as f64).sqrt();
         Some(Star {
             x,
             y,
-            flux: sum,
+            flux: total,
             peak,
-            snr: sum / noise.max(1e-9),
-            hfd: 2.0 * weighted / sum,
+            snr: total / noise.max(1e-9),
+            hfd: 2.0 * hfr,
             saturated: raw_peak >= self.bg.saturation,
         })
     }
@@ -156,7 +182,7 @@ impl<'a> Frame<'a> {
     /// Candidate guide stars, best first.
     pub fn detect(&self, max: usize) -> Vec<Star> {
         let threshold = self.bg.level + 5.0 * self.bg.sigma;
-        let margin = 12;
+        let margin = self.aperture.ceil() as usize + 5;
         let mut peaks: Vec<(usize, usize)> = Vec::new();
         if self.width <= 2 * margin || self.height <= 2 * margin {
             return Vec::new();
@@ -195,7 +221,7 @@ impl<'a> Frame<'a> {
         // Merge duplicates that converged on the same star.
         let mut unique: Vec<Star> = Vec::new();
         for s in stars.drain(..) {
-            if !unique.iter().any(|u| (u.x - s.x).hypot(u.y - s.y) < 3.0) {
+            if !unique.iter().any(|u| (u.x - s.x).hypot(u.y - s.y) < self.aperture.max(3.0)) {
                 unique.push(s);
             }
         }
@@ -213,6 +239,33 @@ fn score(s: &Star) -> f64 {
         v *= 0.5;
     }
     v
+}
+
+/// Star count and typical size in a frame (for focusing).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StarStats {
+    pub count: usize,
+    /// Median half-flux radius (px).
+    pub hfr: f64,
+}
+
+/// Measure stars across a whole frame with an aperture of `aperture` px.
+pub fn star_stats(img: &Image, aperture: f64, max_stars: usize) -> Option<StarStats> {
+    let frame = Frame::new(img).with_aperture(aperture);
+    let mut hfds: Vec<f64> = frame
+        .detect(max_stars)
+        .iter()
+        .filter(|s| !s.saturated && s.snr > 10.0)
+        .map(|s| s.hfd)
+        .collect();
+    if hfds.is_empty() {
+        return None;
+    }
+    hfds.sort_by(f64::total_cmp);
+    Some(StarStats {
+        count: hfds.len(),
+        hfr: hfds[hfds.len() / 2] / 2.0,
+    })
 }
 
 #[cfg(test)]
@@ -293,6 +346,25 @@ pub(crate) mod tests {
         let stars = frame.detect(5);
         assert!((stars[0].x - 140.0).abs() < 0.5, "{stars:?}");
         assert!(stars.iter().any(|s| s.saturated));
+    }
+
+    #[test]
+    fn hfr_grows_with_defocus() {
+        let stars: Vec<(f64, f64, f64)> = (0..12)
+            .map(|i| (40.0 + (i % 4) as f64 * 40.0, 35.0 + (i / 4) as f64 * 40.0, 3000.0))
+            .collect();
+        let mut last = 0.0;
+        for sigma in [1.2, 2.0, 3.0, 4.5] {
+            // Constant flux: peak falls as the star spreads.
+            let s: Vec<_> = stars.iter().map(|&(x, y, p)| (x, y, p * 1.44 / (sigma * sigma))).collect();
+            let img = render(200, 150, &s, sigma, 10.0, 9);
+            let st = star_stats(&img, 15.0, 50).expect("stars");
+            assert_eq!(st.count, 12, "sigma {sigma}");
+            assert!(st.hfr > last, "hfr {} at sigma {sigma}", st.hfr);
+            // Gaussian HFR ≈ 1.18 σ.
+            assert!((st.hfr - 1.177 * sigma).abs() < 0.1 * sigma, "hfr {} at sigma {sigma}", st.hfr);
+            last = st.hfr;
+        }
     }
 
     #[test]

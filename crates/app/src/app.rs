@@ -8,6 +8,7 @@ use indi_link::{Device, IndexMap, PropertyState, interface};
 use protocol::{IndiStatus, LogEntry, LogLevel, Roles, ToEngine, ToUi, UiState};
 use serde::{Deserialize, Serialize};
 
+use crate::focus_view::FocusView;
 use crate::guider_view::GuiderView;
 use crate::imaging_view::{CaptureForm, ImagingView};
 use crate::link::{EngineLink, Incoming, LinkState};
@@ -30,6 +31,7 @@ enum View {
     Imaging,
     Sequence,
     Guiding,
+    Focus,
     Mount,
     Devices,
 }
@@ -114,6 +116,7 @@ pub struct App {
     sequence: SequenceView,
     guider: GuiderView,
     mount: MountView,
+    focus: FocusView,
     #[cfg(not(target_arch = "wasm32"))]
     local: LocalEngine,
 }
@@ -141,6 +144,7 @@ impl App {
             sequence,
             guider: GuiderView::new(),
             mount: MountView::default(),
+            focus: FocusView::default(),
             link: None,
             link_error: None,
             state: UiState::default(),
@@ -247,6 +251,7 @@ impl App {
                 ToUi::ImagingSettings(s) => self.imaging.on_settings(s),
                 ToUi::GuiderSettings(s) => self.guider.on_settings(s),
                 ToUi::SolverSettings(s) => self.mount.on_solver_settings(s),
+                ToUi::FocusSettings(s) => self.focus.on_settings(s),
                 _ => {}
             }
             self.state.apply(msg);
@@ -554,6 +559,7 @@ impl eframe::App for App {
                     (View::Imaging, "Imaging"),
                     (View::Sequence, "Sequence"),
                     (View::Guiding, "Guiding"),
+                    (View::Focus, "Focus"),
                     (View::Mount, "Mount"),
                     (View::Devices, "Devices"),
                 ] {
@@ -586,6 +592,7 @@ impl eframe::App for App {
                 View::Sequence => self.sequence.ui(ui, &self.state, &mut self.imaging, &mut actions),
                 View::Guiding => self.guider.ui(ui, &self.state, &mut actions),
                 View::Mount => self.mount.ui(ui, &self.state, &mut actions),
+                View::Focus => self.focus.ui(ui, &self.state, &mut actions),
                 View::Devices => self.device_view(ui, &mut actions),
             });
         });

@@ -27,6 +27,9 @@ pub(crate) struct SolveJob {
     from_sequence: bool,
     /// Bumped on every stage change, so stale timers are ignored.
     epoch: u64,
+    /// A solver result that arrived while the solve frame was still being
+    /// processed; handled once the capture has finished.
+    pending: Option<Result<SolveResult, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,6 +90,7 @@ impl Core {
             restart_guiding,
             from_sequence,
             epoch: 0,
+            pending: None,
         });
         match target {
             Some(_) => self.solve_slew(),
@@ -220,6 +224,11 @@ impl Core {
         if self.solve_job.as_ref().is_none_or(|j| j.id != id) {
             return;
         }
+        // The solve frame may still be processing (preview); finish that first.
+        if self.job.is_some() {
+            self.solve_job.as_mut().expect("checked").pending = Some(result);
+            return;
+        }
         let r = match result {
             Ok(r) => r,
             Err(e) => return self.solve_failed(e),
@@ -261,6 +270,16 @@ impl Core {
                     }
                 }
             }
+        }
+    }
+
+    /// The solve frame's capture job has finished.
+    pub(super) fn solve_capture_done(&mut self) {
+        if let Some(job) = &mut self.solve_job
+            && let Some(result) = job.pending.take()
+        {
+            let id = job.id;
+            self.solve_done(id, result);
         }
     }
 

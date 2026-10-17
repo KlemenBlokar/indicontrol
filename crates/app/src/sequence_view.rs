@@ -225,6 +225,23 @@ impl SequenceView {
             );
         });
         ui.horizontal(|ui| {
+            let af = &mut seq.autofocus;
+            ui.label("Autofocus:");
+            ui.checkbox(&mut af.on_start, "at start");
+            ui.checkbox(&mut af.on_filter_change, "on filter change");
+            ui.checkbox(&mut af.after_flip, "after flip");
+            ui.label("every");
+            ui.add(egui::DragValue::new(&mut af.every_frames).range(0..=500));
+            ui.label("lights");
+            let mut temp = af.temperature_delta.is_some();
+            if ui.checkbox(&mut temp, "on ΔT").changed() {
+                af.temperature_delta = temp.then_some(1.0);
+            }
+            if let Some(d) = &mut af.temperature_delta {
+                ui.add(egui::DragValue::new(d).range(0.1..=10.0).speed(0.1).suffix(" °C"));
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label("Order");
             ui.selectable_value(&mut seq.order, SequenceOrder::ByStep, "Step by step")
                 .on_hover_text("All frames of a step, then the next step");

@@ -101,6 +101,7 @@ pub struct Sequence {
     pub center_on_start: bool,
     /// Re-centre the target after a meridian flip.
     pub center_after_flip: bool,
+    pub autofocus: crate::AutofocusTriggers,
 }
 
 impl Default for Sequence {
@@ -116,6 +117,7 @@ impl Default for Sequence {
             target: None,
             center_on_start: true,
             center_after_flip: true,
+            autofocus: Default::default(),
         }
     }
 }

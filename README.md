@@ -139,6 +139,18 @@ pixel size and focal length) are passed as hints.
 - Sequences can have a target, centred before the first frame and again
   after a meridian flip.
 
+## Focusing
+
+The Focus tab moves the focuser (assign it in Equipment) and runs
+**autofocus**: it samples star size (half-flux radius) at evenly spaced
+positions around the current one, always approaching from outside (with
+optional backlash overshoot), fits the V-curve, and moves to the minimum. If
+best focus lies outside the sampled range, the range is extended. Every main
+camera frame reports its star count and HFR.
+
+Sequences can refocus at the start, after N light frames, on a filter
+change, after a meridian flip, or when the focuser temperature has changed.
+
 ## Web UI
 
 Build the wasm UI with [trunk](https://trunkrs.dev) (needs the

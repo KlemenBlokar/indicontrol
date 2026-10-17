@@ -31,6 +31,10 @@ pub(crate) struct Run {
     flat: Vec<FlatState>,
     message: String,
     lights_since_dither: u32,
+    lights_since_focus: u32,
+    focused_once: bool,
+    last_focus_filter: Option<u32>,
+    focus_after_flip: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +55,8 @@ enum Wait {
     Meridian,
     /// Slewing to and centring the target before the first frame.
     CenterStart { restart_guiding: bool },
+    /// Autofocus before the next light frame (for this filter).
+    Focus { filter: Option<u32> },
     Flip {
         phase: FlipPhase,
         restart_guiding: bool,
@@ -102,6 +108,10 @@ impl Core {
             flat: vec![FlatState::default(); n],
             message: String::new(),
             lights_since_dither: 0,
+            lights_since_focus: 0,
+            focused_once: false,
+            last_focus_filter: None,
+            focus_after_flip: false,
         });
         self.log(None, format!("{name} started"), LogLevel::Info);
         let run = self.run.as_ref().expect("just created");
@@ -149,6 +159,7 @@ impl Core {
     pub(super) fn abort_sequence(&mut self) {
         if self.run.take().is_some() {
             self.abort_solve();
+            self.abort_autofocus();
             self.abort_capture();
             self.log(None, "Sequence aborted", LogLevel::Warning);
             self.send_sequence();
@@ -299,6 +310,7 @@ impl Core {
         run.wait = Wait::None;
         if run.seq.steps[step].frame_type == FrameType::Light {
             run.lights_since_dither += 1;
+            run.lights_since_focus += 1;
         }
         let Exposure::AutoFlat {
             target,
@@ -390,6 +402,48 @@ impl Core {
                 });
                 self.send_sequence();
                 return true;
+            }
+        }
+
+        // Autofocus.
+        let run = self.run.as_ref().expect("running");
+        let af = &run.seq.autofocus;
+        let temperature_drift = af.temperature_delta.is_some_and(|d| {
+            match (self.focuser_temperature(), self.last_focus_temperature) {
+                (Some(now), Some(then)) => (now - then).abs() >= d,
+                _ => false,
+            }
+        });
+        let reason = if af.on_start && !run.focused_once {
+            Some("start")
+        } else if run.focus_after_flip {
+            Some("meridian flip")
+        } else if af.every_frames > 0 && run.lights_since_focus >= af.every_frames {
+            Some("frame count")
+        } else if af.on_filter_change && step.filter_slot.is_some() && step.filter_slot != run.last_focus_filter {
+            Some("filter change")
+        } else if temperature_drift {
+            Some("temperature change")
+        } else {
+            None
+        };
+        if let Some(reason) = reason
+            && self.state.roles.focuser.is_some()
+        {
+            let filter = step.filter_slot;
+            let run = self.run.as_mut().expect("running");
+            run.focus_after_flip = false;
+            run.wait = Wait::Focus { filter };
+            self.log(None, format!("Autofocus ({reason})"), LogLevel::Info);
+            match self.start_autofocus(filter, true) {
+                Ok(()) => {
+                    self.set_sequence_message("Autofocus");
+                    return true;
+                }
+                Err(e) => {
+                    self.run.as_mut().expect("running").wait = Wait::None;
+                    self.log(None, format!("Autofocus skipped: {e}"), LogLevel::Warning);
+                }
             }
         }
 
@@ -497,6 +551,7 @@ impl Core {
     fn finish_flip(&mut self) {
         if let Some(run) = &mut self.run {
             run.wait = Wait::None;
+            run.focus_after_flip = run.seq.autofocus.after_flip;
         }
         self.log(None, "Meridian flip complete", LogLevel::Info);
         self.sequence_next();
@@ -538,6 +593,24 @@ impl Core {
             }
             _ => {}
         }
+    }
+
+    /// Autofocus requested by the sequencer finished.
+    pub(super) fn sequence_focus_done(&mut self, ok: bool) {
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        let Wait::Focus { filter } = run.wait else {
+            return;
+        };
+        run.wait = Wait::None;
+        run.focused_once = true;
+        run.lights_since_focus = 0;
+        run.last_focus_filter = filter;
+        if !ok {
+            self.log(None, "Autofocus failed — continuing with the current focus", LogLevel::Warning);
+        }
+        self.sequence_next();
     }
 
     fn set_sequence_message(&mut self, message: &str) {
@@ -800,6 +873,10 @@ mod tests {
             flat: vec![FlatState::default(); n],
             message: String::new(),
             lights_since_dither: 0,
+            lights_since_focus: 0,
+            focused_once: false,
+            last_focus_filter: None,
+            focus_after_flip: false,
         }
     }
 

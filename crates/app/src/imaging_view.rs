@@ -374,6 +374,9 @@ impl ImagingView {
 
         ui.add_space(4.0);
         clipping_report(ui, a);
+        if let Some(s) = frame.stars {
+            ui.label(format!("{} stars, HFR {:.2} px", s.count, s.hfr));
+        }
         ui.add_space(4.0);
 
         egui::Grid::new("stats").striped(true).num_columns(a.channels.len() + 1).show(ui, |ui| {
@@ -565,6 +568,7 @@ mod tests {
                 height: h,
                 path: Some("/tmp/x.fits".into()),
                 analysis,
+                stars: Some(protocol::StarStats { count: 12, hfr: 1.8 }),
                 header: vec![("IMAGETYP".into(), "Light Frame".into())],
             }),
             capture: CaptureState::Exposing { total: 10.0, remaining: 4.0 },

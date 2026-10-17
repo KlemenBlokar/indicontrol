@@ -2,6 +2,7 @@
 //! engine state. UI sessions and helper tasks talk to it through [`CoreMsg`].
 
 mod capture;
+mod focus;
 mod guider;
 mod mount;
 mod sequence;
@@ -55,6 +56,7 @@ pub(crate) enum CoreMsg {
         epoch: u64,
         timer: solve::SolveTimer,
     },
+    FocusTimeout { id: u64, epoch: u64 },
 }
 
 /// A message to UIs: JSON text or a binary image preview.
@@ -100,6 +102,10 @@ pub(crate) struct Core {
     solve_job: Option<solve::SolveJob>,
     next_solve_id: u64,
     solve_status: protocol::SolveStatus,
+    focus_job: Option<focus::FocusJob>,
+    next_focus_id: u64,
+    focus_status: protocol::AutofocusStatus,
+    last_focus_temperature: Option<f64>,
 }
 
 impl Core {
@@ -128,6 +134,10 @@ impl Core {
             solve_job: None,
             next_solve_id: 0,
             solve_status: Default::default(),
+            focus_job: None,
+            next_focus_id: 0,
+            focus_status: Default::default(),
+            last_focus_temperature: None,
         };
         (core, tx)
     }
@@ -189,6 +199,7 @@ impl Core {
             CoreMsg::FlipTimeout { run_id } => self.flip_timeout(run_id),
             CoreMsg::SolveDone { id, result } => self.solve_done(id, *result),
             CoreMsg::SolveTimer { id, epoch, timer } => self.solve_on_timer(id, epoch, timer),
+            CoreMsg::FocusTimeout { id, epoch } => self.focus_timeout(id, epoch),
             CoreMsg::Retry { attempt } => {
                 if attempt == self.attempt && self.state.indi.autoconnect && self.client.is_none() {
                     self.connect();
@@ -319,6 +330,25 @@ impl Core {
                 self.send(ToUi::SolverSettings(settings));
                 Ok(())
             }
+            ToEngine::FocuserMove { steps } => self.focus_result(|c| c.focuser_move(steps)),
+            ToEngine::FocuserGoto { position } => self.focus_result(|c| {
+                if c.focusing() {
+                    return Err("autofocus is running".into());
+                }
+                c.focuser_goto(position)
+            }),
+            ToEngine::FocuserAbort => self.focus_result(|c| c.focuser_abort()),
+            ToEngine::Autofocus => self.focus_result(|c| c.start_autofocus(None, false)),
+            ToEngine::AbortAutofocus => {
+                self.abort_autofocus();
+                Ok(())
+            }
+            ToEngine::SetFocusSettings(settings) => {
+                self.state.focus = settings.clone();
+                self.save();
+                self.send(ToUi::FocusSettings(settings));
+                Ok(())
+            }
             ToEngine::GuiderClearCalibration => {
                 self.state.guider_calibration = None;
                 self.save();
@@ -392,6 +422,7 @@ impl Core {
                 self.capture_on_update(&device, &name);
                 self.mount_on_update(&device, &name);
                 self.solve_on_update(&device, &name);
+                self.focus_on_update(&device, &name);
                 self.sequence_on_update(&device, &name);
             }
             Event::Deleted { device, name } => self.send(ToUi::PropertyDeleted { device, name }),
@@ -456,6 +487,13 @@ impl Core {
         });
     }
 
+    fn focus_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
+        if let Err(e) = f(self) {
+            self.log(None, format!("Focuser: {e}"), LogLevel::Error);
+        }
+        Ok(())
+    }
+
     fn solve_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
         if let Err(e) = f(self) {
             self.log(None, format!("Plate solving: {e}"), LogLevel::Error);
@@ -517,6 +555,8 @@ impl Core {
             self.mount_msg(),
             ToUi::SolverSettings(self.state.solver.clone()),
             self.solve_msg(),
+            ToUi::FocusSettings(self.state.focus.clone()),
+            self.focus_msg(),
         ]
         .iter()
         .map(Outgoing::text)

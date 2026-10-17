@@ -11,6 +11,7 @@ use indi_link::{Cache, Device, Property};
 use serde::{Deserialize, Serialize};
 
 pub mod equipment;
+pub mod focus;
 pub mod guider;
 pub mod mount;
 pub mod sequence;
@@ -18,6 +19,7 @@ pub mod solver;
 
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
+pub use focus::{AutofocusStatus, AutofocusTriggers, FocusSettings, StarStats};
 pub use mount::MountInfo;
 pub use solver::{SolveResult, SolveStatus, SolverKind, SolverSettings, Target};
 pub use sequence::{
@@ -214,6 +216,8 @@ pub struct FrameInfo {
     /// Where the FITS file was written, if saved.
     pub path: Option<String>,
     pub analysis: Analysis,
+    /// Detected stars and their median size.
+    pub stars: Option<StarStats>,
     /// Final FITS header as (keyword, value) pairs.
     pub header: Vec<(String, String)>,
 }
@@ -294,6 +298,8 @@ pub enum ToUi {
     Mount { info: Option<Box<MountInfo>> },
     Solve { status: SolveStatus },
     SolverSettings(SolverSettings),
+    Autofocus { status: AutofocusStatus },
+    FocusSettings(FocusSettings),
 }
 
 /// UI → engine.
@@ -362,6 +368,13 @@ pub enum ToEngine {
     CenterOn { ra_hours: f64, dec_deg: f64 },
     AbortSolve,
     SetSolverSettings(SolverSettings),
+    /// Move the focuser by a number of steps (positive = outward).
+    FocuserMove { steps: i64 },
+    FocuserGoto { position: i64 },
+    FocuserAbort,
+    Autofocus,
+    AbortAutofocus,
+    SetFocusSettings(FocusSettings),
 }
 
 macro_rules! json_codec {
@@ -405,6 +418,8 @@ pub struct UiState {
     pub mount: Option<MountInfo>,
     pub solve: SolveStatus,
     pub solver_settings: SolverSettings,
+    pub autofocus: AutofocusStatus,
+    pub focus_settings: FocusSettings,
 }
 
 impl Default for UiState {
@@ -430,6 +445,8 @@ impl Default for UiState {
             mount: None,
             solve: SolveStatus::default(),
             solver_settings: SolverSettings::default(),
+            autofocus: AutofocusStatus::default(),
+            focus_settings: FocusSettings::default(),
         }
     }
 }
@@ -499,6 +516,8 @@ impl UiState {
             ToUi::Mount { info } => self.mount = info.map(|i| *i),
             ToUi::Solve { status } => self.solve = status,
             ToUi::SolverSettings(s) => self.solver_settings = s,
+            ToUi::Autofocus { status } => self.autofocus = status,
+            ToUi::FocusSettings(s) => self.focus_settings = s,
         }
     }
 
@@ -663,6 +682,8 @@ mod tests {
             ToEngine::MountTracking { on: false },
             ToEngine::CenterOn { ra_hours: 5.5, dec_deg: -5.4 },
             ToEngine::SetSolverSettings(SolverSettings::default()),
+            ToEngine::FocuserMove { steps: -100 },
+            ToEngine::SetFocusSettings(FocusSettings::default()),
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);

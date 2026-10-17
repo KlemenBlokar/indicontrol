@@ -20,6 +20,8 @@ pub struct ProcessInput {
     pub ctx: FrameContext,
     pub settings: ImagingSettings,
     pub save: bool,
+    /// Aperture (px) for star size measurement.
+    pub star_aperture: f64,
 }
 
 pub struct ProcessOutput {
@@ -35,6 +37,7 @@ pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
         ctx,
         settings,
         save,
+        star_aperture,
     } = input;
     if !format.starts_with(".fit") {
         return Err(format!(
@@ -54,6 +57,7 @@ pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
         .bits_per_pixel
         .or_else(|| (fits.bitpix().ok() == Some(8)).then_some(8));
     let analysis = analyze(&image, bpp);
+    let stars = star_stats(&image, star_aperture);
     let jpeg = encode_jpeg(&make_preview(&image, &analysis, PREVIEW_MAX_DIM), PREVIEW_QUALITY);
 
     let path = if save {
@@ -84,10 +88,41 @@ pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
             height: image.height,
             path,
             analysis,
+            stars,
             header,
         },
         jpeg,
     })
+}
+
+/// Star count and HFR in original pixels. Colour (CFA) frames are measured
+/// on 2×2 superpixels so the Bayer pattern does not break up the stars.
+fn star_stats(img: &Image, aperture: f64) -> Option<protocol::StarStats> {
+    const MAX_STARS: usize = 200;
+    match img.cfa {
+        None => guiding::star_stats(img, aperture, MAX_STARS),
+        Some(_) => {
+            let (w, h) = (img.width / 2, img.height / 2);
+            let data = (0..w * h)
+                .map(|i| {
+                    let (x, y) = (2 * (i % w), 2 * (i / w));
+                    let px = |dx: usize, dy: usize| img.data[(y + dy) * img.width + x + dx] as u32;
+                    ((px(0, 0) + px(1, 0) + px(0, 1) + px(1, 1)) / 4) as u16
+                })
+                .collect();
+            let mono = Image {
+                width: w,
+                height: h,
+                channels: 1,
+                data,
+                cfa: None,
+            };
+            guiding::star_stats(&mono, aperture / 2.0, MAX_STARS).map(|s| protocol::StarStats {
+                hfr: s.hfr * 2.0,
+                ..s
+            })
+        }
+    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
