@@ -116,7 +116,7 @@ impl SequenceView {
                 let seq = &self.draft.sequence;
                 let ready = seq.planned_frames() > 0;
                 if ui
-                    .add_enabled(ready, egui::Button::new(RichText::new("▶ Start sequence").strong()))
+                    .add_enabled(ready, egui::Button::new(RichText::new("⏵ Start sequence").strong()))
                     .clicked()
                 {
                     actions.push(ToEngine::StartSequence(seq.clone()));
@@ -133,7 +133,7 @@ impl SequenceView {
                     }
                 }
                 RunState::Pausing | RunState::Paused => {
-                    if ui.button("▶ Resume").clicked() {
+                    if ui.button("⏵ Resume").clicked() {
                         actions.push(ToEngine::ResumeSequence);
                     }
                 }
@@ -294,16 +294,16 @@ impl SequenceView {
                         optional_value(ui, &mut step.temperature, -10.0, -60.0..=40.0, 0.5, "")
                     });
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(i > 0, egui::Button::new("↑").small()).clicked() {
+                        if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).clicked() {
                             edit = Some(Edit::Up(i));
                         }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new("↓").small()).clicked() {
+                        if ui.add_enabled(i + 1 < n, egui::Button::new("⏷").small()).clicked() {
                             edit = Some(Edit::Down(i));
                         }
-                        if ui.small_button("⧉").on_hover_text("Duplicate").clicked() {
+                        if ui.small_button("🗐").on_hover_text("Duplicate").clicked() {
                             edit = Some(Edit::Duplicate(i));
                         }
-                        if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                        if ui.small_button("🗙").on_hover_text("Remove").clicked() {
                             edit = Some(Edit::Remove(i));
                         }
                     });
@@ -510,7 +510,7 @@ fn progress_table(ui: &mut egui::Ui, status: &SequenceStatus) {
     egui::Grid::new("seq_progress").striped(true).num_columns(4).show(ui, |ui| {
         for (i, step) in status.sequence.steps.iter().enumerate().filter(|(_, s)| s.enabled) {
             let current = status.current_step == Some(i);
-            let marker = if current { "▶" } else { "" };
+            let marker = if current { "⏵" } else { "" };
             ui.label(marker);
             ui.label(format!("{} {}", i + 1, step.frame_type.label()));
             ui.label(exposure_text(&step.exposure));
@@ -609,7 +609,7 @@ fn optional_value(
     ui.horizontal(|ui| match value {
         Some(v) => {
             ui.add(egui::DragValue::new(v).range(range).speed(speed).suffix(suffix));
-            if ui.small_button("✕").on_hover_text("Leave unchanged").clicked() {
+            if ui.small_button("🗙").on_hover_text("Leave unchanged").clicked() {
                 *value = None;
             }
         }

@@ -461,6 +461,9 @@ impl Core {
                 if name == "SCOPE_INFO" {
                     self.push_optics();
                 }
+                // A connecting mount defines its properties without updating
+                // them (a parked mount may never send an update).
+                self.mount_on_update(&device, &name);
             }
             Event::Updated { device, name } => {
                 if let Some(p) = self.property(&device, &name) {
@@ -472,7 +475,13 @@ impl Core {
                 self.focus_on_update(&device, &name);
                 self.sequence_on_update(&device, &name);
             }
-            Event::Deleted { device, name } => self.send(ToUi::PropertyDeleted { device, name }),
+            Event::Deleted { device, name } => {
+                let mount = self.state.roles.mount.as_deref() == Some(device.as_str());
+                self.send(ToUi::PropertyDeleted { device, name });
+                if mount {
+                    self.send(self.mount_msg());
+                }
+            }
             Event::Message { device, text, .. } => self.log(device, text, LogLevel::Info),
             Event::Blob {
                 device,
@@ -494,6 +503,7 @@ impl Core {
                 self.log(None, format!("INDI connection lost: {error}"), LogLevel::Warning);
                 self.set_status(IndiStatus::Disconnected { error: Some(error) });
                 self.send(ToUi::Devices(Cache::default()));
+                self.send(self.mount_msg());
                 self.schedule_retry();
             }
         }

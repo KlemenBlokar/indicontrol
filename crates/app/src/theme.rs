@@ -52,3 +52,38 @@ mod tests {
         assert!(night_red(Color32::WHITE).r() > night_red(Color32::from_rgb(80, 80, 80)).r());
     }
 }
+
+#[cfg(test)]
+mod glyph_check {
+    use eframe::egui::{self, FontId};
+
+    /// Every non-ASCII character in UI code must exist in egui's built-in
+    /// fonts, or it renders as an empty box.
+    #[test]
+    fn ui_text_glyphs_exist() {
+        let sources = [
+            ("app.rs", include_str!("app.rs")),
+            ("focus_view.rs", include_str!("focus_view.rs")),
+            ("guider_view.rs", include_str!("guider_view.rs")),
+            ("imaging_view.rs", include_str!("imaging_view.rs")),
+            ("mount_view.rs", include_str!("mount_view.rs")),
+            ("property_view.rs", include_str!("property_view.rs")),
+            ("sequence_view.rs", include_str!("sequence_view.rs")),
+        ];
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let mut missing = Vec::new();
+        for (file, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                for c in code.chars().filter(|c| !c.is_ascii()) {
+                    let ok = ctx.fonts_mut(|f| f.has_glyph(&FontId::proportional(14.0), c));
+                    if !ok {
+                        missing.push(format!("{file}:{}: {c:?}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "glyphs missing from egui fonts:\n{}", missing.join("\n"));
+    }
+}

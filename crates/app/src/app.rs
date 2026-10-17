@@ -451,6 +451,29 @@ impl App {
             actions.push(ToEngine::SetRoles(roles));
         }
 
+        ui.label(RichText::new("Optics").strong())
+            .on_hover_text("Focal length incl. reducer/barlow. Written to the cameras for metadata, plate solving and guiding.");
+        let mut optics = self.state.optics.clone();
+        egui::Grid::new("optics").num_columns(3).show(ui, |ui| {
+            ui.label("");
+            ui.label(RichText::new("focal length").small());
+            ui.label(RichText::new("aperture").small());
+            ui.end_row();
+            for (label, focal, aperture) in [
+                ("Main", &mut optics.focal_length, &mut optics.aperture),
+                ("Guide", &mut optics.guide_focal_length, &mut optics.guide_aperture),
+            ] {
+                ui.label(label);
+                optional_mm(ui, focal);
+                optional_mm(ui, aperture);
+                ui.end_row();
+            }
+        });
+        if optics != self.state.optics {
+            self.state.optics = optics.clone();
+            actions.push(ToEngine::SetOptics(optics));
+        }
+
         ui.separator();
         ui.heading("Devices");
         if self.state.cache.devices.is_empty() {
@@ -664,6 +687,23 @@ impl eframe::App for App {
         self.settings.sequence = self.sequence.draft.clone();
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
+}
+
+/// "—" (unknown) or a value in millimetres.
+fn optional_mm(ui: &mut egui::Ui, value: &mut Option<f64>) {
+    ui.horizontal(|ui| match value {
+        Some(v) => {
+            ui.add(egui::DragValue::new(v).range(1.0..=20000.0).speed(1.0).suffix(" mm"));
+            if ui.small_button("🗙").clicked() {
+                *value = None;
+            }
+        }
+        None => {
+            if ui.small_button("—").on_hover_text("Not set — click to enter").clicked() {
+                *value = Some(500.0);
+            }
+        }
+    });
 }
 
 fn role_slots(roles: &mut Roles) -> [(&'static str, &mut Option<String>, u32); 5] {

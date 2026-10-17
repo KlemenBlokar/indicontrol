@@ -370,7 +370,7 @@ fn optional(ui: &mut egui::Ui, v: &mut Option<f64>, default: f64, suffix: &str, 
     ui.horizontal(|ui| match v {
         Some(x) => {
             ui.add(egui::DragValue::new(x).range(0.1..=10000.0).speed(0.1).suffix(suffix));
-            if ui.small_button("✕").on_hover_text(none_text).clicked() {
+            if ui.small_button("🗙").on_hover_text(none_text).clicked() {
                 *v = None;
             }
         }

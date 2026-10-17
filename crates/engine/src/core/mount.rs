@@ -152,7 +152,12 @@ impl Core {
         }
         if matches!(
             name,
-            "EQUATORIAL_EOD_COORD" | "EQUATORIAL_COORD" | "TELESCOPE_PIER_SIDE" | "TELESCOPE_TRACK_STATE" | "TELESCOPE_PARK"
+            "EQUATORIAL_EOD_COORD"
+                | "EQUATORIAL_COORD"
+                | "TELESCOPE_PIER_SIDE"
+                | "TELESCOPE_TRACK_STATE"
+                | "TELESCOPE_PARK"
+                | "GEOGRAPHIC_COORD"
         ) {
             self.send(self.mount_msg());
         }

@@ -178,6 +178,10 @@ impl ImagingView {
                         ("Offset", Control::Offset, &mut f.set_offset, &mut f.offset),
                     ] {
                         if let Some(n) = equipment::control_value(cam, control) {
+                            // Unticked: show what the camera is set to now.
+                            if !*enabled {
+                                *value = n.value;
+                            }
                             ui.checkbox(enabled, label).on_hover_text(format!(
                                 "Unchecked: leave the camera at {}",
                                 indi_link::format_number(n.value, &n.format).trim()
@@ -490,7 +494,7 @@ fn clipping_report(ui: &mut egui::Ui, a: &protocol::Analysis) {
         ok = false;
         ui.colored_label(theme::c(ui, RED),
             format!(
-                "⚠ Black clipping: {zero} px at 0 ({}). Raise the offset.",
+                "Black clipping: {zero} px at 0 ({}). Raise the offset.",
                 percent(zero as f64 / pixels as f64)
             ),
         );
@@ -504,7 +508,7 @@ fn clipping_report(ui: &mut egui::Ui, a: &protocol::Analysis) {
     if sat > 0.01 {
         ok = false;
         ui.colored_label(theme::c(ui, RED),
-            format!("⚠ {} saturated — shorten the exposure or lower the gain.", percent(sat)),
+            format!("{} saturated — shorten the exposure or lower the gain.", percent(sat)),
         );
     } else if sat > 0.001 {
         ok = false;
@@ -517,9 +521,9 @@ fn clipping_report(ui: &mut egui::Ui, a: &protocol::Analysis) {
     }
     if ok {
         let note = if headroom.is_finite() {
-            format!("✔ No clipping. Dark end {headroom:.0}σ above 0.")
+            format!("No clipping. Dark end {headroom:.0}σ above 0.")
         } else {
-            "✔ No clipping.".into()
+            "No clipping.".into()
         };
         ui.colored_label(theme::c(ui, GREEN), note);
     }
