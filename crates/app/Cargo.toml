@@ -1,0 +1,15 @@
+[package]
+name = "indicontrol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = "0.4.45"
+eframe = { version = "0.35.0", features = ["persistence"] }
+indi-link = { version = "0.1.0", path = "../indi-link" }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

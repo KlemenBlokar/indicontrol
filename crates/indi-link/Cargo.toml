@@ -1,0 +1,18 @@
+[package]
+name = "indi-link"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+flate2 = "1.1.10"
+indexmap = "2.14.2"
+quick-xml = { version = "0.42.0", features = ["async-tokio"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
