@@ -5,6 +5,8 @@
 //! telescope) or embedded in the native UI for local use.
 
 mod core;
+mod frame;
+mod metadata;
 mod server;
 mod state;
 
@@ -13,7 +15,7 @@ use std::path::PathBuf;
 
 use tokio::task::JoinHandle;
 
-pub use state::{IndiSettings, PersistedState, default_state_file};
+pub use state::{IndiSettings, PersistedState, default_output_dir, default_state_file};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -58,6 +60,7 @@ pub async fn start(config: EngineConfig) -> std::io::Result<EngineHandle> {
         .as_deref()
         .map(PersistedState::load)
         .unwrap_or_default();
+    state.fill_defaults();
     if let Some((host, port)) = config.indi {
         state.indi.host = host;
         state.indi.port = port;

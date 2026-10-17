@@ -8,7 +8,8 @@ use indi_link::{Device, IndexMap, PropertyState, interface};
 use protocol::{IndiStatus, LogEntry, LogLevel, Roles, ToEngine, ToUi, UiState};
 use serde::{Deserialize, Serialize};
 
-use crate::link::{EngineLink, LinkState};
+use crate::imaging_view::{CaptureForm, ImagingView};
+use crate::link::{EngineLink, Incoming, LinkState};
 use crate::property_view::{self, Edits};
 
 /// Which engine the UI talks to (native builds only; the web UI always uses
@@ -21,11 +22,19 @@ pub enum EngineChoice {
     Remote(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum View {
+    Imaging,
+    Devices,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct UiSettings {
     night_mode: bool,
     engine: EngineChoice,
+    view: View,
+    capture: CaptureForm,
 }
 
 impl Default for UiSettings {
@@ -33,6 +42,8 @@ impl Default for UiSettings {
         Self {
             night_mode: false,
             engine: EngineChoice::Local,
+            view: View::Imaging,
+            capture: CaptureForm::default(),
         }
     }
 }
@@ -91,6 +102,7 @@ pub struct App {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     engine_input: String,
     applied_night_mode: Option<bool>,
+    imaging: ImagingView,
     #[cfg(not(target_arch = "wasm32"))]
     local: LocalEngine,
 }
@@ -110,8 +122,10 @@ impl App {
         };
         #[cfg(target_arch = "wasm32")]
         let _ = options.local_indi;
+        let imaging = ImagingView::new(settings.capture.clone());
         let mut app = Self {
             settings,
+            imaging,
             link: None,
             link_error: None,
             state: UiState::default(),
@@ -194,14 +208,25 @@ impl App {
         });
     }
 
-    fn poll_link(&mut self) {
+    fn poll_link(&mut self, ctx: &egui::Context) {
         let Some(link) = &mut self.link else {
             return;
         };
-        for msg in link.poll() {
-            if let ToUi::IndiStatus { host, port, .. } = &msg {
-                self.indi_host.clone_from(host);
-                self.indi_port = *port;
+        for incoming in link.poll() {
+            let msg = match incoming {
+                Incoming::Msg(msg) => msg,
+                Incoming::Preview { id, jpeg } => {
+                    self.imaging.on_preview(ctx, id, &jpeg);
+                    continue;
+                }
+            };
+            match &msg {
+                ToUi::IndiStatus { host, port, .. } => {
+                    self.indi_host.clone_from(host);
+                    self.indi_port = *port;
+                }
+                ToUi::ImagingSettings(s) => self.imaging.on_settings(s),
+                _ => {}
             }
             self.state.apply(msg);
         }
@@ -471,8 +496,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_link();
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_link(ctx);
         if self.selected_device.is_none() {
             self.selected_device = self.state.cache.devices.keys().next().cloned();
         }
@@ -503,7 +528,15 @@ impl eframe::App for App {
                     "Not connected to the engine.",
                 );
             }
-            ui.add_enabled_ui(usable, |ui| self.device_view(ui, &mut actions));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.settings.view, View::Imaging, RichText::new("Imaging").heading());
+                ui.selectable_value(&mut self.settings.view, View::Devices, RichText::new("Devices").heading());
+            });
+            ui.separator();
+            ui.add_enabled_ui(usable, |ui| match self.settings.view {
+                View::Imaging => self.imaging.ui(ui, &self.state, &mut actions),
+                View::Devices => self.device_view(ui, &mut actions),
+            });
         });
         if !actions.is_empty() {
             self.send_all(actions);
@@ -511,6 +544,7 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.capture = self.imaging.form.clone();
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
 }

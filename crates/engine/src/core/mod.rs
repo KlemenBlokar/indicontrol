@@ -1,15 +1,19 @@
 //! The engine core: a single task that owns the INDI connection and all
 //! engine state. UI sessions and helper tasks talk to it through [`CoreMsg`].
 
+mod capture;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use indi_link::{Cache, Client, ClientError, Event};
 use protocol::{IndiStatus, LogEntry, LogLevel, PROTOCOL_VERSION, ToEngine, ToUi};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::frame::ProcessOutput;
 use crate::state::PersistedState;
 
 /// Log entries replayed to newly connected UIs.
@@ -23,18 +27,37 @@ pub(crate) enum CoreMsg {
     NewSession(oneshot::Sender<Session>),
     ConnectResult { attempt: u64, result: ConnectResult },
     Retry { attempt: u64 },
+    FrameDone {
+        job_id: u64,
+        result: Box<Result<ProcessOutput, String>>,
+    },
+    CaptureTimeout { job_id: u64, frame: u32 },
+    FilterTimeout { job_id: u64 },
+}
+
+/// A message to UIs: JSON text or a binary image preview.
+#[derive(Clone)]
+pub(crate) enum Outgoing {
+    Text(Arc<str>),
+    Binary(Bytes),
+}
+
+impl Outgoing {
+    fn text(msg: &ToUi) -> Self {
+        Outgoing::Text(msg.to_json().into())
+    }
 }
 
 /// What a new UI session needs: a state dump, then live updates.
 pub(crate) struct Session {
-    pub initial: Vec<String>,
-    pub updates: broadcast::Receiver<Arc<str>>,
+    pub initial: Vec<Outgoing>,
+    pub updates: broadcast::Receiver<Outgoing>,
 }
 
 pub(crate) struct Core {
     rx: mpsc::UnboundedReceiver<CoreMsg>,
     tx: mpsc::UnboundedSender<CoreMsg>,
-    updates: broadcast::Sender<Arc<str>>,
+    updates: broadcast::Sender<Outgoing>,
     state: PersistedState,
     state_file: Option<PathBuf>,
     client: Option<Client>,
@@ -44,6 +67,11 @@ pub(crate) struct Core {
     attempt: u64,
     failures: u32,
     log: VecDeque<LogEntry>,
+    job: Option<capture::Job>,
+    next_job_id: u64,
+    next_frame_id: u64,
+    /// Latest frame info + preview, replayed to new UIs.
+    last_frame: Option<(Outgoing, Outgoing)>,
 }
 
 impl Core {
@@ -62,6 +90,10 @@ impl Core {
             attempt: 0,
             failures: 0,
             log: VecDeque::new(),
+            job: None,
+            next_job_id: 0,
+            next_frame_id: 0,
+            last_frame: None,
         };
         (core, tx)
     }
@@ -112,6 +144,9 @@ impl Core {
                     }
                 }
             }
+            CoreMsg::FrameDone { job_id, result } => self.frame_done(job_id, *result),
+            CoreMsg::CaptureTimeout { job_id, frame } => self.capture_timeout(job_id, frame),
+            CoreMsg::FilterTimeout { job_id } => self.filter_timeout(job_id),
             CoreMsg::Retry { attempt } => {
                 if attempt == self.attempt && self.state.indi.autoconnect && self.client.is_none() {
                     self.connect();
@@ -132,6 +167,7 @@ impl Core {
                 Ok(())
             }
             ToEngine::DisconnectIndi => {
+                self.fail_capture("disconnected from INDI".into());
                 self.state.indi.autoconnect = false;
                 self.save();
                 self.attempt += 1;
@@ -147,6 +183,26 @@ impl Core {
                 self.state.roles = roles.clone();
                 self.save();
                 self.send(ToUi::Roles(roles));
+                Ok(())
+            }
+            ToEngine::SetImagingSettings(settings) => {
+                if settings.output_dir.trim().is_empty() {
+                    self.log(None, "Output directory must not be empty", LogLevel::Error);
+                } else {
+                    self.state.imaging = settings.clone();
+                    self.save();
+                    self.send(ToUi::ImagingSettings(settings));
+                }
+                Ok(())
+            }
+            ToEngine::Capture(req) => {
+                if let Err(e) = self.start_capture(req) {
+                    self.log(None, format!("Cannot capture: {e}"), LogLevel::Error);
+                }
+                Ok(())
+            }
+            ToEngine::AbortCapture => {
+                self.abort_capture();
                 Ok(())
             }
             ToEngine::ConnectDevice { device } => self.with_client(|c| c.connect_device(&device)),
@@ -198,21 +254,18 @@ impl Core {
                 if let Some(p) = self.property(&device, &name) {
                     self.send(ToUi::PropertyUpdated(p));
                 }
+                self.capture_on_update(&device, &name);
             }
             Event::Deleted { device, name } => self.send(ToUi::PropertyDeleted { device, name }),
             Event::Message { device, text, .. } => self.log(device, text, LogLevel::Info),
             Event::Blob {
                 device,
-                element,
                 format,
                 data,
                 ..
-            } => self.log(
-                Some(device),
-                format!("Received {element} ({format}, {} bytes)", data.len()),
-                LogLevel::Info,
-            ),
+            } => self.capture_on_blob(&device, format, data),
             Event::Disconnected(reason) => {
+                self.fail_capture("INDI connection lost".into());
                 self.client = None;
                 self.indi_events = None;
                 let error = reason.unwrap_or_else(|| "server closed the connection".into());
@@ -279,20 +332,26 @@ impl Core {
             .as_ref()
             .map(|c| c.cache().clone())
             .unwrap_or_default();
-        let mut initial = vec![
+        let mut initial: Vec<Outgoing> = [
             ToUi::Hello {
                 protocol: PROTOCOL_VERSION,
                 engine_version: env!("CARGO_PKG_VERSION").into(),
             },
             self.status_msg(),
             ToUi::Roles(self.state.roles.clone()),
+            ToUi::ImagingSettings(self.state.imaging.clone()),
             ToUi::Devices(devices),
-        ];
-        initial.extend(self.log.iter().cloned().map(ToUi::Log));
-        Session {
-            initial: initial.iter().map(ToUi::to_json).collect(),
-            updates,
+            self.capture_msg(),
+        ]
+        .iter()
+        .map(Outgoing::text)
+        .collect();
+        if let Some((info, preview)) = &self.last_frame {
+            initial.push(info.clone());
+            initial.push(preview.clone());
         }
+        initial.extend(self.log.iter().cloned().map(|l| Outgoing::text(&ToUi::Log(l))));
+        Session { initial, updates }
     }
 
     fn status_msg(&self) -> ToUi {
@@ -309,8 +368,12 @@ impl Core {
     }
 
     fn send(&self, msg: ToUi) {
+        self.broadcast(Outgoing::text(&msg));
+    }
+
+    fn broadcast(&self, msg: Outgoing) {
         // No receivers just means no UI is connected.
-        let _ = self.updates.send(msg.to_json().into());
+        let _ = self.updates.send(msg);
     }
 
     fn log(&mut self, device: Option<String>, text: impl Into<String>, level: LogLevel) {

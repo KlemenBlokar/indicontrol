@@ -42,6 +42,30 @@ only on a trusted network: like INDI itself, there is no authentication yet.
 The engine saves its settings (INDI server, equipment roles) in
 `~/.config/indicontrol/engine.json`.
 
+## Imaging
+
+The Imaging tab takes single exposures or loops (for framing and focusing)
+with the main camera. The engine writes the FITS files on its own machine,
+by default under `~/Pictures/indicontrol`, with a configurable path template:
+
+```
+{object}/{date}/{type}/{filter}/{object}_{type}_{filter}_{exposure}s_G{gain}_O{offset}_{temp}C_bin{bin}_{seq:04}
+```
+
+`{date}` is the night of the session, so frames taken after midnight stay
+with the evening they belong to. Existing files are never overwritten.
+
+Each file gets `IMAGETYP` (`Light Frame`, `Dark Frame`, `Bias Frame`,
+`Flat Frame`), `FILTER`, `OBJECT`, `EXPTIME`, `GAIN`, `OFFSET`, `TELESCOP`,
+`FOCALLEN`, `APTDIA`, J2000 `RA`/`DEC`/`OBJCTRA`/`OBJCTDEC`, `PIERSIDE`,
+`AIRMASS`, `SITELAT`/`SITELONG`, `FOCPOS`/`FOCTEMP`, and `DATE-OBS`,
+`CCD-TEMP`, `XBINNING` where the driver did not provide them. Pixel data is
+saved exactly as the camera sent it.
+
+The histogram panel shows linear or log histograms per channel, with
+counts of pixels at 0 (black clipping: raise the offset), how far the dark
+end of the signal sits above 0 in noise sigmas, and saturated pixels.
+
 ## Web UI
 
 Build the wasm UI with [trunk](https://trunkrs.dev) (needs the

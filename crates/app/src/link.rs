@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
-use protocol::{ToEngine, ToUi};
+use protocol::{ToEngine, ToUi, preview_frame};
 
 const RETRY_SECONDS: f64 = 2.0;
 
@@ -12,6 +12,12 @@ pub enum LinkState {
     Connecting,
     Open,
     Closed(String),
+}
+
+pub enum Incoming {
+    Msg(ToUi),
+    /// JPEG preview for frame `id`.
+    Preview { id: u64, jpeg: Vec<u8> },
 }
 
 pub struct EngineLink {
@@ -51,7 +57,7 @@ impl EngineLink {
     }
 
     /// Process incoming events; returns decoded messages in order.
-    pub fn poll(&mut self) -> Vec<ToUi> {
+    pub fn poll(&mut self) -> Vec<Incoming> {
         let now = self.ctx.input(|i| i.time);
         let mut out = Vec::new();
         if let Some((_, rx)) = &self.conn {
@@ -59,9 +65,17 @@ impl EngineLink {
                 match ev {
                     WsEvent::Opened => self.state = LinkState::Open,
                     WsEvent::Message(WsMessage::Text(text)) => match ToUi::from_json(&text) {
-                        Ok(msg) => out.push(msg),
+                        Ok(msg) => out.push(Incoming::Msg(msg)),
                         Err(e) => eprintln!("unreadable engine message: {e}"),
                     },
+                    WsEvent::Message(WsMessage::Binary(bytes)) => {
+                        if let Some((id, jpeg)) = preview_frame::decode(&bytes) {
+                            out.push(Incoming::Preview {
+                                id,
+                                jpeg: jpeg.to_vec(),
+                            });
+                        }
+                    }
                     WsEvent::Message(_) => {}
                     WsEvent::Error(e) => self.state = LinkState::Closed(e),
                     WsEvent::Closed => self.state = LinkState::Closed("connection closed".into()),

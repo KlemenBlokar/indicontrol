@@ -11,6 +11,7 @@ chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+imaging = { version = "0.1.0", path = "../imaging" }
 indi-link = { version = "0.1.0", path = "../indi-link", features = ["serde"] }
 protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,6 +22,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+base64 = "0.23.1"
 tokio-tungstenite = "0.30.0"
 
 [[bin]]

@@ -1,4 +1,5 @@
 mod app;
+mod imaging_view;
 mod link;
 mod property_view;
 

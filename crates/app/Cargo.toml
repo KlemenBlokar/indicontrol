@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 eframe = { version = "0.35.0", features = ["persistence"] }
+egui_plot = "0.36"
 ewebsock = "0.8.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 indi-link = { version = "0.1.0", path = "../indi-link", default-features = false }
 protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -24,3 +26,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 log = "0.4"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Window", "Location", "Document", "HtmlCanvasElement"] }
+
+[dev-dependencies]
+imaging = { path = "../imaging" }

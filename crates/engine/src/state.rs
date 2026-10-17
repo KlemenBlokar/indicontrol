@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use protocol::Roles;
+use protocol::{ImagingSettings, Roles};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,6 +29,15 @@ impl Default for IndiSettings {
 pub struct PersistedState {
     pub indi: IndiSettings,
     pub roles: Roles,
+    pub imaging: ImagingSettings,
+}
+
+/// `~/Pictures/indicontrol` (or `~/indicontrol` without a pictures dir).
+pub fn default_output_dir() -> PathBuf {
+    dirs::picture_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("indicontrol")
 }
 
 pub fn default_state_file() -> Option<PathBuf> {
@@ -37,12 +46,20 @@ pub fn default_state_file() -> Option<PathBuf> {
 
 impl PersistedState {
     pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
+        let mut state = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 tracing::warn!("ignoring unreadable state file {}: {e}", path.display());
                 Self::default()
             }),
             Err(_) => Self::default(),
+        };
+        state.fill_defaults();
+        state
+    }
+
+    pub fn fill_defaults(&mut self) {
+        if self.imaging.output_dir.trim().is_empty() {
+            self.imaging.output_dir = default_output_dir().display().to_string();
         }
     }
 

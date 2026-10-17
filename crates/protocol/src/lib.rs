@@ -10,6 +10,9 @@ use std::collections::VecDeque;
 use indi_link::{Cache, Device, Property};
 use serde::{Deserialize, Serialize};
 
+pub mod equipment;
+
+pub use imaging::{Analysis, ChannelStats};
 pub use indi_link;
 
 /// Bump on any incompatible message change.
@@ -76,6 +79,154 @@ pub struct LogEntry {
     pub level: LogLevel,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FrameType {
+    #[default]
+    Light,
+    Dark,
+    Bias,
+    Flat,
+}
+
+impl FrameType {
+    pub const ALL: [FrameType; 4] = [Self::Light, Self::Dark, Self::Bias, Self::Flat];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::Bias => "Bias",
+            Self::Flat => "Flat",
+        }
+    }
+
+    /// FITS `IMAGETYP` value understood by Siril, PixInsight, etc.
+    pub fn imagetyp(self) -> &'static str {
+        match self {
+            Self::Light => "Light Frame",
+            Self::Dark => "Dark Frame",
+            Self::Bias => "Bias Frame",
+            Self::Flat => "Flat Frame",
+        }
+    }
+
+    /// Element of the INDI `CCD_FRAME_TYPE` switch.
+    pub fn indi_switch(self) -> &'static str {
+        match self {
+            Self::Light => "FRAME_LIGHT",
+            Self::Dark => "FRAME_DARK",
+            Self::Bias => "FRAME_BIAS",
+            Self::Flat => "FRAME_FLAT",
+        }
+    }
+}
+
+/// One exposure (or a loop of them) on the main camera.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureRequest {
+    pub exposure: f64,
+    pub frame_type: FrameType,
+    /// `None` leaves the camera setting unchanged.
+    pub binning: Option<u32>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    /// 1-based filter wheel slot.
+    pub filter_slot: Option<u32>,
+    pub object: String,
+    pub save: bool,
+    /// Keep exposing until aborted (framing/focusing).
+    pub repeat: bool,
+}
+
+impl Default for CaptureRequest {
+    fn default() -> Self {
+        Self {
+            exposure: 1.0,
+            frame_type: FrameType::Light,
+            binning: None,
+            gain: None,
+            offset: None,
+            filter_slot: None,
+            object: String::new(),
+            save: true,
+            repeat: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state")]
+pub enum CaptureState {
+    Idle,
+    /// Waiting for equipment (e.g. the filter wheel) before exposing.
+    Preparing { what: String },
+    Exposing { total: f64, remaining: f64 },
+    Downloading,
+    Processing,
+}
+
+pub const DEFAULT_FILE_TEMPLATE: &str =
+    "{object}/{date}/{type}/{filter}/{object}_{type}_{filter}_{exposure}s_G{gain}_O{offset}_{temp}C_bin{bin}_{seq:04}";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImagingSettings {
+    /// Root directory for saved frames (on the engine's machine).
+    pub output_dir: String,
+    /// Path below `output_dir`, without extension. Tokens: {object} {type}
+    /// {filter} {exposure} {gain} {offset} {temp} {bin} {camera} {date}
+    /// (night of the session) {time} (UTC) {seq} / {seq:04}.
+    pub file_template: String,
+}
+
+impl Default for ImagingSettings {
+    fn default() -> Self {
+        Self {
+            output_dir: String::new(),
+            file_template: DEFAULT_FILE_TEMPLATE.into(),
+        }
+    }
+}
+
+/// A processed frame. The stretched preview follows as a binary message
+/// (see [`preview_frame`]) with the same `id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameInfo {
+    pub id: u64,
+    pub camera: String,
+    pub frame_type: FrameType,
+    pub exposure: f64,
+    pub filter: Option<String>,
+    pub object: String,
+    pub width: usize,
+    pub height: usize,
+    /// Where the FITS file was written, if saved.
+    pub path: Option<String>,
+    pub analysis: Analysis,
+    /// Final FITS header as (keyword, value) pairs.
+    pub header: Vec<(String, String)>,
+}
+
+/// Binary preview messages: `b"ICPV"`, frame id (u64 LE), JPEG bytes.
+pub mod preview_frame {
+    pub const MAGIC: &[u8; 4] = b"ICPV";
+
+    pub fn encode(frame_id: u64, jpeg: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + jpeg.len());
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&frame_id.to_le_bytes());
+        out.extend_from_slice(jpeg);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<(u64, &[u8])> {
+        let rest = bytes.strip_prefix(MAGIC)?;
+        let id = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+        Some((id, &rest[8..]))
+    }
+}
+
 /// Engine → UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -99,6 +250,13 @@ pub enum ToUi {
         name: Option<String>,
     },
     Log(LogEntry),
+    Capture {
+        state: CaptureState,
+        /// Frames completed in the current capture run.
+        frames: u32,
+    },
+    Frame(Box<FrameInfo>),
+    ImagingSettings(ImagingSettings),
 }
 
 /// UI → engine.
@@ -132,6 +290,9 @@ pub enum ToEngine {
         values: Vec<(String, bool)>,
     },
     SetRoles(Roles),
+    Capture(CaptureRequest),
+    AbortCapture,
+    SetImagingSettings(ImagingSettings),
 }
 
 macro_rules! json_codec {
@@ -162,6 +323,10 @@ pub struct UiState {
     pub log: VecDeque<LogEntry>,
     /// Set when the engine speaks a different protocol version.
     pub version_mismatch: Option<u32>,
+    pub capture: CaptureState,
+    pub frames_captured: u32,
+    pub last_frame: Option<FrameInfo>,
+    pub imaging: ImagingSettings,
 }
 
 impl Default for UiState {
@@ -175,6 +340,10 @@ impl Default for UiState {
             cache: Cache::default(),
             log: VecDeque::new(),
             version_mismatch: None,
+            capture: CaptureState::Idle,
+            frames_captured: 0,
+            last_frame: None,
+            imaging: ImagingSettings::default(),
         }
     }
 }
@@ -224,6 +393,12 @@ impl UiState {
                 }
             },
             ToUi::Log(entry) => self.push_log(entry),
+            ToUi::Capture { state, frames } => {
+                self.capture = state;
+                self.frames_captured = frames;
+            }
+            ToUi::Frame(info) => self.last_frame = Some(*info),
+            ToUi::ImagingSettings(s) => self.imaging = s,
         }
     }
 
@@ -307,6 +482,32 @@ mod tests {
             values: vec![("CONNECT".into(), true)],
         };
         assert_eq!(ToEngine::from_json(&cmd.to_json()).unwrap(), cmd);
+    }
+
+    #[test]
+    fn preview_frames() {
+        let msg = preview_frame::encode(42, &[0xFF, 0xD8, 1, 2]);
+        assert_eq!(preview_frame::decode(&msg), Some((42, &[0xFF, 0xD8, 1, 2][..])));
+        assert_eq!(preview_frame::decode(b"nope"), None);
+        assert_eq!(preview_frame::decode(b"ICPV123"), None);
+    }
+
+    #[test]
+    fn capture_messages_round_trip() {
+        let cmd = ToEngine::Capture(CaptureRequest {
+            exposure: 300.0,
+            frame_type: FrameType::Dark,
+            gain: Some(100.0),
+            filter_slot: Some(3),
+            object: "M 31".into(),
+            ..Default::default()
+        });
+        assert_eq!(ToEngine::from_json(&cmd.to_json()).unwrap(), cmd);
+        let st = ToUi::Capture {
+            state: CaptureState::Exposing { total: 300.0, remaining: 12.5 },
+            frames: 2,
+        };
+        assert_eq!(ToUi::from_json(&st.to_json()).unwrap(), st);
     }
 
     #[test]

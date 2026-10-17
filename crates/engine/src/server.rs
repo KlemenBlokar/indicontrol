@@ -13,7 +13,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::services::ServeDir;
 
-use crate::core::{CoreMsg, Session};
+use crate::core::{CoreMsg, Outgoing, Session};
 
 type CoreTx = mpsc::UnboundedSender<CoreMsg>;
 
@@ -45,7 +45,7 @@ async fn session(socket: WebSocket, core: CoreTx) {
     };
     let (mut sink, mut stream) = socket.split();
     for msg in initial {
-        if sink.send(Message::Text(msg.into())).await.is_err() {
+        if sink.send(to_message(msg)).await.is_err() {
             return;
         }
     }
@@ -53,8 +53,8 @@ async fn session(socket: WebSocket, core: CoreTx) {
     loop {
         tokio::select! {
             update = updates.recv() => match update {
-                Ok(json) => {
-                    if sink.send(Message::Text(json.as_ref().into())).await.is_err() {
+                Ok(msg) => {
+                    if sink.send(to_message(msg)).await.is_err() {
                         break;
                     }
                 }
@@ -78,4 +78,11 @@ async fn session(socket: WebSocket, core: CoreTx) {
         }
     }
     tracing::info!("UI disconnected");
+}
+
+fn to_message(msg: Outgoing) -> Message {
+    match msg {
+        Outgoing::Text(json) => Message::Text(json.as_ref().into()),
+        Outgoing::Binary(bytes) => Message::Binary(bytes),
+    }
 }
