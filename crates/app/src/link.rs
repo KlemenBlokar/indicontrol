@@ -16,8 +16,10 @@ pub enum LinkState {
 
 pub enum Incoming {
     Msg(ToUi),
-    /// JPEG preview for frame `id`.
+    /// JPEG preview of main-camera frame `id`.
     Preview { id: u64, jpeg: Vec<u8> },
+    /// JPEG preview of a guide-camera frame.
+    GuidePreview { jpeg: Vec<u8> },
 }
 
 pub struct EngineLink {
@@ -69,11 +71,15 @@ impl EngineLink {
                         Err(e) => eprintln!("unreadable engine message: {e}"),
                     },
                     WsEvent::Message(WsMessage::Binary(bytes)) => {
-                        if let Some((id, jpeg)) = preview_frame::decode(&bytes) {
-                            out.push(Incoming::Preview {
+                        match preview_frame::decode(&bytes) {
+                            Some((preview_frame::Kind::Main, id, jpeg)) => out.push(Incoming::Preview {
                                 id,
                                 jpeg: jpeg.to_vec(),
-                            });
+                            }),
+                            Some((preview_frame::Kind::Guide, _, jpeg)) => out.push(Incoming::GuidePreview {
+                                jpeg: jpeg.to_vec(),
+                            }),
+                            None => {}
                         }
                     }
                     WsEvent::Message(_) => {}

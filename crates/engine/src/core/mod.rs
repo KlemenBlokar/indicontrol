@@ -2,6 +2,7 @@
 //! engine state. UI sessions and helper tasks talk to it through [`CoreMsg`].
 
 mod capture;
+mod guider;
 mod sequence;
 
 use std::collections::VecDeque;
@@ -35,6 +36,12 @@ pub(crate) enum CoreMsg {
     CaptureTimeout { job_id: u64, frame: u32 },
     FilterTimeout { job_id: u64 },
     TemperatureTimeout { run_id: u64, step: usize },
+    GuideFrame {
+        seq: u64,
+        result: Box<Result<guider::GuideFrameOut, String>>,
+    },
+    GuideNext { seq: u64 },
+    GuideTimeout { seq: u64 },
 }
 
 /// A message to UIs: JSON text or a binary image preview.
@@ -76,6 +83,7 @@ pub(crate) struct Core {
     last_frame: Option<(Outgoing, Outgoing)>,
     run: Option<sequence::Run>,
     next_run_id: u64,
+    guider: guider::GuiderCore,
 }
 
 impl Core {
@@ -100,6 +108,7 @@ impl Core {
             last_frame: None,
             run: None,
             next_run_id: 0,
+            guider: Default::default(),
         };
         (core, tx)
     }
@@ -154,6 +163,9 @@ impl Core {
             CoreMsg::CaptureTimeout { job_id, frame } => self.capture_timeout(job_id, frame),
             CoreMsg::FilterTimeout { job_id } => self.filter_timeout(job_id),
             CoreMsg::TemperatureTimeout { run_id, step } => self.temperature_timeout(run_id, step),
+            CoreMsg::GuideFrame { seq, result } => self.guider_frame(seq, *result),
+            CoreMsg::GuideNext { seq } => self.guider_next(seq),
+            CoreMsg::GuideTimeout { seq } => self.guider_timeout(seq),
             CoreMsg::Retry { attempt } => {
                 if attempt == self.attempt && self.state.indi.autoconnect && self.client.is_none() {
                     self.connect();
@@ -176,6 +188,7 @@ impl Core {
             ToEngine::DisconnectIndi => {
                 self.fail_capture("disconnected from INDI".into());
                 self.sequence_failed("disconnected from INDI".into());
+                self.guider_halt("disconnected from INDI".into());
                 self.state.indi.autoconnect = false;
                 self.save();
                 self.attempt += 1;
@@ -252,6 +265,28 @@ impl Core {
                 }
                 Ok(())
             }
+            ToEngine::GuiderLoop => self.guider_result(|c| c.guider_loop()),
+            ToEngine::GuiderStop => {
+                self.guider_stop();
+                Ok(())
+            }
+            ToEngine::GuiderSelectStar { x, y } => self.guider_result(|c| c.guider_select(Some((x, y)))),
+            ToEngine::GuiderAutoSelect => self.guider_result(|c| c.guider_select(None)),
+            ToEngine::GuiderCalibrate => self.guider_result(|c| c.guider_calibrate(false)),
+            ToEngine::GuiderGuide => self.guider_result(|c| c.guider_guide()),
+            ToEngine::GuiderClearCalibration => {
+                self.state.guider_calibration = None;
+                self.save();
+                self.send_guider();
+                Ok(())
+            }
+            ToEngine::SetGuiderSettings(settings) => {
+                self.state.guider = settings.clone();
+                self.save();
+                self.send(ToUi::GuiderSettings(settings));
+                self.send_guider();
+                Ok(())
+            }
             ToEngine::DeleteSequence { name } => {
                 self.state.sequences.retain(|s| s.name != name);
                 self.save();
@@ -319,10 +354,15 @@ impl Core {
                 format,
                 data,
                 ..
-            } => self.capture_on_blob(&device, format, data),
+            } => {
+                if !self.guider_on_blob(&device, format.clone(), data.clone()) {
+                    self.capture_on_blob(&device, format, data);
+                }
+            }
             Event::Disconnected(reason) => {
                 self.fail_capture("INDI connection lost".into());
                 self.sequence_failed("INDI connection lost".into());
+                self.guider_halt("INDI connection lost".into());
                 self.client = None;
                 self.indi_events = None;
                 let error = reason.unwrap_or_else(|| "server closed the connection".into());
@@ -369,6 +409,14 @@ impl Core {
         });
     }
 
+    fn guider_result(&mut self, f: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), ClientError> {
+        if let Err(e) = f(self) {
+            self.log(None, format!("Guider: {e}"), LogLevel::Error);
+            self.send_guider();
+        }
+        Ok(())
+    }
+
     fn with_client(&self, f: impl FnOnce(&Client) -> Result<(), ClientError>) -> Result<(), ClientError> {
         match &self.client {
             Some(c) => f(c),
@@ -403,6 +451,8 @@ impl Core {
                 sequences: self.state.sequences.clone(),
             },
             self.sequence_msg(),
+            ToUi::GuiderSettings(self.state.guider.clone()),
+            self.guider_msg(),
         ]
         .iter()
         .map(Outgoing::text)
@@ -411,6 +461,7 @@ impl Core {
             initial.push(info.clone());
             initial.push(preview.clone());
         }
+        initial.extend(self.guider_last_preview());
         initial.extend(self.log.iter().cloned().map(|l| Outgoing::text(&ToUi::Log(l))));
         Session { initial, updates }
     }

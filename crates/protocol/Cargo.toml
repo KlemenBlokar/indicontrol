@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+guiding = { version = "0.1.0", path = "../guiding" }
 imaging = { version = "0.1.0", path = "../imaging" }
 indi-link = { version = "0.1.0", path = "../indi-link", default-features = false, features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }

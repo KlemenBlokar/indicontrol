@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use protocol::{FlatRecord, ImagingSettings, Roles, Sequence};
+use protocol::guider::Calibration;
+use protocol::{FlatRecord, GuiderSettings, ImagingSettings, Roles, Sequence};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +34,8 @@ pub struct PersistedState {
     pub sequences: Vec<Sequence>,
     /// Exposures found by flat auto-exposure, for matching dark flats.
     pub flat_exposures: Vec<FlatRecord>,
+    pub guider: GuiderSettings,
+    pub guider_calibration: Option<Calibration>,
 }
 
 /// `~/Pictures/indicontrol` (or `~/indicontrol` without a pictures dir).

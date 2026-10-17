@@ -69,7 +69,72 @@ const DEFS: &str = r#"
 <defSwitchVector device="Wheel" name="CONNECTION" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="CONNECT">On</defSwitch><defSwitch name="DISCONNECT">Off</defSwitch></defSwitchVector>
 <defNumberVector device="Wheel" name="FILTER_SLOT" group="Main" state="Ok" perm="rw"><defNumber name="FILTER_SLOT_VALUE" format="%.0f" min="1" max="2" step="1">1</defNumber></defNumberVector>
 <defTextVector device="Wheel" name="FILTER_NAME" group="Main" state="Ok" perm="rw"><defText name="FILTER_SLOT_NAME_1">L</defText><defText name="FILTER_SLOT_NAME_2">Ha</defText></defTextVector>
+<defSwitchVector device="GuideCam" name="CONNECTION" group="Main" state="Ok" perm="rw" rule="OneOfMany"><defSwitch name="CONNECT">On</defSwitch><defSwitch name="DISCONNECT">Off</defSwitch></defSwitchVector>
+<defTextVector device="GuideCam" name="DRIVER_INFO" group="Info" perm="ro"><defText name="DRIVER_INTERFACE">6</defText></defTextVector>
+<defNumberVector device="GuideCam" name="CCD_EXPOSURE" group="Main" state="Idle" perm="rw"><defNumber name="CCD_EXPOSURE_VALUE" format="%.2f" min="0" max="3600" step="1">1</defNumber></defNumberVector>
+<defNumberVector device="GuideCam" name="CCD_INFO" group="Info" state="Ok" perm="ro"><defNumber name="CCD_PIXEL_SIZE" format="%.2f" min="0" max="50" step="0">3.75</defNumber></defNumberVector>
+<defBLOBVector device="GuideCam" name="CCD1" group="Image" state="Idle" perm="ro"><defBLOB name="CCD1"/></defBLOBVector>
+<defNumberVector device="Scope" name="TELESCOPE_TIMED_GUIDE_NS" group="Guide" state="Idle" perm="rw"><defNumber name="TIMED_GUIDE_N" format="%.0f" min="0" max="60000" step="1">0</defNumber><defNumber name="TIMED_GUIDE_S" format="%.0f" min="0" max="60000" step="1">0</defNumber></defNumberVector>
+<defNumberVector device="Scope" name="TELESCOPE_TIMED_GUIDE_WE" group="Guide" state="Idle" perm="rw"><defNumber name="TIMED_GUIDE_W" format="%.0f" min="0" max="60000" step="1">0</defNumber><defNumber name="TIMED_GUIDE_E" format="%.0f" min="0" max="60000" step="1">0</defNumber></defNumberVector>
+<defNumberVector device="Scope" name="TELESCOPE_INFO" group="Info" state="Ok" perm="rw"><defNumber name="GUIDER_FOCAL_LENGTH" format="%g" min="0" max="10000" step="0">240</defNumber></defNumberVector>
 "#;
+
+/// Guide camera rotation relative to the mount axes, and pulse response.
+pub const GUIDE_THETA_DEG: f64 = 30.0;
+pub const GUIDE_RATE: f64 = 0.05; // px per ms of pulse
+pub const GUIDE_DRIFT: f64 = 0.3; // px of RA drift per guide exposure
+const GW: usize = 160;
+const GH: usize = 120;
+
+/// Simulated sky as seen by the guide camera.
+struct GuideSky {
+    x: f64,
+    y: f64,
+    frames: usize,
+}
+
+impl GuideSky {
+    fn mv(&mut self, angle_deg: f64, px: f64) {
+        let a = angle_deg.to_radians();
+        self.x += a.cos() * px;
+        self.y += a.sin() * px;
+    }
+
+    fn pulse(&mut self, n: f64, s: f64, w: f64, e: f64) {
+        self.mv(GUIDE_THETA_DEG, GUIDE_RATE * (w - e));
+        self.mv(GUIDE_THETA_DEG + 90.0, GUIDE_RATE * (n - s));
+    }
+
+    /// Render the next guide frame (drift is applied per exposure).
+    fn frame(&mut self) -> Vec<u8> {
+        self.frames += 1;
+        self.mv(GUIDE_THETA_DEG, GUIDE_DRIFT);
+        let pixels: Vec<u16> = (0..GW * GH)
+            .map(|i| {
+                let (x, y) = ((i % GW) as f64, (i / GW) as f64);
+                let d2 = (x - self.x).powi(2) + (y - self.y).powi(2);
+                let noise = ((i * 7919 + self.frames * 104_729) % 61) as f64;
+                (1000.0 + noise + 6000.0 * (-d2 / (2.0 * 1.5 * 1.5)).exp()) as u16
+            })
+            .collect();
+        let mut h = Header::default();
+        for c in [
+            Card::new("SIMPLE", true, ""),
+            Card::new("BITPIX", 16i64, ""),
+            Card::new("NAXIS", 2i64, ""),
+            Card::new("NAXIS1", GW as i64, ""),
+            Card::new("NAXIS2", GH as i64, ""),
+            Card::new("BZERO", 32768i64, ""),
+        ] {
+            h.set(c);
+        }
+        let data = pixels
+            .iter()
+            .flat_map(|&p| ((p as i32 - 32768) as i16).to_be_bytes())
+            .collect();
+        Fits { header: h, data }.to_bytes()
+    }
+}
 
 fn number_in(msg: &str, element: &str) -> f64 {
     let at = msg.find(&format!(r#"name="{element}">"#)).expect("element") + element.len() + 8;
@@ -82,6 +147,7 @@ pub async fn fake_indi(listener: TcpListener, initial_temp: f64) -> String {
     let (mut seen, mut pending) = (String::new(), String::new());
     let mut buf = vec![0u8; 65536];
     let mut defined = false;
+    let mut sky = GuideSky { x: 80.0, y: 60.0, frames: 0 };
     loop {
         let n = match sock.read(&mut buf).await {
             Ok(0) | Err(_) => return seen,
@@ -112,6 +178,18 @@ pub async fn fake_indi(listener: TcpListener, initial_temp: f64) -> String {
                     let m = format!(r#"<setNumberVector device="Cam" name="CCD_TEMPERATURE" state="{state}"><oneNumber name="CCD_TEMPERATURE_VALUE">{t}</oneNumber></setNumberVector>"#);
                     sock.write_all(m.as_bytes()).await.unwrap();
                 }
+            } else if msg.contains(r#"name="TELESCOPE_TIMED_GUIDE_NS""#) {
+                sky.pulse(number_in(msg, "TIMED_GUIDE_N"), number_in(msg, "TIMED_GUIDE_S"), 0.0, 0.0);
+            } else if msg.contains(r#"name="TELESCOPE_TIMED_GUIDE_WE""#) {
+                sky.pulse(0.0, 0.0, number_in(msg, "TIMED_GUIDE_W"), number_in(msg, "TIMED_GUIDE_E"));
+            } else if msg.contains(r#"device="GuideCam""#) && msg.contains(r#"name="CCD_EXPOSURE""#) {
+                let frame = sky.frame();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&frame);
+                let blob = format!(
+                    r#"<setNumberVector device="GuideCam" name="CCD_EXPOSURE" state="Ok"><oneNumber name="CCD_EXPOSURE_VALUE">0</oneNumber></setNumberVector><setBLOBVector device="GuideCam" name="CCD1" state="Ok"><oneBLOB name="CCD1" size="{}" format=".fits">{b64}</oneBLOB></setBLOBVector>"#,
+                    frame.len()
+                );
+                sock.write_all(blob.as_bytes()).await.unwrap();
             } else if msg.contains(r#"name="CCD_EXPOSURE""#) {
                 let exposure = number_in(msg, "CCD_EXPOSURE_VALUE");
                 sock.write_all(br#"<setNumberVector device="Cam" name="CCD_EXPOSURE" state="Busy"><oneNumber name="CCD_EXPOSURE_VALUE">1</oneNumber></setNumberVector>"#).await.unwrap();
@@ -163,7 +241,7 @@ impl TestUi {
                     self.state.apply(msg);
                 }
                 Message::Binary(b) => {
-                    let (id, jpeg) = preview_frame::decode(&b).expect("preview frame");
+                    let (_kind, id, jpeg) = preview_frame::decode(&b).expect("preview frame");
                     self.previews.push((id, jpeg.to_vec()));
                 }
                 _ => {}

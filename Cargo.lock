@@ -1257,6 +1257,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "guiding",
  "imaging",
  "indi-link",
  "protocol",
@@ -1755,6 +1756,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdf242682df893b86f33a73828fb09ca4b2d3bb6cc95249707fc684d27484b91"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "guiding"
+version = "0.1.0"
+dependencies = [
+ "imaging",
+ "serde",
 ]
 
 [[package]]
@@ -3173,6 +3182,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "protocol"
 version = "0.1.0"
 dependencies = [
+ "guiding",
  "imaging",
  "indi-link",
  "serde",

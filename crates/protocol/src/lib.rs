@@ -11,8 +11,10 @@ use indi_link::{Cache, Device, Property};
 use serde::{Deserialize, Serialize};
 
 pub mod equipment;
+pub mod guider;
 pub mod sequence;
 
+pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
 pub use sequence::{
     Exposure, FlatRecord, RunState, Sequence, SequenceOrder, SequenceStatus, SequenceStep,
@@ -212,22 +214,39 @@ pub struct FrameInfo {
     pub header: Vec<(String, String)>,
 }
 
-/// Binary preview messages: `b"ICPV"`, frame id (u64 LE), JPEG bytes.
+/// Binary preview messages: 4-byte magic (`ICPV` main camera, `ICGV` guide
+/// camera), frame id (u64 LE), JPEG bytes.
 pub mod preview_frame {
-    pub const MAGIC: &[u8; 4] = b"ICPV";
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Main,
+        Guide,
+    }
 
-    pub fn encode(frame_id: u64, jpeg: &[u8]) -> Vec<u8> {
+    impl Kind {
+        fn magic(self) -> &'static [u8; 4] {
+            match self {
+                Kind::Main => b"ICPV",
+                Kind::Guide => b"ICGV",
+            }
+        }
+    }
+
+    pub fn encode(kind: Kind, frame_id: u64, jpeg: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(12 + jpeg.len());
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(kind.magic());
         out.extend_from_slice(&frame_id.to_le_bytes());
         out.extend_from_slice(jpeg);
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Option<(u64, &[u8])> {
-        let rest = bytes.strip_prefix(MAGIC)?;
+    pub fn decode(bytes: &[u8]) -> Option<(Kind, u64, &[u8])> {
+        let kind = [Kind::Main, Kind::Guide]
+            .into_iter()
+            .find(|k| bytes.starts_with(k.magic()))?;
+        let rest = &bytes[4..];
         let id = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
-        Some((id, &rest[8..]))
+        Some((kind, id, &rest[8..]))
     }
 }
 
@@ -265,6 +284,9 @@ pub enum ToUi {
     Sequence { status: Option<Box<SequenceStatus>> },
     /// Sequences saved on the engine.
     SequenceLibrary { sequences: Vec<Sequence> },
+    Guider { status: Box<GuiderStatus> },
+    GuideStep(GuideStep),
+    GuiderSettings(GuiderSettings),
 }
 
 /// UI → engine.
@@ -308,6 +330,17 @@ pub enum ToEngine {
     /// Save (or replace, by name) a sequence in the engine's library.
     SaveSequence(Sequence),
     DeleteSequence { name: String },
+    /// Loop exposures on the guide camera.
+    GuiderLoop,
+    GuiderStop,
+    /// Select the guide star nearest to this guide-frame position.
+    GuiderSelectStar { x: f64, y: f64 },
+    GuiderAutoSelect,
+    GuiderCalibrate,
+    /// Start guiding (selecting a star and calibrating first if needed).
+    GuiderGuide,
+    GuiderClearCalibration,
+    SetGuiderSettings(GuiderSettings),
 }
 
 macro_rules! json_codec {
@@ -344,6 +377,10 @@ pub struct UiState {
     pub imaging: ImagingSettings,
     pub sequence: Option<SequenceStatus>,
     pub library: Vec<Sequence>,
+    pub guider: GuiderStatus,
+    pub guider_settings: GuiderSettings,
+    /// Recent guide steps, oldest first.
+    pub guide_history: VecDeque<GuideStep>,
 }
 
 impl Default for UiState {
@@ -363,12 +400,16 @@ impl Default for UiState {
             imaging: ImagingSettings::default(),
             sequence: None,
             library: Vec::new(),
+            guider: GuiderStatus::default(),
+            guider_settings: GuiderSettings::default(),
+            guide_history: VecDeque::new(),
         }
     }
 }
 
 impl UiState {
     pub const MAX_LOG: usize = 5000;
+    pub const MAX_GUIDE_HISTORY: usize = 1000;
 
     pub fn apply(&mut self, msg: ToUi) {
         match msg {
@@ -420,6 +461,14 @@ impl UiState {
             ToUi::ImagingSettings(s) => self.imaging = s,
             ToUi::Sequence { status } => self.sequence = status.map(|s| *s),
             ToUi::SequenceLibrary { sequences } => self.library = sequences,
+            ToUi::Guider { status } => self.guider = *status,
+            ToUi::GuideStep(step) => {
+                if self.guide_history.len() >= Self::MAX_GUIDE_HISTORY {
+                    self.guide_history.pop_front();
+                }
+                self.guide_history.push_back(step);
+            }
+            ToUi::GuiderSettings(s) => self.guider_settings = s,
         }
     }
 
@@ -434,6 +483,7 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guider::GuideDir;
     use indi_link::*;
 
     fn number_prop() -> Property {
@@ -507,8 +557,11 @@ mod tests {
 
     #[test]
     fn preview_frames() {
-        let msg = preview_frame::encode(42, &[0xFF, 0xD8, 1, 2]);
-        assert_eq!(preview_frame::decode(&msg), Some((42, &[0xFF, 0xD8, 1, 2][..])));
+        use preview_frame::Kind;
+        let msg = preview_frame::encode(Kind::Main, 42, &[0xFF, 0xD8, 1, 2]);
+        assert_eq!(preview_frame::decode(&msg), Some((Kind::Main, 42, &[0xFF, 0xD8, 1, 2][..])));
+        let msg = preview_frame::encode(Kind::Guide, 7, &[1]);
+        assert_eq!(preview_frame::decode(&msg), Some((Kind::Guide, 7, &[1][..])));
         assert_eq!(preview_frame::decode(b"nope"), None);
         assert_eq!(preview_frame::decode(b"ICPV123"), None);
     }
@@ -550,6 +603,18 @@ mod tests {
             ToUi::Sequence { status: Some(Box::new(status)) },
             ToUi::SequenceLibrary { sequences: vec![] },
             ToUi::SequenceLibrary { sequences: vec![seq.clone()] },
+            ToUi::Guider { status: Box::default() },
+            ToUi::GuideStep(GuideStep {
+                frame: 3,
+                time: 6.0,
+                ra_px: 0.2,
+                dec_px: -0.1,
+                ra_pulse: Some((GuideDir::East, 120.0)),
+                dec_pulse: None,
+                snr: 40.0,
+                star_lost: false,
+            }),
+            ToUi::GuiderSettings(GuiderSettings::default()),
         ] {
             assert_eq!(ToUi::from_json(&m.to_json()).unwrap(), m);
         }
@@ -559,6 +624,9 @@ mod tests {
             ToEngine::DeleteSequence { name: "x".into() },
             ToEngine::PauseSequence,
             ToEngine::AbortCapture,
+            ToEngine::GuiderSelectStar { x: 1.5, y: 2.0 },
+            ToEngine::GuiderGuide,
+            ToEngine::SetGuiderSettings(GuiderSettings::default()),
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);
         }

@@ -85,6 +85,26 @@ bracketing, darks, bias, flats and dark flats.
 Sequences are saved on the engine, so every connected UI shares them.
 Pause takes effect after the current frame.
 
+## Guiding
+
+The Guiding tab runs a PHD2-style autoguider on the guide camera (assign it
+in Equipment). Guide pulses go through the mount driver by default, or the
+guide camera's ST-4 port.
+
+- **Guide** does everything: picks the best unsaturated star, calibrates if
+  needed, then guides. Click a star in the guide image to choose it yourself.
+- **Calibration** moves the mount west/east and north/south (taking up Dec
+  backlash first) to measure the camera angle and pulse rates. It is saved
+  and reused, with the RA rate adjusted for declination.
+- **RA** uses hysteresis guiding: it corrects a fraction (aggressiveness) of
+  each error and ignores moves smaller than the minimum. **Dec** resists
+  switching direction until several frames agree, or can be limited to
+  north-only or south-only.
+- The graph shows RA/Dec error in arcseconds once the pixel scale is known.
+  Pixel size and focal length come from INDI or the settings.
+
+Not yet: dithering, settling, meridian-flip handling, multi-star guiding.
+
 ## Web UI
 
 Build the wasm UI with [trunk](https://trunkrs.dev) (needs the

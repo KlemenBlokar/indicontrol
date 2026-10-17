@@ -8,6 +8,7 @@ use indi_link::{Device, IndexMap, PropertyState, interface};
 use protocol::{IndiStatus, LogEntry, LogLevel, Roles, ToEngine, ToUi, UiState};
 use serde::{Deserialize, Serialize};
 
+use crate::guider_view::GuiderView;
 use crate::imaging_view::{CaptureForm, ImagingView};
 use crate::link::{EngineLink, Incoming, LinkState};
 use crate::property_view::{self, Edits};
@@ -27,6 +28,7 @@ pub enum EngineChoice {
 enum View {
     Imaging,
     Sequence,
+    Guiding,
     Devices,
 }
 
@@ -108,6 +110,7 @@ pub struct App {
     applied_night_mode: Option<bool>,
     imaging: ImagingView,
     sequence: SequenceView,
+    guider: GuiderView,
     #[cfg(not(target_arch = "wasm32"))]
     local: LocalEngine,
 }
@@ -133,6 +136,7 @@ impl App {
             settings,
             imaging,
             sequence,
+            guider: GuiderView::new(),
             link: None,
             link_error: None,
             state: UiState::default(),
@@ -226,6 +230,10 @@ impl App {
                     self.imaging.on_preview(ctx, id, &jpeg);
                     continue;
                 }
+                Incoming::GuidePreview { jpeg } => {
+                    self.guider.on_preview(ctx, &jpeg);
+                    continue;
+                }
             };
             match &msg {
                 ToUi::IndiStatus { host, port, .. } => {
@@ -233,6 +241,7 @@ impl App {
                     self.indi_port = *port;
                 }
                 ToUi::ImagingSettings(s) => self.imaging.on_settings(s),
+                ToUi::GuiderSettings(s) => self.guider.on_settings(s),
                 _ => {}
             }
             self.state.apply(msg);
@@ -539,9 +548,18 @@ impl eframe::App for App {
                 for (view, label) in [
                     (View::Imaging, "Imaging"),
                     (View::Sequence, "Sequence"),
+                    (View::Guiding, "Guiding"),
                     (View::Devices, "Devices"),
                 ] {
                     ui.selectable_value(&mut self.settings.view, view, RichText::new(label).heading());
+                }
+                let g = &self.state.guider;
+                if g.state == protocol::GuiderState::Guiding && self.settings.view != View::Guiding {
+                    let rms = match g.pixel_scale {
+                        Some(k) => format!("{:.2}\"", g.stats.total_rms * k),
+                        None => format!("{:.2} px", g.stats.total_rms),
+                    };
+                    ui.label(RichText::new(format!("Guiding: RMS {rms}")).weak());
                 }
                 if let Some(s) = &self.state.sequence
                     && self.settings.view != View::Sequence
@@ -560,6 +578,7 @@ impl eframe::App for App {
             ui.add_enabled_ui(usable, |ui| match self.settings.view {
                 View::Imaging => self.imaging.ui(ui, &self.state, &mut actions),
                 View::Sequence => self.sequence.ui(ui, &self.state, &mut self.imaging, &mut actions),
+                View::Guiding => self.guider.ui(ui, &self.state, &mut actions),
                 View::Devices => self.device_view(ui, &mut actions),
             });
         });

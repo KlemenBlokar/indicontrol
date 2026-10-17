@@ -1,0 +1,10 @@
+//! Autoguiding: star detection, centroiding, calibration and guide algorithms.
+//! Pure computation (no I/O), so it can be tested against simulated mounts.
+
+pub mod calibration;
+pub mod guide;
+pub mod star;
+
+pub use calibration::{CalStep, Calibration, CalibrationSettings, Calibrator};
+pub use guide::{Correction, DecMode, GuideController, GuideDir, GuideParams, GuideStats};
+pub use star::{Background, Frame, Star};

@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use protocol::equipment::{self, Control};
-use protocol::{CaptureRequest, CaptureState, LogLevel, ToUi, preview_frame};
+use protocol::preview_frame::{self, Kind};
+use protocol::{CaptureRequest, CaptureState, LogLevel, ToUi};
 
 use super::{Core, CoreMsg, Outgoing};
 use crate::frame::{self, ProcessInput, ProcessOutput};
@@ -278,7 +279,7 @@ impl Core {
     fn publish_frame(&mut self, out: ProcessOutput) {
         let id = out.info.id;
         let info = Outgoing::text(&ToUi::Frame(Box::new(out.info)));
-        let preview = Outgoing::Binary(Bytes::from(preview_frame::encode(id, &out.jpeg)));
+        let preview = Outgoing::Binary(Bytes::from(preview_frame::encode(Kind::Main, id, &out.jpeg)));
         self.broadcast(info.clone());
         self.broadcast(preview.clone());
         self.last_frame = Some((info, preview));
