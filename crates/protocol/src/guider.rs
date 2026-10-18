@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use guiding::{
-    Calibration, CalibrationSettings, DecMode, GuideDir, GuideParams, GuideStats, Star,
+    Calibration, CalibrationSettings, DecMode, GuideDir, GuideParams, GuideStarMark, GuideStats, Star,
 };
 
 /// Where guide pulses are sent.
@@ -29,6 +29,8 @@ pub struct GuiderSettings {
     pub params: GuideParams,
     /// How far (px) the star may move between frames and still be found.
     pub search_radius: f64,
+    /// Guide on every usable star in the field, not just one.
+    pub multi_star: bool,
     /// Consecutive frames without the star before guiding stops.
     pub max_lost_frames: u32,
     /// Pause after a pulse before the next exposure (ms).
@@ -58,6 +60,7 @@ impl Default for GuiderSettings {
             calibration: CalibrationSettings::default(),
             params: GuideParams::default(),
             search_radius: 15.0,
+            multi_star: true,
             max_lost_frames: 10,
             settle_ms: 100.0,
             dither_px: 3.0,
@@ -85,8 +88,15 @@ pub struct GuiderStatus {
     pub state: GuiderState,
     pub camera: Option<String>,
     pub frame_size: Option<(usize, usize)>,
+    /// The primary guide star.
     pub star: Option<Star>,
     pub lock: Option<(f64, f64)>,
+    /// All tracked stars (the primary included).
+    pub guide_stars: Vec<GuideStarMark>,
+    /// Stars used in the last frame (1 = single-star guiding).
+    pub stars_used: usize,
+    /// Field rotation since tracking began (degrees), when measurable.
+    pub field_rotation: Option<f64>,
     pub calibration: Option<Calibration>,
     /// Arcseconds per guide-camera pixel, if focal length and pixel size are known.
     pub pixel_scale: Option<f64>,
@@ -105,6 +115,9 @@ impl Default for GuiderStatus {
             frame_size: None,
             star: None,
             lock: None,
+            guide_stars: Vec::new(),
+            stars_used: 0,
+            field_rotation: None,
             calibration: None,
             pixel_scale: None,
             stats: GuideStats::default(),

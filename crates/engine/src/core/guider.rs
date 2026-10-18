@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use guiding::{
-    CalStep, Calibration, Calibrator, DitherRng, Frame, GuideController, GuideStats, SettleOutcome,
-    SettleTracker, Star, dither_offset,
+    CalStep, Calibration, Calibrator, DitherRng, Fix, Frame, GuideController, GuideStats, SettleOutcome,
+    SettleTracker, Star, StarField, dither_offset,
 };
 use imaging::{Fits, Image, analyze, encode_jpeg, make_preview};
 use protocol::equipment;
@@ -29,7 +29,12 @@ pub(crate) struct GuiderCore {
     exposing: bool,
     /// Identifies the current exposure; stale results and timers are ignored.
     seq: u64,
+    /// The primary star as last measured.
     star: Option<Star>,
+    /// Every star being tracked; guiding locks on its anchor.
+    field: Option<StarField>,
+    /// Stars used in the last fix.
+    stars_used: usize,
     lock: Option<(f64, f64)>,
     frame_size: Option<(usize, usize)>,
     select: Option<Select>,
@@ -64,34 +69,56 @@ enum Select {
 pub(crate) struct GuideFrameOut {
     width: usize,
     height: usize,
-    star: Option<Star>,
+    /// Result of a star selection, if one was requested.
+    selected: Option<Option<Star>>,
+    /// One measurement per tracked star.
+    measured: Vec<Option<Star>>,
+    /// Stars found across the whole frame, if a search was requested.
+    candidates: Vec<Star>,
     jpeg: Vec<u8>,
 }
 
-fn process_frame(
-    blob: Arc<Vec<u8>>,
-    format: String,
+/// What to look for in a guide frame.
+struct Plan {
     select: Option<Select>,
-    track: Option<(f64, f64)>,
+    /// Predicted positions of the tracked stars.
+    track: Vec<(f64, f64)>,
+    /// Also search the whole frame for stars.
+    scan: bool,
     radius: f64,
-) -> Result<GuideFrameOut, String> {
+}
+
+const CANDIDATES: usize = 4 * guiding::multistar::MAX_STARS;
+
+fn process_frame(blob: Arc<Vec<u8>>, format: String, plan: Plan) -> Result<GuideFrameOut, String> {
     if !format.starts_with(".fit") {
         return Err(format!("guide camera sent '{format}', need FITS"));
     }
     let fits = Fits::parse(&blob).map_err(|e| format!("bad guide frame: {e}"))?;
     let img = Image::from_fits(&fits).map_err(|e| format!("bad guide frame: {e}"))?;
     let frame = Frame::new(&img);
-    let r = radius.max(3.0) as usize;
-    let star = match select {
-        Some(Select::Auto) => frame.detect(1).first().copied(),
-        Some(Select::At(x, y)) => frame.measure_near(x, y, r.max(20)),
-        None => track.and_then(|(x, y)| frame.measure_near(x, y, r)),
+    let r = plan.radius.max(3.0) as usize;
+    let mut candidates = if plan.scan || plan.select.is_some() {
+        frame.detect(CANDIDATES)
+    } else {
+        Vec::new()
+    };
+    let selected = plan.select.map(|select| match select {
+        Select::Auto => (!candidates.is_empty()).then(|| candidates.remove(0)),
+        Select::At(x, y) => frame.measure_near(x, y, r.max(20)),
+    });
+    let measured = if selected.is_some() {
+        Vec::new()
+    } else {
+        plan.track.iter().map(|&(x, y)| frame.measure_near(x, y, r)).collect()
     };
     let jpeg = encode_jpeg(&make_preview(&img, &analyze(&img, None), PREVIEW_MAX_DIM), 80);
     Ok(GuideFrameOut {
         width: img.width,
         height: img.height,
-        star,
+        selected,
+        measured,
+        candidates,
         jpeg,
     })
 }
@@ -134,6 +161,7 @@ impl Core {
         let g = &mut self.guider;
         if g.camera.as_deref() != Some(camera.as_str()) {
             g.star = None;
+            g.field = None;
             g.lock = None;
         }
         g.camera = Some(camera);
@@ -172,11 +200,17 @@ impl Core {
         if g.camera.as_deref() != Some(device) || !g.exposing {
             return false;
         }
-        let (seq, select, radius) = (g.seq, g.select, self.state.guider.search_radius);
-        let track = g.star.map(|s| (s.x, s.y)).or(g.lock);
+        let multi = self.state.guider.multi_star;
+        let plan = Plan {
+            select: g.select,
+            track: g.field.as_ref().map(StarField::predictions).unwrap_or_default(),
+            scan: multi && g.select.is_none() && g.field.as_ref().is_some_and(StarField::wants_candidates),
+            radius: self.state.guider.search_radius,
+        };
+        let seq = g.seq;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || process_frame(blob, format, select, track, radius))
+            let result = tokio::task::spawn_blocking(move || process_frame(blob, format, plan))
                 .await
                 .unwrap_or_else(|e| Err(format!("guide frame processing crashed: {e}")));
             let _ = tx.send(CoreMsg::GuideFrame {
@@ -206,14 +240,34 @@ impl Core {
         g.last_preview = Some(preview.clone());
         self.broadcast(preview);
 
+        let (multi, separation) = (self.state.guider.multi_star, self.state.guider.search_radius.max(5.0));
+        let size = (out.width, out.height);
         let g = &mut self.guider;
-        if g.select.take().is_some() {
-            match out.star {
+        let mut fix: Option<Fix> = None;
+        if let Some(selected) = out.selected {
+            g.select = None;
+            match selected {
                 Some(s) => {
+                    let mut field = StarField::new(&s);
+                    if multi {
+                        field.add_candidates(&out.candidates, separation, size);
+                    }
+                    let others = field.len() - 1;
+                    g.field = Some(field);
                     g.star = Some(s);
+                    g.stars_used = 1;
                     g.lock = Some((s.x, s.y));
                     g.lost = 0;
-                    let text = format!("Guide star at ({:.1}, {:.1}), SNR {:.0}", s.x, s.y, s.snr);
+                    fix = Some(Fix {
+                        x: s.x,
+                        y: s.y,
+                        primary: s,
+                        used: 1,
+                    });
+                    let mut text = format!("Guide star at ({:.1}, {:.1}), SNR {:.0}", s.x, s.y, s.snr);
+                    if others > 0 {
+                        text += &format!(", plus {others} more for multi-star guiding");
+                    }
                     self.log(None, text, LogLevel::Info);
                 }
                 None => {
@@ -228,14 +282,24 @@ impl Core {
                     return;
                 }
             }
-        } else {
-            match out.star {
-                Some(s) => {
-                    g.star = Some(s);
+        } else if let Some(field) = g.field.as_mut().filter(|f| f.len() == out.measured.len()) {
+            fix = field.update(&out.measured);
+            match fix {
+                Some(f) => {
+                    if multi && !out.candidates.is_empty() {
+                        field.add_candidates(&out.candidates, separation, size);
+                    }
+                    g.star = Some(f.primary);
+                    g.stars_used = f.used;
                     g.lost = 0;
                 }
-                None => g.lost += 1,
+                None => {
+                    g.stars_used = 0;
+                    g.lost += 1;
+                }
             }
+        } else {
+            g.lost += 1;
         }
 
         let max_lost = self.state.guider.max_lost_frames;
@@ -246,7 +310,13 @@ impl Core {
             Mode::Idle => {}
             Mode::Looping => {
                 g.message = match (&g.star, g.lost) {
-                    (Some(s), 0) => format!("Looping — star SNR {:.0}, HFD {:.1} px", s.snr, s.hfd),
+                    (Some(s), 0) => format!(
+                        "Looping — {}{} SNR {:.0}, HFD {:.1} px",
+                        stars_label(g.stars_used),
+                        if g.stars_used > 1 { "primary" } else { "star" },
+                        s.snr,
+                        s.hfd
+                    ),
                     (Some(_), n) => format!("Looping — star not found in {n} frames"),
                     (None, _) => "Looping — select a guide star".into(),
                 };
@@ -254,15 +324,14 @@ impl Core {
                 self.guide_expose();
             }
             Mode::Calibrating(cal) => {
-                if out.star.is_none() {
+                let Some(f) = fix else {
                     if g.lost >= max_lost {
                         return self.guider_fail_to_loop("Guide star lost during calibration".into());
                     }
                     self.send_guider();
                     return self.guide_expose();
-                }
-                let s = g.star.expect("tracked");
-                match cal.step((s.x, s.y)) {
+                };
+                match cal.step((f.x, f.y)) {
                     CalStep::Pulse(dir, ms) => {
                         g.message = cal.describe();
                         self.send_guider();
@@ -291,7 +360,7 @@ impl Core {
                         self.save();
                         self.log(None, text, level);
                         let g = &mut self.guider;
-                        g.lock = Some((s.x, s.y));
+                        g.lock = Some((f.x, f.y));
                         if std::mem::take(&mut g.guide_after_calibration) {
                             self.guider_start_guiding();
                         } else {
@@ -307,7 +376,7 @@ impl Core {
             Mode::Guiding(ctl) => {
                 let elapsed = g.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
                 g.steps += 1;
-                let Some(s) = out.star else {
+                let Some(f) = fix else {
                     let step = GuideStep {
                         frame: g.steps,
                         time: elapsed,
@@ -331,17 +400,17 @@ impl Core {
                     self.send_guider();
                     return self.guide_expose();
                 };
-                let lock = *g.lock.get_or_insert((s.x, s.y));
+                let lock = *g.lock.get_or_insert((f.x, f.y));
                 let Some(cal) = calibration else {
                     return self.guider_fail_to_loop("no calibration".into());
                 };
-                let c = ctl.compute(&cal, declination, lock, (s.x, s.y));
+                let c = ctl.compute(&cal, declination, lock, (f.x, f.y));
                 g.errors.push_back((c.ra_px, c.dec_px));
                 if g.errors.len() > STATS_WINDOW {
                     g.errors.pop_front();
                 }
                 let stats = GuideStats::from_errors(g.errors.iter().copied());
-                g.message = format!("Guiding — RMS {:.2} px", stats.total_rms);
+                g.message = format!("Guiding — {}RMS {:.2} px", stars_label(f.used), stats.total_rms);
                 let settled = g
                     .settle
                     .as_mut()
@@ -356,7 +425,7 @@ impl Core {
                     dec_px: c.dec_px,
                     ra_pulse: c.ra,
                     dec_pulse: c.dec,
-                    snr: s.snr,
+                    snr: f.primary.snr,
                     star_lost: false,
                 };
                 let pulses: Vec<(GuideDir, f64)> = [c.ra, c.dec].into_iter().flatten().collect();
@@ -452,7 +521,7 @@ impl Core {
     }
 
     pub(super) fn guider_calibrate(&mut self, then_guide: bool) -> Result<(), String> {
-        if self.guider.star.is_none() {
+        if self.guider.field.is_none() {
             self.guider.select = Some(Select::Auto);
         }
         self.guider_loop()?;
@@ -474,7 +543,7 @@ impl Core {
             self.log(None, "No calibration yet — calibrating first", LogLevel::Info);
             return self.guider_calibrate(true);
         }
-        if self.guider.star.is_none() {
+        if self.guider.field.is_none() {
             self.guider.select = Some(Select::Auto);
         }
         self.guider_loop()?;
@@ -489,7 +558,7 @@ impl Core {
         g.active_calibration = active;
         g.settle = Some(SettleTracker::new(settings.settle_px, settings.settle_time, settings.settle_timeout, 0.0));
         g.mode = Mode::Guiding(GuideController::new(self.state.guider.params.clone()));
-        g.lock = g.star.map(|s| (s.x, s.y)).or(g.lock);
+        g.lock = g.field.as_ref().map(StarField::anchor).or(g.lock);
         g.errors.clear();
         g.steps = 0;
         g.lost = 0;
@@ -502,6 +571,7 @@ impl Core {
     /// After a meridian flip the field has rotated: pick a star afresh.
     pub(super) fn guider_restart_after_flip(&mut self) -> Result<(), String> {
         self.guider.star = None;
+        self.guider.field = None;
         self.guider.lock = None;
         self.guider_guide()
     }
@@ -667,6 +737,9 @@ impl Core {
                 frame_size: g.frame_size,
                 star: g.star,
                 lock: g.lock,
+                guide_stars: g.field.as_ref().map(StarField::marks).unwrap_or_default(),
+                stars_used: g.stars_used,
+                field_rotation: g.field.as_ref().and_then(StarField::rotation).map(f64::to_degrees),
                 calibration: g.active_calibration.clone().or_else(|| self.state.guider_calibration.clone()),
                 pixel_scale: self.guide_pixel_scale(),
                 stats: GuideStats::from_errors(g.errors.iter().copied()),
@@ -683,4 +756,9 @@ impl Core {
     pub(super) fn send_guider(&self) {
         self.send(self.guider_msg());
     }
+}
+
+/// "5 stars, " in multi-star mode, nothing for a single star.
+fn stars_label(used: usize) -> String {
+    if used > 1 { format!("{used} stars, ") } else { String::new() }
 }

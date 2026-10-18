@@ -3,6 +3,8 @@
 //!   indiserver -p 7630 indi_simulator_telescope indi_simulator_ccd \
 //!       indi_simulator_wheel indi_simulator_focus indi_simulator_guide
 //!   INDI_SIM=127.0.0.1:7630 cargo test -p engine --test simulators -- --nocapture
+//!
+//! MULTI=0 guides on a single star (for comparison with multi-star guiding).
 
 mod common;
 
@@ -124,9 +126,16 @@ async fn point_at_pleiades(ui: &mut TestUi) -> (f64, f64) {
         ui.until("unparked", |u| u.state.mount.as_ref().and_then(|m| m.parked) == Some(false)).await;
     }
     let target = (3.0 + 47.0 / 60.0, 24.0 + 7.0 / 60.0); // near Alcyone, J2000
-    ui.send(ToEngine::MountGoto { ra_hours: target.0, dec_deg: target.1 }).await;
-    ui.until("slew started", |u| u.state.mount.as_ref().is_some_and(|m| m.slewing)).await;
-    ui.until("slew done", |u| u.state.mount.as_ref().is_some_and(|m| !m.slewing)).await;
+    // From a previous run the mount may already be there: a goto would then
+    // be a tiny slew that is easily missed (and would move the guide stars).
+    let there = ui.state.mount.as_ref().is_some_and(|m| {
+        !m.slewing && (m.ra_j2000 - target.0).abs() < 0.01 && (m.dec_j2000 - target.1).abs() < 0.1
+    });
+    if !there {
+        ui.send(ToEngine::MountGoto { ra_hours: target.0, dec_deg: target.1 }).await;
+        ui.until_for("slew started", 30, |u| u.state.mount.as_ref().is_some_and(|m| m.slewing)).await;
+        ui.until_for("slew done", 120, |u| u.state.mount.as_ref().is_some_and(|m| !m.slewing)).await;
+    }
     let m = ui.state.mount.clone().unwrap();
     eprintln!(
         "mount at {:.4}h {:.3}° (J2000), alt {:?}, pier {:?}",
@@ -201,6 +210,7 @@ async fn guiding_on_simulator() {
     g.calibration.step_ms = 2000.0;
     g.calibration.distance_px = 15.0;
     g.settle_time = 3.0;
+    g.multi_star = std::env::var("MULTI").map_or(true, |v| v != "0");
     ui.send(ToEngine::SetGuiderSettings(g.clone())).await;
     ui.until("guider settings", |u| u.state.guider_settings == g).await;
     ui.send(ToEngine::GuiderGuide).await;
@@ -217,6 +227,13 @@ async fn guiding_on_simulator() {
     let recent: Vec<_> = ui.state.guide_history.iter().rev().take(15).collect();
     let rms = (recent.iter().map(|s| s.ra_px.powi(2) + s.dec_px.powi(2)).sum::<f64>() / recent.len() as f64).sqrt();
     eprintln!("calibration {cal:?}\nguide RMS {rms:.3} px over {} steps", recent.len());
+    let g = &ui.state.guider;
+    eprintln!(
+        "{} of {} tracked stars used, field rotation {:?}°",
+        g.stars_used,
+        g.guide_stars.len(),
+        g.field_rotation
+    );
     assert!(cal.orthogonality_error() < 10.0);
     assert!(rms < 1.0);
     ui.send(ToEngine::GuiderStop).await;

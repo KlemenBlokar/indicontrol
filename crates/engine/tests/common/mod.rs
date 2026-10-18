@@ -9,7 +9,6 @@ use imaging::fits::{Card, Fits, Header};
 use protocol::{CaptureState, ToEngine, ToUi, UiState, preview_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
 pub type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
@@ -194,7 +193,12 @@ struct GuideSky {
     frames: usize,
     /// After a meridian flip the camera is turned 180° relative to the sky.
     flipped: bool,
+    /// The bright star at (x, y) is gone (a test sends SIM_HIDE_PRIMARY).
+    primary_hidden: bool,
 }
+
+/// Fainter stars around the primary guide star: (dx, dy, peak).
+const GUIDE_SECONDARIES: [(f64, f64, f64); 3] = [(-45.0, -25.0, 4000.0), (40.0, 30.0, 3000.0), (-30.0, 33.0, 2500.0)];
 
 impl GuideSky {
     fn theta(&self) -> f64 {
@@ -221,7 +225,15 @@ impl GuideSky {
                 let (x, y) = ((i % GW) as f64, (i / GW) as f64);
                 let d2 = (x - self.x).powi(2) + (y - self.y).powi(2);
                 let noise = ((i * 7919 + self.frames * 104_729) % 61) as f64;
-                (1000.0 + noise + 6000.0 * (-d2 / (2.0 * 1.5 * 1.5)).exp()) as u16
+                let star = |d2: f64, peak: f64| peak * (-d2 / (2.0 * 1.5 * 1.5)).exp();
+                let mut v = 1000.0 + noise;
+                if !self.primary_hidden {
+                    v += star(d2, 6000.0);
+                }
+                for (dx, dy, peak) in GUIDE_SECONDARIES {
+                    v += star((x - self.x - dx).powi(2) + (y - self.y - dy).powi(2), peak);
+                }
+                v.min(65535.0) as u16
             })
             .collect();
         let mut h = Header::default();
@@ -273,7 +285,7 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
     let (mut seen, mut pending) = (String::new(), String::new());
     let mut buf = vec![0u8; 65536];
     let mut defined = false;
-    let mut sky = GuideSky { x: 80.0, y: 60.0, frames: 0, flipped: false };
+    let mut sky = GuideSky { x: 80.0, y: 60.0, frames: 0, flipped: false, primary_hidden: false };
     let ra0 = (lst_now() - hour_angle_min / 60.0).rem_euclid(24.0);
     // Mount model: reported position + pointing error = where it really points (JNow).
     let mut reported = (ra0, -5.39);
@@ -316,7 +328,9 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
                 continue;
             }
             let msg = &chunk[chunk.rfind("<newNumberVector").unwrap()..];
-            if msg.contains(r#"name="FILTER_SLOT""#) {
+            if msg.contains(r#"name="SIM_HIDE_PRIMARY""#) {
+                sky.primary_hidden = true;
+            } else if msg.contains(r#"name="FILTER_SLOT""#) {
                 let slot = number_in(msg, "FILTER_SLOT_VALUE");
                 sock.write_all(br#"<setNumberVector device="Wheel" name="FILTER_SLOT" state="Busy"><oneNumber name="FILTER_SLOT_VALUE">1</oneNumber></setNumberVector>"#).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -419,8 +433,11 @@ impl TestUi {
 
     /// Like [`until`](Self::until) with a custom per-message timeout (seconds).
     pub async fn until_for(&mut self, what: &str, secs: u64, pred: impl Fn(&TestUi) -> bool) {
+        // An overall deadline: a busy engine keeps sending messages, so a
+        // per-message timeout alone would wait forever.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs.max(30));
         while !pred(self) {
-            let msg = timeout(Duration::from_secs(secs), self.ws.next())
+            let msg = tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + Duration::from_secs(secs)), self.ws.next())
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for {what}; log: {:#?}", self.state.log))
                 .expect("socket closed")

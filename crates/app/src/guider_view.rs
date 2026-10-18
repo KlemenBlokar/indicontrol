@@ -99,6 +99,11 @@ impl GuiderView {
             let r = (s.hfd as f32 / fw * rect.width() * 1.5).max(8.0);
             painter.circle_stroke(to_screen(s.x, s.y), r, Stroke::new(1.5, star_c));
         }
+        // Secondary stars: bright when they count, faint when ignored.
+        for m in g.guide_stars.iter().filter(|m| !m.primary) {
+            let color = if m.used { star_c.gamma_multiply(0.7) } else { star_c.gamma_multiply(0.25) };
+            painter.circle_stroke(to_screen(m.x, m.y), 6.0, Stroke::new(1.0, color));
+        }
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -167,6 +172,10 @@ impl GuiderView {
                 ui.end_row();
                 ui.label("Search radius");
                 ui.add(egui::DragValue::new(&mut s.search_radius).range(3.0..=100.0).suffix(" px"));
+                ui.end_row();
+                ui.label("Multi-star");
+                ui.checkbox(&mut s.multi_star, "Use all suitable stars")
+                    .on_hover_text("Averages every usable star; falls back to one star when no others qualify");
                 ui.end_row();
 
                 ui.label(RichText::new("Dither & settle").strong());
@@ -288,6 +297,21 @@ fn status_details(ui: &mut egui::Ui, g: &GuiderStatus, actions: &mut Vec<ToEngin
             ui.label(format!("SNR {:.0}, HFD {:.1} px{}", s.snr, s.hfd, if s.saturated { ", saturated!" } else { "" }));
             ui.end_row();
         }
+        if !g.guide_stars.is_empty() {
+            ui.label("Stars");
+            ui.label(match (g.stars_used, g.guide_stars.len()) {
+                (_, 1) => "single star".to_owned(),
+                (used, n) if used <= 1 => format!("single star ({n} tracked)"),
+                (used, n) => format!("{used} of {n} tracked"),
+            });
+            ui.end_row();
+        }
+        if let Some(rot) = g.field_rotation {
+            ui.label("Field rotation");
+            ui.label(format!("{rot:+.2}°"))
+                .on_hover_text("How far the field turned since the stars were picked; grows with polar alignment error");
+            ui.end_row();
+        }
         ui.label("Scale");
         ui.label(scale.map_or("unknown (set focal length / pixel size)".into(), |s| format!("{s:.2}\"/px")));
         ui.end_row();
@@ -387,7 +411,7 @@ fn optional(ui: &mut egui::Ui, v: &mut Option<f64>, default: f64, suffix: &str, 
 mod tests {
     use super::*;
     use protocol::GuideStep;
-    use protocol::guider::{Calibration, GuideDir, GuideStats, Star};
+    use protocol::guider::{Calibration, GuideDir, GuideStarMark, GuideStats, Star};
 
     #[test]
     fn renders_guiding_state() {
@@ -404,6 +428,13 @@ mod tests {
             frame_size: Some((64, 48)),
             star: Some(Star { x: 30.0, y: 20.0, flux: 1e4, peak: 3000.0, snr: 80.0, hfd: 3.0, saturated: false }),
             lock: Some((30.2, 19.9)),
+            guide_stars: vec![
+                GuideStarMark { x: 30.0, y: 20.0, primary: true, used: true },
+                GuideStarMark { x: 10.0, y: 40.0, primary: false, used: true },
+                GuideStarMark { x: 50.0, y: 8.0, primary: false, used: false },
+            ],
+            stars_used: 2,
+            field_rotation: Some(0.12),
             calibration: Some(Calibration {
                 ra_angle: 0.5,
                 ra_rate: 0.005,

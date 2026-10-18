@@ -93,6 +93,16 @@ guide camera's ST-4 port.
 
 - **Guide** does everything: picks the best unsaturated star, calibrates if
   needed, then guides. Click a star in the guide image to choose it yourself.
+- **Multi-star** (on by default, nothing to tune): every other isolated,
+  unsaturated star in the frame is tracked as well, and new ones are picked
+  up as they appear. Each frame the guide position is the SNR-weighted
+  average of all stars that agree; stars that disagree are ignored, then
+  dropped. Movement shared by all stars is mount error. Slow movement that
+  differs between stars (field rotation from polar misalignment, refraction)
+  is absorbed into each star's reference, so it never turns into guide
+  corrections. If the primary star is lost, another takes over seamlessly.
+  With only one usable star this is ordinary single-star guiding. The
+  measured field rotation is shown and hints at polar alignment error.
 - **Calibration** moves the mount west/east and north/south (taking up Dec
   backlash first) to measure the camera angle and pulse rates. It is saved
   and reused, with the RA rate adjusted for declination.
@@ -109,7 +119,7 @@ guide camera's ST-4 port.
 - After a **meridian flip** the saved calibration is reused, turned by 180°
   (Dec reversal can be switched off for mounts that reverse Dec themselves).
 
-Not yet: multi-star guiding, backlash compensation.
+Not yet: backlash compensation.
 
 ## Mount and meridian flips
 

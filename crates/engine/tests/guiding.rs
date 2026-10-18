@@ -96,3 +96,80 @@ async fn calibrates_and_guides() {
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Several stars in the field: guiding uses all of them and survives losing
+/// the primary star.
+#[tokio::test]
+async fn multi_star_guiding_survives_losing_the_primary() {
+    let indi = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = indi.local_addr().unwrap().port();
+    tokio::spawn(fake_indi(indi, -10.0));
+    let dir = std::env::temp_dir().join(format!("indicontrol-multistar-{}", std::process::id()));
+    let engine = engine::start(EngineConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        web_root: None,
+        state_file: Some(dir.join("engine.json")),
+        indi: Some(("127.0.0.1".into(), port)),
+    })
+    .await
+    .unwrap();
+
+    let mut ui = TestUi::connect(&engine.ws_url()).await;
+    ui.until("devices", |u| {
+        u.state.indi_status == IndiStatus::Connected
+            && u.state.cache.property("Scope", "TELESCOPE_TIMED_GUIDE_WE").is_some()
+            && u.state.cache.property("GuideCam", "CCD_INFO").is_some()
+    })
+    .await;
+    let roles = Roles {
+        main_camera: Some("Cam".into()),
+        guide_camera: Some("GuideCam".into()),
+        mount: Some("Scope".into()),
+        ..Default::default()
+    };
+    ui.send(ToEngine::SetRoles(roles.clone())).await;
+    let settings = GuiderSettings {
+        exposure: 0.01,
+        settle_ms: 5.0,
+        calibration: CalibrationSettings {
+            step_ms: 100.0,
+            distance_px: 15.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(settings.multi_star, "on by default");
+    ui.send(ToEngine::SetGuiderSettings(settings.clone())).await;
+    ui.until("settings", |u| u.state.roles == roles && u.state.guider_settings == settings).await;
+
+    ui.send(ToEngine::GuiderGuide).await;
+    ui.until("guiding on several stars", |u| {
+        u.state.guider.state == GuiderState::Guiding && u.state.guide_history.len() >= 10 && u.state.guider.stars_used >= 3
+    })
+    .await;
+    let primary = ui.state.guider.star.expect("primary star");
+    assert!(ui.state.guider.guide_stars.len() >= 3, "{:?}", ui.state.guider.guide_stars);
+
+    // The primary star vanishes; the others carry on.
+    ui.send(ToEngine::SetNumber {
+        device: "GuideCam".into(),
+        name: "SIM_HIDE_PRIMARY".into(),
+        values: vec![("HIDE".into(), 1.0)],
+    })
+    .await;
+    let before = ui.state.guide_history.len();
+    ui.until("20 more guide steps", |u| u.state.guide_history.len() >= before + 20).await;
+    assert_eq!(ui.state.guider.state, GuiderState::Guiding);
+    let recent: Vec<_> = ui.state.guide_history.iter().rev().take(15).collect();
+    assert!(recent.iter().all(|s| !s.star_lost), "guide star counted as lost");
+    let rms = (recent.iter().map(|s| s.ra_px.powi(2) + s.dec_px.powi(2)).sum::<f64>() / recent.len() as f64).sqrt();
+    assert!(rms < 0.8, "guide RMS {rms} px after losing the primary");
+    let now = ui.state.guider.star.expect("a new primary");
+    assert!((now.x - primary.x).hypot(now.y - primary.y) > 10.0, "another star became primary");
+    assert!(ui.state.guider.stars_used >= 2);
+
+    ui.send(ToEngine::GuiderStop).await;
+    ui.until("idle", |u| u.state.guider.state == GuiderState::Idle).await;
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
