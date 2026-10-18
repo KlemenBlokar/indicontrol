@@ -184,6 +184,14 @@ indicontrol-engine --listen 0.0.0.0:7700 --web-root crates/app/dist
 # open http://telescope-pi.local:7700/
 ```
 
+Release builds also write Brotli (if `brotli` is installed) and gzip copies of
+the wasm, and the engine serves those: the download shrinks from ~9 MB to
+~2.7 MB. The page reconnects by itself when the engine restarts, and
+remembers its own view settings (tab, night mode) in the browser.
+
+There is no login: anyone who can reach the port can control the
+equipment. Keep `--listen` on a trusted network (or behind a VPN/SSH tunnel).
+
 ## Testing without hardware
 
 The INDI simulators (`indi_simulator_ccd`, `indi_simulator_telescope`,

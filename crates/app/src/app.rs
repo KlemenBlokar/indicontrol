@@ -249,6 +249,12 @@ impl App {
                 }
             };
             match &msg {
+                // A (re)connected engine: images from before are stale. It
+                // re-sends its latest previews right after.
+                ToUi::Hello { .. } => {
+                    self.imaging.clear_preview();
+                    self.guider.clear_preview();
+                }
                 ToUi::IndiStatus { host, port, .. } => {
                     self.indi_host.clone_from(host);
                     self.indi_port = *port;
@@ -480,7 +486,10 @@ impl App {
             ui.label(RichText::new("No devices — connect to an INDI server.").weak());
         }
         egui::ScrollArea::vertical().id_salt("devices").show(ui, |ui| {
-            for dev in self.state.cache.devices.values() {
+            // By name: INDI reports devices in no particular order.
+            let mut devices: Vec<_> = self.state.cache.devices.values().collect();
+            devices.sort_by(|a, b| a.name.cmp(&b.name));
+            for dev in devices {
                 ui.horizontal(|ui| {
                     let connected = dev.is_connected();
                     property_view::state_dot(
@@ -606,7 +615,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_link(ctx);
         if self.selected_device.is_none() {
-            self.selected_device = self.state.cache.devices.keys().next().cloned();
+            self.selected_device = self.state.cache.devices.keys().min().cloned();
         }
     }
 
@@ -723,12 +732,13 @@ fn role_combo(
     devices: &IndexMap<String, Device>,
     flag: u32,
 ) {
-    let candidates: Vec<&str> = devices
+    let mut candidates: Vec<&str> = devices
         .values()
         // Devices that have not reported interfaces yet are offered too.
         .filter(|d| d.interfaces() == 0 || d.has_interface(flag))
         .map(|d| d.name.as_str())
         .collect();
+    candidates.sort_unstable();
     let mut text = slot.clone().unwrap_or_else(|| "—".into());
     if slot.as_ref().is_some_and(|s| !devices.contains_key(s)) {
         text += " (offline)";

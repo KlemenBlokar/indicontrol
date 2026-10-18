@@ -22,7 +22,8 @@ pub(crate) fn router(core: CoreTx, web_root: Option<PathBuf>) -> Router {
         .route(protocol::WS_PATH, get(ws_handler))
         .with_state(core);
     match web_root {
-        Some(root) => router.fallback_service(ServeDir::new(root)),
+        // Release builds of the web UI come with .br/.gz copies (Trunk.toml).
+        Some(root) => router.fallback_service(ServeDir::new(root).precompressed_br().precompressed_gzip()),
         None => router,
     }
 }

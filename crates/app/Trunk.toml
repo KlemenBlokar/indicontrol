@@ -1,0 +1,13 @@
+# Release builds also get .br/.gz copies; the engine serves those to browsers
+# that accept them (the wasm shrinks from ~9 MB to under 3 MB).
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-c", """
+[ "$TRUNK_PROFILE" = release ] || exit 0
+cd "$TRUNK_STAGING_DIR" || exit 1
+for f in *.wasm *.js; do
+    gzip -9 -k -f "$f"
+    if command -v brotli >/dev/null; then brotli -q 11 -k -f "$f"; fi
+done
+"""]

@@ -77,6 +77,10 @@ impl ImagingView {
         self.settings_edit = s.clone();
     }
 
+    pub fn clear_preview(&mut self) {
+        self.texture = None;
+    }
+
     pub fn on_preview(&mut self, ctx: &egui::Context, id: u64, jpeg: &[u8]) {
         let decoded = match image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg) {
             Ok(img) => img.to_rgb8(),

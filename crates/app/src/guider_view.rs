@@ -29,6 +29,10 @@ impl GuiderView {
         self.settings_edit = s.clone();
     }
 
+    pub fn clear_preview(&mut self) {
+        self.texture = None;
+    }
+
     pub fn on_preview(&mut self, ctx: &egui::Context, jpeg: &[u8]) {
         match image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg) {
             Ok(img) => {
