@@ -219,3 +219,12 @@ INDI_SIM=127.0.0.1:7630 ASTAP=~/.local/opt/astap/astap_cli \
 INDI 2.x keeps the telescope focal length on each camera (`SCOPE_INFO`).
 Set it under **Optics** in the Equipment panel: the engine writes it to the
 cameras, and FITS metadata, plate solving and the guider rely on it.
+
+## License
+
+Copyright © 2026 Klemen Blokar. This work is free. You can redistribute it
+and/or modify it under the terms of the Do What The Fuck You Want To Public
+License, Version 2, as published by Sam Hocevar. See the [LICENSE](LICENSE)
+file for more details.
+
+The dependencies (egui, tokio and others) keep their own licenses.
