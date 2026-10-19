@@ -6,16 +6,16 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, RichText};
 use indi_link::{Device, IndexMap, PropertyState, interface};
-use protocol::{IndiStatus, LogEntry, LogLevel, Roles, ToEngine, ToUi, UiState};
+use protocol::{DocId, IndiStatus, LogEntry, LogLevel, Roles, Synced, ToEngine, ToUi, UiState};
 use serde::{Deserialize, Serialize};
 
 use crate::focus_view::FocusView;
 use crate::guider_view::GuiderView;
-use crate::imaging_view::{CaptureForm, ImagingView};
+use crate::imaging_view::ImagingView;
 use crate::link::{EngineLink, Incoming, LinkState};
 use crate::mount_view::MountView;
 use crate::property_view::{self, Edits};
-use crate::sequence_view::{SequenceDraft, SequenceView};
+use crate::sequence_view::{PresetForm, SequenceView};
 
 /// Which engine the UI talks to (native builds only; the web UI always uses
 /// the engine that served it).
@@ -43,8 +43,8 @@ struct UiSettings {
     night_mode: bool,
     engine: EngineChoice,
     view: View,
-    capture: CaptureForm,
-    sequence: SequenceDraft,
+    log_histogram: bool,
+    presets: PresetForm,
 }
 
 impl Default for UiSettings {
@@ -53,8 +53,8 @@ impl Default for UiSettings {
             night_mode: false,
             engine: EngineChoice::Local,
             view: View::Imaging,
-            capture: CaptureForm::default(),
-            sequence: SequenceDraft::default(),
+            log_histogram: true,
+            presets: PresetForm::default(),
         }
     }
 }
@@ -139,8 +139,8 @@ impl App {
         };
         #[cfg(target_arch = "wasm32")]
         let _ = options.local_indi;
-        let imaging = ImagingView::new(settings.capture.clone());
-        let sequence = SequenceView::new(settings.sequence.clone());
+        let imaging = ImagingView::new(settings.log_histogram);
+        let sequence = SequenceView::new(settings.presets.clone());
         let mut app = Self {
             settings,
             imaging,
@@ -232,6 +232,19 @@ impl App {
         });
     }
 
+    /// Shared documents, each held by the view that edits it.
+    fn doc(&mut self, doc: DocId) -> &mut dyn Synced {
+        match doc {
+            DocId::Capture => &mut self.imaging.form,
+            DocId::Sequence => &mut self.sequence.draft,
+            DocId::Goto => &mut self.mount.goto,
+            DocId::ImagingSettings => &mut self.imaging.settings_edit,
+            DocId::GuiderSettings => &mut self.guider.settings_edit,
+            DocId::SolverSettings => &mut self.mount.solver_edit,
+            DocId::FocusSettings => &mut self.focus.settings_edit,
+        }
+    }
+
     fn poll_link(&mut self, ctx: &egui::Context) {
         let Some(link) = &mut self.link else {
             return;
@@ -251,18 +264,21 @@ impl App {
             match &msg {
                 // A (re)connected engine: images from before are stale. It
                 // re-sends its latest previews right after.
-                ToUi::Hello { .. } => {
+                ToUi::Hello { protocol, session, .. } => {
+                    if *protocol != protocol::PROTOCOL_VERSION {
+                        reload_page_for(*protocol);
+                    }
                     self.imaging.clear_preview();
                     self.guider.clear_preview();
+                    for doc in DocId::ALL {
+                        self.doc(doc).connected(*session);
+                    }
                 }
+                ToUi::Doc { doc, value, ack } => self.doc(*doc).on_server(value.clone(), *ack),
                 ToUi::IndiStatus { host, port, .. } => {
                     self.indi_host.clone_from(host);
                     self.indi_port = *port;
                 }
-                ToUi::ImagingSettings(s) => self.imaging.on_settings(s),
-                ToUi::GuiderSettings(s) => self.guider.on_settings(s),
-                ToUi::SolverSettings(s) => self.mount.on_solver_settings(s),
-                ToUi::FocusSettings(s) => self.focus.on_settings(s),
                 ToUi::ObjectsFound { query, objects } => self.mount.search.on_results(query, objects),
                 _ => {}
             }
@@ -525,14 +541,6 @@ impl App {
     }
 
     fn device_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
-        if let Some(v) = self.state.version_mismatch {
-            ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)),
-                format!(
-                    "Engine speaks protocol v{v}, this UI v{} — update one of them.",
-                    protocol::PROTOCOL_VERSION
-                ),
-            );
-        }
         let Some(dev) = self
             .selected_device
             .as_ref()
@@ -626,7 +634,8 @@ impl eframe::App for App {
             apply_theme(ui.ctx(), self.settings.night_mode);
             self.applied_night_mode = Some(self.settings.night_mode);
         }
-        let usable = self.link.as_ref().is_some_and(EngineLink::is_open);
+        // The engine closes the link to a UI of another protocol version anyway.
+        let usable = self.link.as_ref().is_some_and(EngineLink::is_open) && self.state.version_mismatch.is_none();
         let mut actions = Vec::new();
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &mut actions));
         egui::Panel::bottom("log")
@@ -640,7 +649,13 @@ impl eframe::App for App {
                 ui.add_enabled_ui(usable, |ui| self.equipment_panel(ui, &mut actions));
             });
         egui::CentralPanel::default().show(ui, |ui| {
-            if !usable {
+            if let Some(v) = self.state.version_mismatch {
+                let fix = if cfg!(target_arch = "wasm32") { "Reload the page" } else { "Update one of them" };
+                ui.colored_label(
+                    theme::c(ui, Color32::from_rgb(230, 160, 40)),
+                    format!("The engine speaks protocol v{v}, this UI v{}. {fix}.", protocol::PROTOCOL_VERSION),
+                );
+            } else if !usable {
                 ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)),
                     "Not connected to the engine.",
                 );
@@ -690,17 +705,47 @@ impl eframe::App for App {
                 View::Devices => self.device_view(ui, &mut actions),
             });
         });
+        // After commands, so Apply sends a draft before the edits in it.
+        for doc in DocId::ALL {
+            if let Some((seq, ops)) = self.doc(doc).edits() {
+                actions.push(ToEngine::EditDoc { doc, seq, ops });
+            }
+        }
         if !actions.is_empty() {
             self.send_all(actions);
         }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.settings.capture = self.imaging.form.clone();
-        self.settings.sequence = self.sequence.draft.clone();
+        self.settings.log_histogram = self.imaging.log_histogram;
+        self.settings.presets = self.sequence.presets.clone();
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
 }
+
+/// The engine that served this page speaks another protocol: it was updated
+/// since the page loaded. Reload to get the matching UI, once per engine
+/// version, so an engine older than its pages cannot make us reload forever.
+#[cfg(target_arch = "wasm32")]
+fn reload_page_for(engine_protocol: u32) {
+    const KEY: &str = "indicontrol-reloaded-for-protocol";
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let storage = window.session_storage().ok().flatten();
+    let version = engine_protocol.to_string();
+    if storage.as_ref().and_then(|s| s.get_item(KEY).ok().flatten()).as_deref() == Some(version.as_str()) {
+        return;
+    }
+    if let Some(s) = &storage {
+        let _ = s.set_item(KEY, &version);
+    }
+    let _ = window.location().reload();
+}
+
+/// Native UIs cannot fetch a new version of themselves; the banner says so.
+#[cfg(not(target_arch = "wasm32"))]
+fn reload_page_for(_engine_protocol: u32) {}
 
 /// "—" (unknown) or a value in millimetres.
 fn optional_mm(ui: &mut egui::Ui, value: &mut Option<f64>) {

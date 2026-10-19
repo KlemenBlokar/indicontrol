@@ -5,12 +5,13 @@
 //! sends [`ToUi::Hello`] followed by a full state dump; afterwards it sends
 //! incremental updates. UIs mirror state with [`UiState::apply`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use indi_link::{Cache, Device, Property};
 use serde::{Deserialize, Serialize};
 
 pub mod catalog;
+pub mod doc;
 pub mod equipment;
 pub mod focus;
 pub mod guider;
@@ -19,6 +20,7 @@ pub mod sequence;
 pub mod solver;
 
 pub use catalog::CatalogObject;
+pub use doc::{Ack, CaptureForm, DocId, GotoDraft, SequenceDraft, SharedDoc, Synced};
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
 pub use focus::{AutofocusStatus, AutofocusTriggers, FocusSettings, StarStats};
@@ -30,9 +32,19 @@ pub use sequence::{
 pub use indi_link;
 
 /// Bump on any incompatible message change.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_ENGINE_PORT: u16 = 7700;
 pub const WS_PATH: &str = "/ws";
+
+/// `url` with this UI's protocol version (`?protocol=N`), which the engine
+/// requires: it turns away UIs that speak another version.
+pub fn versioned_url(url: &str) -> String {
+    if url.contains("protocol=") {
+        return url.to_owned();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}protocol={PROTOCOL_VERSION}")
+}
 
 /// Parse `host`, `host:port` or `[v6]:port`.
 pub fn parse_host_port(s: &str, default_port: u16) -> (String, u16) {
@@ -279,6 +291,8 @@ pub enum ToUi {
     Hello {
         protocol: u32,
         engine_version: String,
+        /// This UI's session, as named in [`Ack`]s.
+        session: u64,
     },
     IndiStatus {
         host: String,
@@ -317,6 +331,12 @@ pub enum ToUi {
     Optics(Optics),
     /// Saved equipment profiles and the one last loaded or saved.
     Profiles { names: Vec<String>, active: Option<String> },
+    /// A shared document, including edit `ack` (none: changed by the engine).
+    Doc {
+        doc: DocId,
+        value: serde_json::Value,
+        ack: Option<Ack>,
+    },
     /// Answer to [`ToEngine::FindObjects`], sent only to the UI that asked.
     ObjectsFound { query: String, objects: Vec<CatalogObject> },
 }
@@ -399,6 +419,12 @@ pub enum ToEngine {
     SaveProfile { name: String },
     LoadProfile { name: String },
     DeleteProfile { name: String },
+    /// Changes to a shared document; `seq` counts up per UI session.
+    EditDoc {
+        doc: DocId,
+        seq: u64,
+        ops: Vec<doc::Op>,
+    },
     /// Look up deep-sky objects by designation or common name.
     FindObjects { query: String },
 }
@@ -449,6 +475,10 @@ pub struct UiState {
     pub profiles: Vec<String>,
     pub active_profile: Option<String>,
     pub optics: Optics,
+    /// This UI's session on the engine.
+    pub session: Option<u64>,
+    /// The engine's latest shared documents (UIs edit them via [`SharedDoc`]).
+    pub docs: HashMap<DocId, serde_json::Value>,
 }
 
 impl Default for UiState {
@@ -479,6 +509,8 @@ impl Default for UiState {
             profiles: Vec::new(),
             active_profile: None,
             optics: Optics::default(),
+            session: None,
+            docs: HashMap::new(),
         }
     }
 }
@@ -492,11 +524,13 @@ impl UiState {
             ToUi::Hello {
                 protocol,
                 engine_version,
+                session,
             } => {
                 // The engine re-sends history after Hello, so start fresh.
                 *self = UiState {
                     engine_version: Some(engine_version),
                     version_mismatch: (protocol != PROTOCOL_VERSION).then_some(protocol),
+                    session: Some(session),
                     ..UiState::default()
                 };
             }
@@ -554,6 +588,9 @@ impl UiState {
             ToUi::Profiles { names, active } => {
                 self.profiles = names;
                 self.active_profile = active;
+            }
+            ToUi::Doc { doc, value, .. } => {
+                self.docs.insert(doc, value);
             }
             // A reply to one view's search, not shared state.
             ToUi::ObjectsFound { .. } => {}
@@ -618,6 +655,12 @@ mod tests {
             ToUi::Hello {
                 protocol: PROTOCOL_VERSION,
                 engine_version: "0.1.0".into(),
+                session: 3,
+            },
+            ToUi::Doc {
+                doc: DocId::Capture,
+                value: serde_json::to_value(CaptureForm::default()).unwrap(),
+                ack: Some(Ack { session: 3, seq: 9 }),
             },
             ToUi::IndiStatus {
                 host: "pi".into(),
@@ -738,9 +781,23 @@ mod tests {
             ToEngine::LoadProfile { name: "Esprit".into() },
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
             ToEngine::FindObjects { query: "Orion".into() },
+            ToEngine::EditDoc {
+                doc: DocId::Sequence,
+                seq: 4,
+                ops: vec![("/sequence/steps/0/count".into(), serde_json::json!(5))],
+            },
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn versioned_urls() {
+        let v = PROTOCOL_VERSION;
+        assert_eq!(versioned_url("ws://pi:7700/ws"), format!("ws://pi:7700/ws?protocol={v}"));
+        assert_eq!(versioned_url("ws://pi/ws?x=1"), format!("ws://pi/ws?x=1&protocol={v}"));
+        let once = versioned_url("ws://pi/ws");
+        assert_eq!(versioned_url(&once), once);
     }
 
     #[test]
@@ -774,6 +831,7 @@ mod tests {
         s.apply(ToUi::Hello {
             protocol: PROTOCOL_VERSION + 1,
             engine_version: "9".into(),
+            session: 1,
         });
         assert!(s.log.is_empty());
         assert_eq!(s.version_mismatch, Some(PROTOCOL_VERSION + 1));

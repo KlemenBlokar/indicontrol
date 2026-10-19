@@ -4,19 +4,16 @@ use crate::object_search::ObjectSearch;
 use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use indi_link::{format_number, parse_number};
-use protocol::{CatalogObject, MountInfo, SolverKind, SolverSettings, ToEngine, UiState};
+use protocol::{GotoDraft, MountInfo, SharedDoc, SolverKind, SolverSettings, ToEngine, UiState};
 
 const RED: Color32 = Color32::from_rgb(220, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
 
 #[derive(Default)]
 pub struct MountView {
-    ra_input: String,
-    dec_input: String,
-    solver_edit: SolverSettings,
+    pub goto: SharedDoc<GotoDraft>,
+    pub solver_edit: SharedDoc<SolverSettings>,
     pub search: ObjectSearch,
-    /// Last object found with the search.
-    object: Option<CatalogObject>,
 }
 
 /// How close the mount must point to the last found object to be "at" it.
@@ -34,14 +31,11 @@ pub fn dms(deg: f64) -> String {
 impl MountView {
     /// Name of the last found object, if the mount points at it.
     pub fn object_at(&self, m: &MountInfo) -> Option<&str> {
-        let o = self.object.as_ref()?;
+        let o = self.goto.value.object.as_ref()?;
         let off = protocol::mount::separation_arcmin(o.ra_hours, o.dec_deg, m.ra_j2000, m.dec_j2000);
         (off < AT_OBJECT_ARCMIN).then_some(o.name.as_str())
     }
 
-    pub fn on_solver_settings(&mut self, s: &SolverSettings) {
-        self.solver_edit = s.clone();
-    }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         let Some(m) = &state.mount else {
@@ -102,7 +96,7 @@ impl MountView {
 
     fn solver_settings(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         egui::CollapsingHeader::new("Plate solver settings").show(ui, |ui| {
-            let s = &mut self.solver_edit;
+            let s = &mut self.solver_edit.value;
             egui::Grid::new("solver").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                 ui.label("Solver");
                 ui.horizontal(|ui| {
@@ -165,22 +159,22 @@ impl MountView {
     fn goto(&mut self, ui: &mut egui::Ui, m: &MountInfo, state: &UiState, actions: &mut Vec<ToEngine>) {
         ui.label(RichText::new("Go to (J2000)").strong());
         if let Some(o) = self.search.ui(ui, actions) {
-            self.ra_input = hms(o.ra_hours);
-            self.dec_input = dms(o.dec_deg);
-            self.object = Some(o);
+            self.goto.value.ra = hms(o.ra_hours);
+            self.goto.value.dec = dms(o.dec_deg);
+            self.goto.value.object = Some(o);
         }
-        let ra = parse_number(&self.ra_input);
-        let dec = parse_number(&self.dec_input);
+        let ra = parse_number(&self.goto.value.ra);
+        let dec = parse_number(&self.goto.value.dec);
         let ra_ok = ra.is_some_and(|r| (0.0..24.0).contains(&r));
         let dec_ok = dec.is_some_and(|d| (-90.0..=90.0).contains(&d));
-        let ra_bad = !self.ra_input.is_empty() && !ra_ok;
-        let dec_bad = !self.dec_input.is_empty() && !dec_ok;
+        let ra_bad = !self.goto.value.ra.is_empty() && !ra_ok;
+        let dec_bad = !self.goto.value.dec.is_empty() && !dec_ok;
         // The edits sit in the grid's last column: egui sizes earlier columns from
         // their first-frame width, which would leave the edits only ~40 px wide.
         egui::Grid::new("goto").num_columns(2).show(ui, |ui| {
             ui.label("RA");
             ui.horizontal(|ui| {
-                let mut edit = egui::TextEdit::singleline(&mut self.ra_input)
+                let mut edit = egui::TextEdit::singleline(&mut self.goto.value.ra)
                     .hint_text("05:35:17")
                     .desired_width(120.0);
                 if ra_bad {
@@ -192,7 +186,7 @@ impl MountView {
             ui.end_row();
             ui.label("Dec");
             ui.horizontal(|ui| {
-                let mut edit = egui::TextEdit::singleline(&mut self.dec_input)
+                let mut edit = egui::TextEdit::singleline(&mut self.goto.value.dec)
                     .hint_text("-05:23:28")
                     .desired_width(120.0);
                 if dec_bad {
@@ -230,8 +224,8 @@ impl MountView {
                 });
             }
             if ui.button("Use current position").clicked() {
-                self.ra_input = hms(m.ra_j2000);
-                self.dec_input = dms(m.dec_j2000);
+                self.goto.value.ra = hms(m.ra_j2000);
+                self.goto.value.dec = dms(m.dec_j2000);
                 self.search.clear();
             }
         });
@@ -380,8 +374,8 @@ mod tests {
             parked: Some(false),
             slewing: true,
         });
-        view.ra_input = "5:35:17".into();
-        view.dec_input = "-5:23:28".into();
+        view.goto.value.ra = "5:35:17".into();
+        view.goto.value.dec = "-5:23:28".into();
         for _ in 0..2 {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| view.ui(ui, &state, &mut actions));
         }
@@ -406,7 +400,7 @@ mod tests {
             slewing: false,
         };
         assert_eq!(view.object_at(&m), None);
-        view.object = Some(CatalogObject {
+        view.goto.value.object = Some(protocol::CatalogObject {
             name: "M 110".into(),
             aliases: vec!["NGC 205".into()],
             common_names: vec![],

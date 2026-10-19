@@ -2,6 +2,7 @@
 //! engine state. UI sessions and helper tasks talk to it through [`CoreMsg`].
 
 mod capture;
+mod docs;
 mod focus;
 mod guider;
 mod mount;
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use indi_link::{Cache, Client, ClientError, Event};
-use protocol::{IndiStatus, LogEntry, LogLevel, PROTOCOL_VERSION, ToEngine, ToUi};
+use protocol::{DocId, IndiStatus, LogEntry, LogLevel, PROTOCOL_VERSION, ToEngine, ToUi};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::frame::ProcessOutput;
@@ -28,7 +29,7 @@ const BROADCAST_CAPACITY: usize = 4096;
 type ConnectResult = Result<(Client, mpsc::UnboundedReceiver<Event>), ClientError>;
 
 pub(crate) enum CoreMsg {
-    Ui(ToEngine),
+    Ui { session: u64, cmd: ToEngine },
     NewSession(oneshot::Sender<Session>),
     ConnectResult { attempt: u64, result: ConnectResult },
     Retry { attempt: u64 },
@@ -57,6 +58,8 @@ pub(crate) enum CoreMsg {
         timer: solve::SolveTimer,
     },
     FocusTimeout { id: u64, epoch: u64 },
+    /// Write the state file (delayed after document edits).
+    Save,
 }
 
 /// A message to UIs: JSON text or a binary image preview.
@@ -74,6 +77,7 @@ impl Outgoing {
 
 /// What a new UI session needs: a state dump, then live updates.
 pub(crate) struct Session {
+    pub id: u64,
     pub initial: Vec<Outgoing>,
     pub updates: broadcast::Receiver<Outgoing>,
 }
@@ -106,13 +110,17 @@ pub(crate) struct Core {
     next_focus_id: u64,
     focus_status: protocol::AutofocusStatus,
     last_focus_temperature: Option<f64>,
+    next_session: u64,
+    drafts: docs::SettingsDrafts,
+    /// A delayed save is scheduled.
+    save_pending: bool,
 }
 
 impl Core {
     pub fn new(state: PersistedState, state_file: Option<PathBuf>) -> (Self, mpsc::UnboundedSender<CoreMsg>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (updates, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let core = Core {
+        let mut core = Core {
             rx,
             tx: tx.clone(),
             updates,
@@ -138,7 +146,11 @@ impl Core {
             next_focus_id: 0,
             focus_status: Default::default(),
             last_focus_temperature: None,
+            next_session: 0,
+            drafts: Default::default(),
+            save_pending: false,
         };
+        core.init_drafts();
         (core, tx)
     }
 
@@ -159,10 +171,11 @@ impl Core {
 
     fn handle(&mut self, msg: CoreMsg) {
         match msg {
-            CoreMsg::Ui(cmd) => self.handle_ui(cmd),
+            CoreMsg::Ui { session, cmd } => self.handle_ui(session, cmd),
             CoreMsg::NewSession(reply) => {
                 let _ = reply.send(self.session());
             }
+            CoreMsg::Save => self.save_now(),
             CoreMsg::ConnectResult { attempt, result } => {
                 if attempt != self.attempt {
                     return; // superseded; dropping the client closes it
@@ -208,7 +221,7 @@ impl Core {
         }
     }
 
-    fn handle_ui(&mut self, cmd: ToEngine) {
+    fn handle_ui(&mut self, session: u64, cmd: ToEngine) {
         let result = match cmd {
             ToEngine::ConnectIndi { host, port } => {
                 self.state.indi.host = host;
@@ -250,6 +263,7 @@ impl Core {
                     self.state.imaging = settings.clone();
                     self.save();
                     self.send(ToUi::ImagingSettings(settings));
+                    self.reset_drafts();
                 }
                 Ok(())
             }
@@ -329,6 +343,7 @@ impl Core {
                 self.state.solver = settings.clone();
                 self.save();
                 self.send(ToUi::SolverSettings(settings));
+                self.reset_drafts();
                 Ok(())
             }
             ToEngine::FocuserMove { steps } => self.focus_result(|c| c.focuser_move(steps)),
@@ -348,6 +363,7 @@ impl Core {
                 self.state.focus = settings.clone();
                 self.save();
                 self.send(ToUi::FocusSettings(settings));
+                self.reset_drafts();
                 Ok(())
             }
             ToEngine::SetOptics(optics) => {
@@ -402,6 +418,7 @@ impl Core {
                 self.state.guider = settings.clone();
                 self.save();
                 self.send(ToUi::GuiderSettings(settings));
+                self.reset_drafts();
                 self.send_guider();
                 Ok(())
             }
@@ -441,6 +458,10 @@ impl Core {
                 let v: Vec<_> = values.iter().map(|(e, v)| (e.as_str(), *v)).collect();
                 c.send_switch(&device, &name, &v)
             }),
+            ToEngine::EditDoc { doc, seq, ops } => {
+                self.edit_doc(session, doc, seq, ops);
+                Ok(())
+            }
             // Answered by the UI's session (server.rs), never forwarded here.
             ToEngine::FindObjects { .. } => Ok(()),
         };
@@ -614,6 +635,7 @@ impl Core {
         ] {
             self.send(msg);
         }
+        self.reset_drafts();
         self.send_guider();
         // A different INDI server: reconnect (or disconnect) accordingly.
         if (self.state.indi.host.clone(), self.state.indi.port) != old_server || self.client.is_none() {
@@ -670,7 +692,9 @@ impl Core {
         self.client.as_ref()?.cache().property(device, name).cloned()
     }
 
-    fn session(&self) -> Session {
+    fn session(&mut self) -> Session {
+        self.next_session += 1;
+        let id = self.next_session;
         // Subscribe first: anything broadcast after this point reaches the
         // session, and all messages are idempotent, so overlap is harmless.
         let updates = self.updates.subscribe();
@@ -683,6 +707,7 @@ impl Core {
             ToUi::Hello {
                 protocol: PROTOCOL_VERSION,
                 engine_version: env!("CARGO_PKG_VERSION").into(),
+                session: id,
             },
             self.status_msg(),
             ToUi::Roles(self.state.roles.clone()),
@@ -704,6 +729,7 @@ impl Core {
             self.profiles_msg(),
         ]
         .iter()
+        .chain(&DocId::ALL.map(|d| self.doc_msg(d, None)))
         .map(Outgoing::text)
         .collect();
         if let Some((info, preview)) = &self.last_frame {
@@ -712,7 +738,7 @@ impl Core {
         }
         initial.extend(self.guider_last_preview());
         initial.extend(self.log.iter().cloned().map(|l| Outgoing::text(&ToUi::Log(l))));
-        Session { initial, updates }
+        Session { id, initial, updates }
     }
 
     fn status_msg(&self) -> ToUi {

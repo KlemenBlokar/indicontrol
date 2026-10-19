@@ -4,7 +4,7 @@ use crate::theme;
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use protocol::guider::DecMode;
-use protocol::{GuideOutput, GuiderSettings, GuiderState, GuiderStatus, ToEngine, UiState};
+use protocol::{GuideOutput, GuiderSettings, GuiderState, GuiderStatus, SharedDoc, ToEngine, UiState};
 
 const RA_COLOR: Color32 = Color32::from_rgb(80, 140, 240);
 const DEC_COLOR: Color32 = Color32::from_rgb(230, 80, 80);
@@ -14,20 +14,17 @@ const GRAPH_STEPS: usize = 200;
 
 pub struct GuiderView {
     texture: Option<egui::TextureHandle>,
-    settings_edit: GuiderSettings,
+    pub settings_edit: SharedDoc<GuiderSettings>,
 }
 
 impl GuiderView {
     pub fn new() -> Self {
         Self {
             texture: None,
-            settings_edit: GuiderSettings::default(),
+            settings_edit: SharedDoc::default(),
         }
     }
 
-    pub fn on_settings(&mut self, s: &GuiderSettings) {
-        self.settings_edit = s.clone();
-    }
 
     pub fn clear_preview(&mut self) {
         self.texture = None;
@@ -119,7 +116,7 @@ impl GuiderView {
 
     fn settings(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         egui::CollapsingHeader::new("Settings").show(ui, |ui| {
-            let s = &mut self.settings_edit;
+            let s = &mut self.settings_edit.value;
             egui::Grid::new("guide_settings").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                 ui.label("Exposure");
                 ui.add(egui::DragValue::new(&mut s.exposure).range(0.01..=30.0).speed(0.05).suffix(" s"));

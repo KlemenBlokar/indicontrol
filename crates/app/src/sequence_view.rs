@@ -5,7 +5,8 @@ use eframe::egui::{self, Color32, RichText};
 use protocol::equipment;
 use protocol::sequence::presets;
 use protocol::{
-    Exposure, FrameType, RunState, Sequence, SequenceOrder, SequenceStatus, ToEngine, UiState,
+    Exposure, FrameType, RunState, Sequence, SequenceDraft, SequenceOrder, SequenceStatus, SharedDoc, ToEngine,
+    UiState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,34 +48,21 @@ impl Default for PresetForm {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SequenceDraft {
-    pub sequence: Sequence,
-    pub presets: PresetForm,
-}
-
 pub struct SequenceView {
-    pub draft: SequenceDraft,
+    pub draft: SharedDoc<SequenceDraft>,
+    /// Per UI, like a scratch pad for building steps.
+    pub presets: PresetForm,
     library_pick: Option<String>,
     feedback: Option<(String, bool)>,
-    target_ra: String,
-    target_dec: String,
 }
 
 impl SequenceView {
-    pub fn new(draft: SequenceDraft) -> Self {
-        let (target_ra, target_dec) = draft
-            .sequence
-            .target
-            .map(|t| (crate::mount_view::hms(t.ra_hours), crate::mount_view::dms(t.dec_deg)))
-            .unwrap_or_default();
+    pub fn new(presets: PresetForm) -> Self {
         Self {
-            draft,
+            draft: SharedDoc::default(),
+            presets,
             library_pick: None,
             feedback: None,
-            target_ra,
-            target_dec,
         }
     }
 
@@ -115,7 +103,7 @@ impl SequenceView {
     fn run_controls(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         let Some(status) = &state.sequence else {
             ui.horizontal(|ui| {
-                let seq = &self.draft.sequence;
+                let seq = &self.draft.value.sequence;
                 let ready = seq.planned_frames() > 0;
                 if ui
                     .add_enabled(ready, egui::Button::new(RichText::new("⏵ Start sequence").strong()))
@@ -180,9 +168,9 @@ impl SequenceView {
                 .as_ref()
                 .and_then(|p| state.library.iter().find(|s| &s.name == p));
             if ui.add_enabled(picked.is_some(), egui::Button::new("Load")).clicked() {
-                self.draft.sequence = picked.cloned().expect("enabled only when picked");
-                (self.target_ra, self.target_dec) = self
-                    .draft
+                self.draft.value.sequence = picked.cloned().expect("enabled only when picked");
+                let d = &mut self.draft.value;
+                (d.target_ra, d.target_dec) = d
                     .sequence
                     .target
                     .map(|t| (crate::mount_view::hms(t.ra_hours), crate::mount_view::dms(t.dec_deg)))
@@ -194,21 +182,21 @@ impl SequenceView {
                 });
             }
             ui.separator();
-            let named = !self.draft.sequence.name.trim().is_empty();
-            let exists = names.contains(&self.draft.sequence.name.as_str());
+            let named = !self.draft.value.sequence.name.trim().is_empty();
+            let exists = names.contains(&self.draft.value.sequence.name.as_str());
             if ui
                 .add_enabled(named, egui::Button::new(if exists { "Save (replace)" } else { "Save" }))
                 .on_disabled_hover_text("Name the sequence first")
                 .clicked()
             {
-                actions.push(ToEngine::SaveSequence(self.draft.sequence.clone()));
-                self.library_pick = Some(self.draft.sequence.name.clone());
+                actions.push(ToEngine::SaveSequence(self.draft.value.sequence.clone()));
+                self.library_pick = Some(self.draft.value.sequence.name.clone());
             }
         });
     }
 
     fn editor(&mut self, ui: &mut egui::Ui, filters: &[String]) {
-        let seq = &mut self.draft.sequence;
+        let seq = &mut self.draft.value.sequence;
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.add(egui::TextEdit::singleline(&mut seq.name).desired_width(160.0));
@@ -336,32 +324,32 @@ impl SequenceView {
     }
 
     fn target(&mut self, ui: &mut egui::Ui, state: &UiState, mount_object: Option<&str>) {
-        let seq = &mut self.draft.sequence;
+        let seq = &mut self.draft.value.sequence;
         ui.horizontal(|ui| {
             ui.label("Target (J2000)");
-            ui.add(egui::TextEdit::singleline(&mut self.target_ra).hint_text("RA 05:35:17").desired_width(90.0));
-            ui.add(egui::TextEdit::singleline(&mut self.target_dec).hint_text("Dec -05:23:28").desired_width(90.0));
+            ui.add(egui::TextEdit::singleline(&mut self.draft.value.target_ra).hint_text("RA 05:35:17").desired_width(90.0));
+            ui.add(egui::TextEdit::singleline(&mut self.draft.value.target_dec).hint_text("Dec -05:23:28").desired_width(90.0));
             if let Some(m) = &state.mount
                 && ui
                     .small_button("From mount")
                     .on_hover_text("Also sets the object, if the mount points at the one found in the Mount tab")
                     .clicked()
             {
-                self.target_ra = crate::mount_view::hms(m.ra_j2000);
-                self.target_dec = crate::mount_view::dms(m.dec_j2000);
+                self.draft.value.target_ra = crate::mount_view::hms(m.ra_j2000);
+                self.draft.value.target_dec = crate::mount_view::dms(m.dec_j2000);
                 if let Some(name) = mount_object {
                     seq.object = name.to_owned();
                 }
             }
             if ui.small_button("Clear").clicked() {
-                self.target_ra.clear();
-                self.target_dec.clear();
+                self.draft.value.target_ra.clear();
+                self.draft.value.target_dec.clear();
             }
         });
-        let ra = indi_link::parse_number(&self.target_ra).filter(|r| (0.0..24.0).contains(r));
-        let dec = indi_link::parse_number(&self.target_dec).filter(|d| (-90.0..=90.0).contains(d));
+        let ra = indi_link::parse_number(&self.draft.value.target_ra).filter(|r| (0.0..24.0).contains(r));
+        let dec = indi_link::parse_number(&self.draft.value.target_dec).filter(|d| (-90.0..=90.0).contains(d));
         seq.target = ra.zip(dec).map(|(ra_hours, dec_deg)| protocol::Target { ra_hours, dec_deg });
-        let has_input = !self.target_ra.is_empty() || !self.target_dec.is_empty();
+        let has_input = !self.draft.value.target_ra.is_empty() || !self.draft.value.target_dec.is_empty();
         if has_input && seq.target.is_none() {
             ui.colored_label(theme::c(ui, ORANGE), "Enter RA (h:m:s) and Dec (d:m:s) to use a target.");
         }
@@ -375,8 +363,8 @@ impl SequenceView {
 
     fn presets(&mut self, ui: &mut egui::Ui, filters: &[String]) {
         egui::CollapsingHeader::new("Add from preset").default_open(true).show(ui, |ui| {
-            let p = &mut self.draft.presets;
-            let steps = &mut self.draft.sequence.steps;
+            let p = &mut self.presets;
+            let steps = &mut self.draft.value.sequence.steps;
             let mut feedback = None;
             let all_filters: Vec<Option<u32>> = if filters.is_empty() {
                 vec![None]
@@ -665,12 +653,13 @@ mod tests {
     #[test]
     fn renders_editor_and_status() {
         let ctx = egui::Context::default();
-        let mut draft = SequenceDraft::default();
+        let mut view = SequenceView::new(PresetForm::default());
+        let draft = &mut view.draft.value;
         draft.sequence.steps = presets::darks(&[60.0, 120.0], 10, Some(-10.0));
         draft.sequence.steps.extend(presets::flats(&[Some(1), None], 5));
         draft.sequence.steps.push(presets::bias(20, None));
-        let mut view = SequenceView::new(draft.clone());
-        let mut imaging = ImagingView::new(Default::default());
+        let draft = draft.clone();
+        let mut imaging = ImagingView::new(true);
         let idle = UiState::default();
         let running = UiState {
             sequence: Some(SequenceStatus {

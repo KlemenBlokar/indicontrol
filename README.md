@@ -19,6 +19,15 @@ indiserver ──TCP/XML──► engine ──WebSocket/JSON──► UI (nativ
 - **protocol** (`crates/protocol`) defines the engine ↔ UI messages.
 - **indi-link** (`crates/indi-link`) is the INDI client and property model.
 
+Several people can work on the same engine together: every UI shows the
+same state, and edits appear everywhere as they are typed. That includes the
+capture form, the sequence being edited, the goto target and settings drafts.
+A settings change still takes effect only when someone presses Apply, and
+Revert takes the draft back to the settings in use. People editing different
+fields at the same time both keep their changes; for the same field the last
+edit wins. Only viewing choices stay with each UI: the tab, night mode,
+histogram scale and the preset inputs.
+
 ## Running
 
 Local, everything in one process (the engine is embedded in the app):

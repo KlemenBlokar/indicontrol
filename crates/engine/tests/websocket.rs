@@ -142,3 +142,119 @@ async fn object_search_answers_only_the_asking_ui() {
     }
     engine.shutdown();
 }
+
+#[tokio::test]
+async fn shared_documents_between_uis() {
+    use protocol::{CaptureForm, DocId, GuiderSettings};
+    use serde_json::json;
+
+    let dir = std::env::temp_dir().join(format!("indicontrol-docs-{}", std::process::id()));
+    let state_file = dir.join("engine.json");
+    let config = EngineConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        web_root: None,
+        state_file: Some(state_file.clone()),
+        indi: None,
+    };
+    let engine = engine::start(config.clone()).await.unwrap();
+    let connect = async || {
+        let (mut ws, _) = tokio_tungstenite::connect_async(engine.ws_url()).await.unwrap();
+        let mut state = UiState::default();
+        until(&mut ws, &mut state, |s| s.docs.len() == DocId::ALL.len()).await;
+        (ws, state)
+    };
+    let (mut a, mut sa) = connect().await;
+    let (mut b, mut sb) = connect().await;
+    assert_ne!(sa.session, sb.session);
+    let capture = |s: &UiState| serde_json::from_value::<CaptureForm>(s.docs[&DocId::Capture].clone()).unwrap();
+
+    // Both edit the capture form at once, different fields: both stick, everywhere.
+    let edit = |seq, path: &str, value| ToEngine::EditDoc { doc: DocId::Capture, seq, ops: vec![(path.into(), value)] };
+    send(&mut a, edit(1, "/exposure", json!(30.0))).await;
+    send(&mut b, edit(1, "/object", json!("M 31"))).await;
+    let both = |s: &UiState| {
+        let c = capture(s);
+        c.exposure == 30.0 && c.object == "M 31"
+    };
+    until(&mut a, &mut sa, both).await;
+    until(&mut b, &mut sb, both).await;
+
+    // A drafts a guider change; B sees the draft and applies it for everyone.
+    let draft = |s: &UiState| serde_json::from_value::<GuiderSettings>(s.docs[&DocId::GuiderSettings].clone()).unwrap();
+    assert_ne!(sb.guider_settings.exposure, 3.5);
+    send(&mut a, ToEngine::EditDoc { doc: DocId::GuiderSettings, seq: 2, ops: vec![("/exposure".into(), json!(3.5))] })
+        .await;
+    until(&mut b, &mut sb, |s| draft(s).exposure == 3.5).await;
+    assert_ne!(sb.guider_settings.exposure, 3.5, "a draft is not applied yet");
+    send(&mut b, ToEngine::SetGuiderSettings(draft(&sb))).await;
+    until(&mut a, &mut sa, |s| s.guider_settings.exposure == 3.5).await;
+
+    // An edit that would break the document is ignored.
+    send(&mut a, edit(3, "/exposure", json!("long"))).await;
+    send(&mut a, edit(4, "/save", json!(false))).await;
+    until(&mut a, &mut sa, |s| !capture(s).save).await;
+    assert_eq!(capture(&sa).exposure, 30.0);
+
+    // The form is saved on the engine (shortly after the last edit) and survives a restart.
+    let saved = || {
+        std::fs::read_to_string(&state_file)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some_and(|v| v["capture"]["save"] == json!(false))
+    };
+    timeout(Duration::from_secs(5), async {
+        while !saved() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("state file not written");
+    engine.shutdown();
+    drop((a, b));
+    let engine = engine::start(config).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(engine.ws_url()).await.unwrap();
+    let mut state = UiState::default();
+    until(&mut ws, &mut state, |s| s.docs.contains_key(&DocId::Capture)).await;
+    assert_eq!(capture(&state).object, "M 31");
+    assert!(!capture(&state).save);
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn ui_of_another_protocol_is_turned_away() {
+    let engine = engine::start(EngineConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        web_root: None,
+        state_file: None,
+        indi: None,
+    })
+    .await
+    .unwrap();
+    let base = format!("ws://{}{}", engine.local_addr, protocol::WS_PATH);
+    for url in [base.clone(), format!("{base}?protocol=1")] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        // Told the engine's version, so a web UI can reload…
+        match recv(&mut ws).await {
+            ToUi::Hello { protocol, .. } => assert_eq!(protocol, protocol::PROTOCOL_VERSION),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        // …then closed: commands from it never reach the engine.
+        send(&mut ws, ToEngine::DisconnectIndi).await;
+        let rest = timeout(Duration::from_secs(5), async {
+            let mut texts = 0;
+            while let Some(Ok(msg)) = ws.next().await {
+                texts += matches!(msg, Message::Text(_)) as usize;
+            }
+            texts
+        })
+        .await
+        .expect("not closed");
+        assert_eq!(rest, 0, "{url}");
+    }
+    // The current version gets the full state.
+    let (mut ws, _) = tokio_tungstenite::connect_async(protocol::versioned_url(&base)).await.unwrap();
+    let mut state = UiState::default();
+    until(&mut ws, &mut state, |s| s.docs.len() == protocol::DocId::ALL.len()).await;
+    engine.shutdown();
+}

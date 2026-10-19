@@ -46,7 +46,7 @@ impl EngineLink {
     fn open(&mut self) {
         let ctx = self.ctx.clone();
         let wakeup = move || ctx.request_repaint();
-        match ewebsock::connect_with_wakeup(self.url.clone(), Default::default(), wakeup) {
+        match ewebsock::connect_with_wakeup(protocol::versioned_url(&self.url), Default::default(), wakeup) {
             Ok(conn) => {
                 self.conn = Some(conn);
                 self.state = LinkState::Connecting;

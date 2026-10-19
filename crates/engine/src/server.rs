@@ -1,14 +1,17 @@
 //! HTTP/WebSocket front of the engine.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ToEngine, ToUi};
+use protocol::{PROTOCOL_VERSION, ToEngine, ToUi};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::services::ServeDir;
@@ -28,8 +31,36 @@ pub(crate) fn router(core: CoreTx, web_root: Option<PathBuf>) -> Router {
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(core): State<CoreTx>) -> Response {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(core): State<CoreTx>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let ui_protocol = query.get("protocol").and_then(|v| v.parse::<u32>().ok());
+    if ui_protocol != Some(PROTOCOL_VERSION) {
+        return ws.on_upgrade(move |socket| turn_away(socket, ui_protocol));
+    }
     ws.on_upgrade(move |socket| session(socket, core))
+}
+
+/// A UI built for another protocol: tell it ours (a web UI reloads itself
+/// on that), then close before it can send anything.
+async fn turn_away(mut socket: WebSocket, ui_protocol: Option<u32>) {
+    // Such a UI retries every few seconds: say so once a minute.
+    static LAST_WARNING: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if now.saturating_sub(LAST_WARNING.load(Ordering::Relaxed)) >= 60 {
+        LAST_WARNING.store(now, Ordering::Relaxed);
+        let ui = ui_protocol.map_or("an unknown".into(), |v| format!("v{v}"));
+        tracing::warn!("turned away a UI speaking {ui} protocol (engine: v{PROTOCOL_VERSION}); reload it");
+    }
+    let hello = ToUi::Hello {
+        protocol: PROTOCOL_VERSION,
+        engine_version: env!("CARGO_PKG_VERSION").into(),
+        session: 0,
+    };
+    let _ = socket.send(Message::Text(hello.to_json().into())).await;
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 async fn session(socket: WebSocket, core: CoreTx) {
@@ -38,6 +69,7 @@ async fn session(socket: WebSocket, core: CoreTx) {
         return;
     }
     let Ok(Session {
+        id,
         initial,
         mut updates,
     }) = reply_rx.await
@@ -77,7 +109,7 @@ async fn session(socket: WebSocket, core: CoreTx) {
                         }
                     }
                     Ok(cmd) => {
-                        let _ = core.send(CoreMsg::Ui(cmd));
+                        let _ = core.send(CoreMsg::Ui { session: id, cmd });
                     }
                     Err(e) => tracing::warn!("bad message from UI: {e}"),
                 },

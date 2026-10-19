@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use protocol::guider::Calibration;
 use protocol::{
-    FlatRecord, FocusSettings, GuiderSettings, ImagingSettings, Optics, Roles, Sequence, SolverSettings,
+    CaptureForm, FlatRecord, FocusSettings, GotoDraft, GuiderSettings, ImagingSettings, Optics, Roles, Sequence,
+    SequenceDraft, SolverSettings,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,10 @@ pub struct PersistedState {
     pub focus: FocusSettings,
     pub profiles: Vec<Profile>,
     pub active_profile: Option<String>,
+    // Shared documents (see protocol::doc).
+    pub capture: CaptureForm,
+    pub sequence_draft: SequenceDraft,
+    pub goto: GotoDraft,
 }
 
 impl PersistedState {

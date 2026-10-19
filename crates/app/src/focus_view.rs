@@ -4,7 +4,7 @@ use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points, VLine};
 use protocol::equipment;
-use protocol::{FocusSettings, ToEngine, UiState};
+use protocol::{FocusSettings, SharedDoc, ToEngine, UiState};
 
 const POINT_COLOR: Color32 = Color32::from_rgb(80, 140, 240);
 const FIT_COLOR: Color32 = Color32::from_rgb(230, 160, 40);
@@ -13,13 +13,10 @@ const BEST_COLOR: Color32 = Color32::from_rgb(60, 200, 90);
 #[derive(Default)]
 pub struct FocusView {
     goto_input: String,
-    settings_edit: FocusSettings,
+    pub settings_edit: SharedDoc<FocusSettings>,
 }
 
 impl FocusView {
-    pub fn on_settings(&mut self, s: &FocusSettings) {
-        self.settings_edit = s.clone();
-    }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         egui::Panel::left("focus_controls")
@@ -113,7 +110,7 @@ impl FocusView {
 
     fn settings(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         egui::CollapsingHeader::new("Autofocus settings").show(ui, |ui| {
-            let s = &mut self.settings_edit;
+            let s = &mut self.settings_edit.value;
             egui::Grid::new("focus_settings").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                 ui.label("Step size");
                 ui.add(egui::DragValue::new(&mut s.step).range(1..=100_000));

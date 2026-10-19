@@ -39,7 +39,7 @@ pub struct EngineHandle {
 impl EngineHandle {
     /// WebSocket URL for UIs on this machine.
     pub fn ws_url(&self) -> String {
-        format!("ws://{}{}", self.local_addr, protocol::WS_PATH)
+        protocol::versioned_url(&format!("ws://{}{}", self.local_addr, protocol::WS_PATH))
     }
 
     /// Resolves when the engine stops (normally never).

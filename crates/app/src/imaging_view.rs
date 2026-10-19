@@ -5,76 +5,36 @@ use eframe::egui::{self, Color32, RichText};
 use egui_plot::{HoverPosition, Line, Plot, PlotPoints, VLine};
 use protocol::equipment::{self, Control};
 use protocol::{
-    CaptureRequest, CaptureState, ChannelStats, FrameInfo, FrameType, ImagingSettings, ToEngine,
-    UiState,
+    CaptureForm, CaptureRequest, CaptureState, ChannelStats, FrameInfo, FrameType, ImagingSettings, SharedDoc,
+    ToEngine, UiState,
 };
-use serde::{Deserialize, Serialize};
 
 const RED: Color32 = Color32::from_rgb(220, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
 const GREEN: Color32 = Color32::from_rgb(60, 180, 75);
 
-/// Capture settings as entered by the user (persisted by the UI).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CaptureForm {
-    exposure: f64,
-    frame_type: FrameType,
-    binning: u32,
-    set_gain: bool,
-    gain: f64,
-    set_offset: bool,
-    offset: f64,
-    filter_slot: Option<u32>,
-    object: String,
-    save: bool,
-    repeat: bool,
-    log_histogram: bool,
-}
-
-impl Default for CaptureForm {
-    fn default() -> Self {
-        Self {
-            exposure: 1.0,
-            frame_type: FrameType::Light,
-            binning: 1,
-            set_gain: false,
-            gain: 0.0,
-            set_offset: false,
-            offset: 0.0,
-            filter_slot: None,
-            object: String::new(),
-            save: true,
-            repeat: false,
-            log_histogram: true,
-        }
-    }
-}
-
 pub struct ImagingView {
-    pub form: CaptureForm,
+    pub form: SharedDoc<CaptureForm>,
+    /// Per UI: a viewing choice, not part of the shared form.
+    pub log_histogram: bool,
     texture: Option<(u64, egui::TextureHandle)>,
     scene_rect: egui::Rect,
     fit_pending: bool,
-    settings_edit: ImagingSettings,
+    pub settings_edit: SharedDoc<ImagingSettings>,
     show_header: bool,
 }
 
 impl ImagingView {
-    pub fn new(form: CaptureForm) -> Self {
+    pub fn new(log_histogram: bool) -> Self {
         Self {
-            form,
+            form: SharedDoc::default(),
+            log_histogram,
             texture: None,
             scene_rect: egui::Rect::ZERO,
             fit_pending: true,
-            settings_edit: ImagingSettings::default(),
+            settings_edit: SharedDoc::default(),
             show_header: false,
         }
-    }
-
-    /// The engine's imaging settings changed; refresh the edit buffers.
-    pub fn on_settings(&mut self, s: &ImagingSettings) {
-        self.settings_edit = s.clone();
     }
 
     pub fn clear_preview(&mut self) {
@@ -147,7 +107,7 @@ impl ImagingView {
             }
         }
 
-        let f = &mut self.form;
+        let f = &mut self.form.value;
         egui::Grid::new("capture_form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -252,7 +212,7 @@ impl ImagingView {
     }
 
     fn request(&self, has_binning: bool) -> CaptureRequest {
-        let f = &self.form;
+        let f = &self.form.value;
         CaptureRequest {
             exposure: f.exposure,
             frame_type: f.frame_type,
@@ -269,26 +229,26 @@ impl ImagingView {
     fn output_settings(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
         egui::CollapsingHeader::new("Output files").show(ui, |ui| {
             ui.label("Folder (on the engine's computer)");
-            ui.add(egui::TextEdit::singleline(&mut self.settings_edit.output_dir).desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::singleline(&mut self.settings_edit.value.output_dir).desired_width(f32::INFINITY));
             ui.label("File name template").on_hover_text(
                 "Tokens: {object} {type} {filter} {exposure} {gain} {offset} {temp} {bin} \
                  {camera} {date} (night of the session) {time} (UTC) {seq} {seq:04}",
             );
             ui.add(
-                egui::TextEdit::multiline(&mut self.settings_edit.file_template)
+                egui::TextEdit::multiline(&mut self.settings_edit.value.file_template)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY),
             );
-            let changed = self.settings_edit != state.imaging;
+            let changed = self.settings_edit.value != state.imaging;
             ui.horizontal(|ui| {
                 if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
-                    actions.push(ToEngine::SetImagingSettings(self.settings_edit.clone()));
+                    actions.push(ToEngine::SetImagingSettings(self.settings_edit.value.clone()));
                 }
                 if ui.add_enabled(changed, egui::Button::new("Revert")).clicked() {
-                    self.settings_edit = state.imaging.clone();
+                    self.settings_edit.value = state.imaging.clone();
                 }
                 if ui.button("Default template").clicked() {
-                    self.settings_edit.file_template = protocol::DEFAULT_FILE_TEMPLATE.into();
+                    self.settings_edit.value.file_template = protocol::DEFAULT_FILE_TEMPLATE.into();
                 }
             });
         });
@@ -339,9 +299,9 @@ impl ImagingView {
         let a = &frame.analysis;
         ui.horizontal(|ui| {
             ui.heading("Histogram");
-            ui.checkbox(&mut self.form.log_histogram, "Log scale");
+            ui.checkbox(&mut self.log_histogram, "Log scale");
         });
-        let log = self.form.log_histogram;
+        let log = self.log_histogram;
         let colors: Vec<Color32> = channel_colors(&a.channels, ui.visuals().text_color())
             .into_iter()
             .map(|c| theme::c(ui, c))
@@ -611,7 +571,7 @@ mod tests {
             // Second pass in night mode.
             crate::theme::set_night(&ctx, i == 1);
             let (state, jpeg) = frame_state(cfa, clipping);
-            let mut view = ImagingView::new(CaptureForm::default());
+            let mut view = ImagingView::new(true);
             view.on_preview(&ctx, 1, &jpeg);
             assert!(view.texture.is_some());
             let actions = render(&mut view, &state, &ctx);
@@ -622,18 +582,18 @@ mod tests {
     #[test]
     fn renders_without_frame_or_camera() {
         let ctx = egui::Context::default();
-        let mut view = ImagingView::new(CaptureForm::default());
+        let mut view = ImagingView::new(true);
         render(&mut view, &UiState::default(), &ctx);
     }
 
     #[test]
     fn request_reflects_form() {
-        let mut view = ImagingView::new(CaptureForm::default());
-        view.form.exposure = 120.0;
-        view.form.frame_type = FrameType::Flat;
-        view.form.set_gain = true;
-        view.form.gain = 100.0;
-        view.form.filter_slot = Some(3);
+        let mut view = ImagingView::new(true);
+        view.form.value.exposure = 120.0;
+        view.form.value.frame_type = FrameType::Flat;
+        view.form.value.set_gain = true;
+        view.form.value.gain = 100.0;
+        view.form.value.filter_slot = Some(3);
         let req = view.request(false);
         assert_eq!(req.exposure, 120.0);
         assert_eq!(req.frame_type, FrameType::Flat);
