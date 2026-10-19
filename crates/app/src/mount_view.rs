@@ -54,10 +54,11 @@ impl MountView {
         ui.horizontal(|ui| {
             if let Some(tracking) = m.tracking {
                 ui.label("Tracking");
-                if ui.selectable_label(tracking, "On").clicked() && !tracking {
+                let unparked = m.parked != Some(true);
+                if ui.add_enabled(unparked, egui::Button::selectable(tracking, "On")).clicked() && !tracking {
                     actions.push(ToEngine::MountTracking { on: true });
                 }
-                if ui.selectable_label(!tracking, "Off").clicked() && tracking {
+                if ui.add_enabled(unparked, egui::Button::selectable(!tracking, "Off")).clicked() && tracking {
                     actions.push(ToEngine::MountTracking { on: false });
                 }
                 ui.separator();
@@ -155,26 +156,32 @@ impl MountView {
         let dec_ok = dec.is_some_and(|d| (-90.0..=90.0).contains(&d));
         let ra_bad = !self.ra_input.is_empty() && !ra_ok;
         let dec_bad = !self.dec_input.is_empty() && !dec_ok;
-        egui::Grid::new("goto").num_columns(3).show(ui, |ui| {
+        // The edits sit in the grid's last column: egui sizes earlier columns from
+        // their first-frame width, which would leave the edits only ~40 px wide.
+        egui::Grid::new("goto").num_columns(2).show(ui, |ui| {
             ui.label("RA");
-            let mut edit = egui::TextEdit::singleline(&mut self.ra_input)
-                .hint_text("05:35:17")
-                .desired_width(120.0);
-            if ra_bad {
-                edit = edit.text_color(RED);
-            }
-            ui.add(edit);
-            ui.label(RichText::new("hours").weak());
+            ui.horizontal(|ui| {
+                let mut edit = egui::TextEdit::singleline(&mut self.ra_input)
+                    .hint_text("05:35:17")
+                    .desired_width(120.0);
+                if ra_bad {
+                    edit = edit.text_color(RED);
+                }
+                ui.add(edit);
+                ui.label(RichText::new("hours").weak());
+            });
             ui.end_row();
             ui.label("Dec");
-            let mut edit = egui::TextEdit::singleline(&mut self.dec_input)
-                .hint_text("-05:23:28")
-                .desired_width(120.0);
-            if dec_bad {
-                edit = edit.text_color(RED);
-            }
-            ui.add(edit);
-            ui.label(RichText::new("degrees").weak());
+            ui.horizontal(|ui| {
+                let mut edit = egui::TextEdit::singleline(&mut self.dec_input)
+                    .hint_text("-05:23:28")
+                    .desired_width(120.0);
+                if dec_bad {
+                    edit = edit.text_color(RED);
+                }
+                ui.add(edit);
+                ui.label(RichText::new("degrees").weak());
+            });
             ui.end_row();
         });
         ui.horizontal(|ui| {
@@ -276,10 +283,14 @@ fn position(ui: &mut egui::Ui, m: &MountInfo) {
         }
         if let Some(ha) = m.hour_angle {
             ui.label("Hour angle");
-            ui.label(RichText::new(hms(ha + 24.0 * f64::from(ha < 0.0))).monospace());
+            // Signed, so east (negative) and west of the meridian read at a glance.
+            let sign = if ha < 0.0 { "-" } else { "+" };
+            ui.label(RichText::new(format!("{sign}{}", hms(ha.abs()))).monospace());
             ui.end_row();
         }
-        if let Some(min) = m.minutes_to_meridian() {
+        // A parked or stopped mount never reaches the meridian.
+        let moving = m.tracking != Some(false) && m.parked != Some(true);
+        if let Some(min) = m.minutes_to_meridian().filter(|_| moving) {
             ui.label("Meridian");
             ui.label(if min >= 0.0 {
                 format!("in {}", duration(min))

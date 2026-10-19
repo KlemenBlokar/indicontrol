@@ -207,12 +207,11 @@ impl SequenceView {
 
     fn editor(&mut self, ui: &mut egui::Ui, filters: &[String]) {
         let seq = &mut self.draft.sequence;
-        egui::Grid::new("seq_meta").num_columns(4).show(ui, |ui| {
+        ui.horizontal(|ui| {
             ui.label("Name");
             ui.add(egui::TextEdit::singleline(&mut seq.name).desired_width(160.0));
             ui.label("Object");
             ui.add(egui::TextEdit::singleline(&mut seq.object).hint_text("e.g. M 31").desired_width(160.0));
-            ui.end_row();
         });
         ui.horizontal(|ui| {
             ui.label("Dither every");
@@ -493,12 +492,13 @@ fn plan_summary(seq: &Sequence) -> String {
         .steps
         .iter()
         .any(|s| s.enabled && s.exposure.seconds().is_none());
-    let hours = (secs / 3600.0).floor();
-    let mins = ((secs - hours * 3600.0) / 60.0).round();
-    let time = if hours > 0.0 {
-        format!("{hours:.0} h {mins:.0} min")
+    let total_mins = (secs / 60.0).round() as u64;
+    let time = if secs < 60.0 {
+        format!("{secs:.0} s")
+    } else if total_mins >= 60 {
+        format!("{} h {} min", total_mins / 60, total_mins % 60)
     } else {
-        format!("{mins:.0} min")
+        format!("{total_mins} min")
     };
     format!(
         "{frames} frames, {time} of exposure{}",
@@ -640,6 +640,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(plan_summary(&seq), "30 frames, 1 h 40 min of exposure + flats");
+        let lights = |seconds, count| Sequence {
+            steps: vec![SequenceStep {
+                exposure: Exposure::Fixed { seconds },
+                count,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(plan_summary(&lights(2.0, 3)), "3 frames, 6 s of exposure");
+        assert_eq!(plan_summary(&lights(177.0, 20)), "20 frames, 59 min of exposure");
+        assert_eq!(plan_summary(&lights(179.0, 20)), "20 frames, 1 h 0 min of exposure");
+        assert_eq!(plan_summary(&lights(359.0, 20)), "20 frames, 2 h 0 min of exposure");
     }
 
     #[test]

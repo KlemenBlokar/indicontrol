@@ -163,7 +163,8 @@ fn v_curve(ui: &mut egui::Ui, state: &UiState) {
         .x_axis_label("focuser position")
         .y_axis_label("HFR (px)")
         .include_y(0.0)
-        .legend(egui_plot::Legend::default())
+        // The plot starts at HFR 0, so its bottom never has samples to cover.
+        .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightBottom))
         .show(ui, |plot| {
             plot.points(
                 Points::new("samples", points)
