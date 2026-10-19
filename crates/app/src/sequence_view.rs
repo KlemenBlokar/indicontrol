@@ -78,10 +78,12 @@ impl SequenceView {
         }
     }
 
+    /// `mount_object`: the object found in the Mount tab, if the mount points at it.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         state: &UiState,
+        mount_object: Option<&str>,
         imaging: &mut ImagingView,
         actions: &mut Vec<ToEngine>,
     ) {
@@ -102,7 +104,7 @@ impl SequenceView {
                     self.library(ui, state, actions);
                     ui.separator();
                     self.editor(ui, &filters);
-                    self.target(ui, state);
+                    self.target(ui, state, mount_object);
                     ui.separator();
                     self.presets(ui, &filters);
                 });
@@ -333,17 +335,23 @@ impl SequenceView {
         });
     }
 
-    fn target(&mut self, ui: &mut egui::Ui, state: &UiState) {
+    fn target(&mut self, ui: &mut egui::Ui, state: &UiState, mount_object: Option<&str>) {
         let seq = &mut self.draft.sequence;
         ui.horizontal(|ui| {
             ui.label("Target (J2000)");
             ui.add(egui::TextEdit::singleline(&mut self.target_ra).hint_text("RA 05:35:17").desired_width(90.0));
             ui.add(egui::TextEdit::singleline(&mut self.target_dec).hint_text("Dec -05:23:28").desired_width(90.0));
             if let Some(m) = &state.mount
-                && ui.small_button("From mount").clicked()
+                && ui
+                    .small_button("From mount")
+                    .on_hover_text("Also sets the object, if the mount points at the one found in the Mount tab")
+                    .clicked()
             {
                 self.target_ra = crate::mount_view::hms(m.ra_j2000);
                 self.target_dec = crate::mount_view::dms(m.dec_j2000);
+                if let Some(name) = mount_object {
+                    seq.object = name.to_owned();
+                }
             }
             if ui.small_button("Clear").clicked() {
                 self.target_ra.clear();
@@ -678,7 +686,7 @@ mod tests {
             let mut actions = Vec::new();
             for _ in 0..3 {
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    view.ui(ui, state, &mut imaging, &mut actions)
+                    view.ui(ui, state, None, &mut imaging, &mut actions)
                 });
             }
             assert!(actions.is_empty());

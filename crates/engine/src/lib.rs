@@ -4,6 +4,7 @@
 //! Runs standalone (`indicontrol-engine`, e.g. on the computer at the
 //! telescope) or embedded in the native UI for local use.
 
+mod catalog;
 mod core;
 mod frame;
 mod metadata;

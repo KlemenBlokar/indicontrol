@@ -126,6 +126,14 @@ Not yet: backlash compensation.
 The Mount tab shows J2000/JNow position, altitude, hour angle, time to the
 meridian and pier side, and controls tracking, park and goto.
 
+**Find** looks an object up while you type and fills in its J2000
+coordinates: Messier, NGC and IC numbers in any spelling (`M110`, `ngc 205`),
+common names (`Orion Nebula`, `horsehead`) and other catalogue numbers listed
+for the object (`UGC 454`, `Sh2-155`). The catalogue is
+[OpenNGC](https://github.com/mattiaverga/OpenNGC), built into the engine, so
+it works without internet. In the Sequence tab, **From mount** then also
+sets the object name, as long as the mount still points at that object.
+
 Sequences can **dither every N light frames** while guiding, waiting for
 guiding to settle before the next frame. With **meridian flip** enabled, a
 light frame is never started if it would run past the flip point (default
@@ -227,4 +235,6 @@ and/or modify it under the terms of the Do What The Fuck You Want To Public
 License, Version 2, as published by Sam Hocevar. See the [LICENSE](LICENSE)
 file for more details.
 
-The dependencies (egui, tokio and others) keep their own licenses.
+The dependencies (egui, tokio and others) keep their own licenses. The
+OpenNGC catalogue in `crates/engine/data/openngc` is by Mattia Verga, under
+CC-BY-SA-4.0.

@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use indi_link::{Cache, Device, Property};
 use serde::{Deserialize, Serialize};
 
+pub mod catalog;
 pub mod equipment;
 pub mod focus;
 pub mod guider;
@@ -17,6 +18,7 @@ pub mod mount;
 pub mod sequence;
 pub mod solver;
 
+pub use catalog::CatalogObject;
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
 pub use focus::{AutofocusStatus, AutofocusTriggers, FocusSettings, StarStats};
@@ -315,6 +317,8 @@ pub enum ToUi {
     Optics(Optics),
     /// Saved equipment profiles and the one last loaded or saved.
     Profiles { names: Vec<String>, active: Option<String> },
+    /// Answer to [`ToEngine::FindObjects`], sent only to the UI that asked.
+    ObjectsFound { query: String, objects: Vec<CatalogObject> },
 }
 
 /// UI → engine.
@@ -395,6 +399,8 @@ pub enum ToEngine {
     SaveProfile { name: String },
     LoadProfile { name: String },
     DeleteProfile { name: String },
+    /// Look up deep-sky objects by designation or common name.
+    FindObjects { query: String },
 }
 
 macro_rules! json_codec {
@@ -549,6 +555,8 @@ impl UiState {
                 self.profiles = names;
                 self.active_profile = active;
             }
+            // A reply to one view's search, not shared state.
+            ToUi::ObjectsFound { .. } => {}
         }
     }
 
@@ -697,6 +705,18 @@ mod tests {
             ToUi::GuiderSettings(GuiderSettings::default()),
             ToUi::Mount { info: None },
             ToUi::Solve { status: SolveStatus::default() },
+            ToUi::ObjectsFound {
+                query: "m110".into(),
+                objects: vec![CatalogObject {
+                    name: "M 110".into(),
+                    aliases: vec!["NGC 205".into()],
+                    common_names: vec![],
+                    kind: "Galaxy".into(),
+                    ra_hours: 0.673,
+                    dec_deg: 41.685,
+                    mag: Some(8.15),
+                }],
+            },
         ] {
             assert_eq!(ToUi::from_json(&m.to_json()).unwrap(), m);
         }
@@ -717,6 +737,7 @@ mod tests {
             ToEngine::SetFocusSettings(FocusSettings::default()),
             ToEngine::LoadProfile { name: "Esprit".into() },
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
+            ToEngine::FindObjects { query: "Orion".into() },
         ] {
             assert_eq!(ToEngine::from_json(&c.to_json()).unwrap(), c);
         }

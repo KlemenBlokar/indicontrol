@@ -441,6 +441,8 @@ impl Core {
                 let v: Vec<_> = values.iter().map(|(e, v)| (e.as_str(), *v)).collect();
                 c.send_switch(&device, &name, &v)
             }),
+            // Answered by the UI's session (server.rs), never forwarded here.
+            ToEngine::FindObjects { .. } => Ok(()),
         };
         if let Err(e) = result {
             self.log(None, e.to_string(), LogLevel::Error);

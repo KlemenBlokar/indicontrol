@@ -4,6 +4,7 @@ mod guider_view;
 mod imaging_view;
 mod link;
 mod mount_view;
+mod object_search;
 mod property_view;
 mod sequence_view;
 mod theme;

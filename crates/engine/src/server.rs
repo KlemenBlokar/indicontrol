@@ -8,7 +8,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use protocol::ToEngine;
+use protocol::{ToEngine, ToUi};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::services::ServeDir;
@@ -68,6 +68,14 @@ async fn session(socket: WebSocket, core: CoreTx) {
             },
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(text))) => match ToEngine::from_json(text.as_str()) {
+                    // Answered here: only this UI wants the result.
+                    Ok(ToEngine::FindObjects { query }) => {
+                        let objects = crate::catalog::search(&query, protocol::catalog::MAX_RESULTS);
+                        let reply = ToUi::ObjectsFound { query, objects }.to_json();
+                        if sink.send(Message::Text(reply.into())).await.is_err() {
+                            break;
+                        }
+                    }
                     Ok(cmd) => {
                         let _ = core.send(CoreMsg::Ui(cmd));
                     }

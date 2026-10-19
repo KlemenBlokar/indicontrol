@@ -1,9 +1,10 @@
 //! Mount tab: position, meridian timing, tracking, park and goto.
 
+use crate::object_search::ObjectSearch;
 use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use indi_link::{format_number, parse_number};
-use protocol::{MountInfo, SolverKind, SolverSettings, ToEngine, UiState};
+use protocol::{CatalogObject, MountInfo, SolverKind, SolverSettings, ToEngine, UiState};
 
 const RED: Color32 = Color32::from_rgb(220, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
@@ -13,7 +14,13 @@ pub struct MountView {
     ra_input: String,
     dec_input: String,
     solver_edit: SolverSettings,
+    pub search: ObjectSearch,
+    /// Last object found with the search.
+    object: Option<CatalogObject>,
 }
+
+/// How close the mount must point to the last found object to be "at" it.
+const AT_OBJECT_ARCMIN: f64 = 60.0;
 
 pub fn hms(hours: f64) -> String {
     format_number(hours.rem_euclid(24.0), "%010.6m").trim().to_owned()
@@ -25,6 +32,13 @@ pub fn dms(deg: f64) -> String {
 }
 
 impl MountView {
+    /// Name of the last found object, if the mount points at it.
+    pub fn object_at(&self, m: &MountInfo) -> Option<&str> {
+        let o = self.object.as_ref()?;
+        let off = protocol::mount::separation_arcmin(o.ra_hours, o.dec_deg, m.ra_j2000, m.dec_j2000);
+        (off < AT_OBJECT_ARCMIN).then_some(o.name.as_str())
+    }
+
     pub fn on_solver_settings(&mut self, s: &SolverSettings) {
         self.solver_edit = s.clone();
     }
@@ -150,6 +164,11 @@ impl MountView {
 
     fn goto(&mut self, ui: &mut egui::Ui, m: &MountInfo, state: &UiState, actions: &mut Vec<ToEngine>) {
         ui.label(RichText::new("Go to (J2000)").strong());
+        if let Some(o) = self.search.ui(ui, actions) {
+            self.ra_input = hms(o.ra_hours);
+            self.dec_input = dms(o.dec_deg);
+            self.object = Some(o);
+        }
         let ra = parse_number(&self.ra_input);
         let dec = parse_number(&self.dec_input);
         let ra_ok = ra.is_some_and(|r| (0.0..24.0).contains(&r));
@@ -213,6 +232,7 @@ impl MountView {
             if ui.button("Use current position").clicked() {
                 self.ra_input = hms(m.ra_j2000);
                 self.dec_input = dms(m.dec_j2000);
+                self.search.clear();
             }
         });
     }
@@ -366,5 +386,38 @@ mod tests {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| view.ui(ui, &state, &mut actions));
         }
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn object_at_mount_position() {
+        let mut view = MountView::default();
+        let mut m = MountInfo {
+            name: "Scope".into(),
+            ra: 0.69,
+            dec: 41.8,
+            ra_j2000: 0.673,
+            dec_j2000: 41.685,
+            alt: None,
+            hour_angle: None,
+            lst: None,
+            pier_side: None,
+            tracking: Some(true),
+            parked: Some(false),
+            slewing: false,
+        };
+        assert_eq!(view.object_at(&m), None);
+        view.object = Some(CatalogObject {
+            name: "M 110".into(),
+            aliases: vec!["NGC 205".into()],
+            common_names: vec![],
+            kind: "Galaxy".into(),
+            ra_hours: 0.6728,
+            dec_deg: 41.6853,
+            mag: Some(8.15),
+        });
+        assert_eq!(view.object_at(&m), Some("M 110"));
+        // Slewed elsewhere since.
+        m.dec_j2000 = 43.0;
+        assert_eq!(view.object_at(&m), None);
     }
 }

@@ -263,6 +263,7 @@ impl App {
                 ToUi::GuiderSettings(s) => self.guider.on_settings(s),
                 ToUi::SolverSettings(s) => self.mount.on_solver_settings(s),
                 ToUi::FocusSettings(s) => self.focus.on_settings(s),
+                ToUi::ObjectsFound { query, objects } => self.mount.search.on_results(query, objects),
                 _ => {}
             }
             self.state.apply(msg);
@@ -679,7 +680,10 @@ impl eframe::App for App {
             ui.separator();
             ui.add_enabled_ui(usable, |ui| match self.settings.view {
                 View::Imaging => self.imaging.ui(ui, &self.state, &mut actions),
-                View::Sequence => self.sequence.ui(ui, &self.state, &mut self.imaging, &mut actions),
+                View::Sequence => {
+                    let object = self.state.mount.as_ref().and_then(|m| self.mount.object_at(m));
+                    self.sequence.ui(ui, &self.state, object, &mut self.imaging, &mut actions)
+                }
                 View::Guiding => self.guider.ui(ui, &self.state, &mut actions),
                 View::Mount => self.mount.ui(ui, &self.state, &mut actions),
                 View::Focus => self.focus.ui(ui, &self.state, &mut actions),

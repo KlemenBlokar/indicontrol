@@ -110,3 +110,35 @@ async fn ui_controls_indi_through_engine() {
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn object_search_answers_only_the_asking_ui() {
+    let engine = engine::start(EngineConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        web_root: None,
+        state_file: None,
+        indi: None,
+    })
+    .await
+    .unwrap();
+    let (mut asking, _) = tokio_tungstenite::connect_async(engine.ws_url()).await.unwrap();
+    let (mut other, _) = tokio_tungstenite::connect_async(engine.ws_url()).await.unwrap();
+
+    send(&mut asking, ToEngine::FindObjects { query: "m 110".into() }).await;
+    let (query, objects) = loop {
+        if let ToUi::ObjectsFound { query, objects } = recv(&mut asking).await {
+            break (query, objects);
+        }
+    };
+    assert_eq!(query, "m 110");
+    assert_eq!(objects[0].name, "M 110");
+    assert!(objects.len() <= protocol::catalog::MAX_RESULTS);
+
+    // The other UI only gets its own state dump.
+    while let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(300), other.next()).await {
+        if let Message::Text(t) = msg {
+            assert!(!matches!(ToUi::from_json(t.as_str()).unwrap(), ToUi::ObjectsFound { .. }));
+        }
+    }
+    engine.shutdown();
+}

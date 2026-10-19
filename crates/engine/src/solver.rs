@@ -221,18 +221,7 @@ fn failure_text(kind: SolverKind, output: &std::process::Output) -> String {
     format!("{} found no solution{}", kind.label(), if last.is_empty() { String::new() } else { format!(" ({last})") })
 }
 
-/// Angular distance between two positions (hours/degrees in, arcminutes out).
-pub fn separation_arcmin(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
-    let (a1, d1, a2, d2) = (
-        (ra1 * 15.0).to_radians(),
-        dec1.to_radians(),
-        (ra2 * 15.0).to_radians(),
-        dec2.to_radians(),
-    );
-    // Haversine: stable for small angles.
-    let h = ((d2 - d1) / 2.0).sin().powi(2) + d1.cos() * d2.cos() * ((a2 - a1) / 2.0).sin().powi(2);
-    (2.0 * h.sqrt().asin()).to_degrees() * 60.0
-}
+pub use protocol::mount::separation_arcmin;
 
 #[cfg(test)]
 mod tests {
