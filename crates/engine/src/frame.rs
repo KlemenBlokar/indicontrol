@@ -8,6 +8,7 @@ use chrono::{Duration, Local};
 use imaging::{Fits, Image, Value, analyze, encode_jpeg, make_preview};
 use protocol::{FrameInfo, ImagingSettings};
 
+use crate::calibrate;
 use crate::metadata::FrameContext;
 
 const PREVIEW_MAX_DIM: usize = 1600;
@@ -22,11 +23,15 @@ pub struct ProcessInput {
     pub save: bool,
     /// Aperture (px) for star size measurement.
     pub star_aperture: f64,
+    /// Masters to apply (sequence lights).
+    pub calibration: Option<(calibrate::Plan, Arc<calibrate::Cache>)>,
 }
 
 pub struct ProcessOutput {
     pub info: FrameInfo,
     pub jpeg: Vec<u8>,
+    /// Why the masters could not be applied.
+    pub warning: Option<String>,
 }
 
 pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
@@ -38,6 +43,7 @@ pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
         settings,
         save,
         star_aperture,
+        calibration,
     } = input;
     if !format.starts_with(".fit") {
         return Err(format!(
@@ -53,21 +59,42 @@ pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
     }
 
     let image = Image::from_fits(&fits).map_err(|e| format!("cannot decode image: {e}"))?;
+    let mut warning = None;
+    let calibrated = calibration.as_ref().and_then(|(plan, cache)| match calibrate::apply(plan, cache, &image) {
+        Ok(values) => Some((values, plan)),
+        Err(e) => {
+            warning = Some(format!("Frame not calibrated: {e}"));
+            None
+        }
+    });
+    // Preview and measurements show the calibrated frame.
+    let shown = calibrated.as_ref().map(|(values, _)| calibrate::to_image(values, &image));
+    let view = shown.as_ref().unwrap_or(&image);
     let bpp = ctx
         .bits_per_pixel
         .or_else(|| (fits.bitpix().ok() == Some(8)).then_some(8));
-    let analysis = analyze(&image, bpp);
-    let stars = star_stats(&image, star_aperture);
-    let jpeg = encode_jpeg(&make_preview(&image, &analysis, PREVIEW_MAX_DIM), PREVIEW_QUALITY);
+    let analysis = analyze(view, bpp);
+    let stars = star_stats(view, star_aperture);
+    let jpeg = encode_jpeg(&make_preview(view, &analysis, PREVIEW_MAX_DIM), PREVIEW_QUALITY);
 
-    let path = if save {
-        let path = output_path(&settings, &ctx);
-        write_atomic(&path, &fits.to_bytes())
-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-        Some(path.display().to_string())
-    } else {
-        None
-    };
+    // The raw frame is kept unless only the calibrated one is wanted.
+    let save_raw = save && calibrated.as_ref().is_none_or(|(_, plan)| plan.save_raw);
+    let save_calibrated = save && calibrated.as_ref().is_some_and(|(_, plan)| plan.save_calibrated);
+    let (mut path, mut calibrated_path) = (None, None);
+    if save_raw || save_calibrated {
+        let raw = free_path(&settings, &ctx, |p| !p.exists() && !calibrated_file(p).exists());
+        if save_raw {
+            write_atomic(&raw, &fits.to_bytes()).map_err(|e| format!("could not write {}: {e}", raw.display()))?;
+            path = Some(raw.display().to_string());
+        }
+        if let (true, Some((values, plan))) = (save_calibrated, &calibrated) {
+            let out = calibrated_file(&raw);
+            let bytes = calibrate::to_fits(values, &fits.header, plan).to_bytes();
+            write_atomic(&out, &bytes).map_err(|e| format!("could not write {}: {e}", out.display()))?;
+            calibrated_path = Some(out.display().to_string());
+            path.get_or_insert_with(|| out.display().to_string());
+        }
+    }
 
     let header = fits
         .header
@@ -87,11 +114,14 @@ pub fn process(input: ProcessInput) -> Result<ProcessOutput, String> {
             width: image.width,
             height: image.height,
             path,
+            calibrated_path,
+            calibration: calibrated.map(|(_, plan)| plan.label.clone()),
             analysis,
             stars,
             header,
         },
         jpeg,
+        warning,
     })
 }
 
@@ -134,8 +164,20 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// The calibrated copy of `raw`: in a `calibrated` folder beside it.
+pub fn calibrated_file(raw: &Path) -> PathBuf {
+    let dir = raw.parent().unwrap_or(Path::new("")).join("calibrated");
+    dir.join(raw.file_name().unwrap_or_default())
+}
+
 /// First free path for this frame according to the file template.
+#[cfg(test)]
 pub fn output_path(settings: &ImagingSettings, ctx: &FrameContext) -> PathBuf {
+    free_path(settings, ctx, |p| !p.exists())
+}
+
+/// First path from the file template that `free` accepts.
+fn free_path(settings: &ImagingSettings, ctx: &FrameContext, free: impl Fn(&Path) -> bool) -> PathBuf {
     let root = PathBuf::from(&settings.output_dir);
     let template = if settings.file_template.contains("{seq") {
         settings.file_template.clone()
@@ -145,7 +187,7 @@ pub fn output_path(settings: &ImagingSettings, ctx: &FrameContext) -> PathBuf {
     };
     for seq in 1..1_000_000 {
         let path = root.join(format!("{}.fits", render(&template, ctx, seq)));
-        if !path.exists() {
+        if free(&path) {
             return path;
         }
     }

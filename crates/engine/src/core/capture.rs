@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use protocol::equipment::{self, Control};
 use protocol::preview_frame::{self, Kind};
-use protocol::{CaptureRequest, CaptureState, LogLevel, ToUi};
+use protocol::{CaptureRequest, CaptureState, FrameType, LogLevel, ToUi};
 
 use super::{Core, CoreMsg, Outgoing};
 use crate::frame::{self, ProcessInput, ProcessOutput};
@@ -271,6 +271,12 @@ impl Core {
         if job.purpose == Purpose::Solve {
             self.solve_frame(blob.clone());
         }
+        let calibration = match &self.job {
+            Some(j) if j.purpose == Purpose::Sequence && j.req.save && ctx.frame_type == FrameType::Light => {
+                self.calibration_for(&ctx).map(|plan| (plan, self.calibration_cache.clone()))
+            }
+            _ => None,
+        };
         let Some(job) = &mut self.job else {
             return;
         };
@@ -283,6 +289,7 @@ impl Core {
             settings: self.state.imaging.clone(),
             save: job.req.save,
             star_aperture: self.state.focus.aperture,
+            calibration,
         };
         let (job_id, tx) = (job.id, self.tx.clone());
         self.set_capture_state(CaptureState::Processing);
@@ -314,6 +321,13 @@ impl Core {
                     Some(p) => format!("Saved {p}"),
                     None => format!("Captured {} ({}×{})", out.info.camera, out.info.width, out.info.height),
                 };
+                let text = match &out.info.calibrated_path {
+                    Some(c) if out.info.path.as_ref() != Some(c) => format!("{text} and {c}"),
+                    _ => text,
+                };
+                if let Some(w) = out.warning.clone() {
+                    self.log(None, w, LogLevel::Warning);
+                }
                 self.publish_frame(out);
                 self.log(None, text, LogLevel::Info);
                 if !current {

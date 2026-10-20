@@ -123,6 +123,8 @@ pub(crate) struct Core {
     /// unique across restarts and saved sequences.
     next_step_id: u64,
     masters: calibration::MastersScan,
+    /// Masters in memory for calibrating frames.
+    calibration_cache: std::sync::Arc<crate::calibrate::Cache>,
 }
 
 impl Core {
@@ -162,6 +164,7 @@ impl Core {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as u64),
             masters: Default::default(),
+            calibration_cache: Default::default(),
         };
         core.init_drafts();
         core.state.sequence_draft.sequence.assign_step_ids(&mut core.next_step_id);

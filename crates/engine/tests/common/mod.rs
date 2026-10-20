@@ -291,6 +291,8 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
     let mut reported = (ra0, -5.39);
     let mut error = POINTING_ERROR;
     let mut sync_mode = false;
+    // Darks see no light.
+    let mut dark = false;
     let mut focus = FOCUS_START;
     loop {
         let n = match sock.read(&mut buf).await {
@@ -324,6 +326,9 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
                 // Coordinate mode switches (sync vs. slew).
                 if chunk.contains(r#"name="ON_COORD_SET""#) {
                     sync_mode = chunk.contains(r#"<oneSwitch name="SYNC">On"#);
+                }
+                if chunk.contains(r#"name="CCD_FRAME_TYPE""#) {
+                    dark = chunk.contains(r#"<oneSwitch name="FRAME_DARK">On"#);
                 }
                 continue;
             }
@@ -394,7 +399,7 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
                 let jd = imaging::astro::julian_day(unix);
                 let (tra, tdec) = imaging::astro::precess(reported.0 + error.0, reported.1 + error.1, jd, imaging::astro::J2000);
                 let frame = test_frame_with(
-                    exposure,
+                    if dark { 0.0 } else { exposure },
                     focus,
                     &[Card::new("TRUERA", tra * 15.0, ""), Card::new("TRUEDEC", tdec, "")],
                 );

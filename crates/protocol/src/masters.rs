@@ -77,6 +77,11 @@ pub struct CalibrationPlan {
     pub darks: bool,
     pub flats: bool,
     pub flats_with: FlatCalibration,
+    /// Keep the frames as taken.
+    pub save_raw: bool,
+    /// Also write the lights with the masters applied (32-bit float), in a
+    /// `calibrated` folder next to the raw ones.
+    pub save_calibrated: bool,
 }
 
 impl Default for CalibrationPlan {
@@ -85,8 +90,63 @@ impl Default for CalibrationPlan {
             darks: true,
             flats: true,
             flats_with: FlatCalibration::Bias,
+            save_raw: true,
+            save_calibrated: false,
         }
     }
+}
+
+/// The masters a light frame gets under a plan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Chosen<'a> {
+    /// The master dark, or the bias when the plan has no darks.
+    pub lights: Option<&'a MasterFrame>,
+    pub flat: Option<&'a MasterFrame>,
+    /// Bias or dark flat to subtract from the flat.
+    pub flat_cal: Option<&'a MasterFrame>,
+    /// What the plan wants but the folder lacks: "dark 120 s, gain 100…".
+    pub missing: Vec<String>,
+}
+
+/// The masters for a light taken as `light`, the same as [`needs`] picks.
+pub fn choose<'a>(light: &LightSpec, plan: CalibrationPlan, masters: &'a [MasterFrame]) -> Chosen<'a> {
+    let mut out = Chosen::default();
+    let lights_kind = if plan.darks { MasterKind::Dark } else { MasterKind::Bias };
+    out.lights = light.find(lights_kind, masters);
+    if out.lights.is_none() {
+        out.missing.push(format!("{} {}", lights_kind.label(), light.describe(lights_kind)));
+    }
+    if !plan.flats {
+        return out;
+    }
+    out.flat = light.find(MasterKind::Flat, masters);
+    let Some(flat) = out.flat else {
+        out.missing.push(format!("flat {}", light.describe(MasterKind::Flat)));
+        return out;
+    };
+    let flat_spec = LightSpec {
+        gain: flat.gain.or(light.gain),
+        offset: flat.offset.or(light.offset),
+        temperature: None,
+        ..light.clone()
+    };
+    match plan.flats_with {
+        FlatCalibration::Bias => {
+            out.flat_cal = flat_spec.find(MasterKind::Bias, masters);
+            if out.flat_cal.is_none() {
+                out.missing.push(format!("bias {} (for the flat)", flat_spec.describe(MasterKind::Bias)));
+            }
+        }
+        FlatCalibration::DarkFlats => {
+            out.flat_cal = flat
+                .exposure
+                .and_then(|exposure| LightSpec { exposure, ..flat_spec.clone() }.find(MasterKind::Dark, masters));
+            if out.flat_cal.is_none() {
+                out.missing.push(format!("dark flat for {}", flat.path));
+            }
+        }
+    }
+    out
 }
 
 /// What is subtracted from the flats before they are averaged.

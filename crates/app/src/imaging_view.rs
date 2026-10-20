@@ -285,8 +285,21 @@ impl ImagingView {
                 ui.label(parts.join(" · "));
             }
         });
-        if let Some(path) = frame.and_then(|f| f.path.as_deref()) {
-            ui.label(RichText::new(path).small().weak());
+        if let Some(f) = frame {
+            // The calibration first: long paths run off the panel.
+            ui.horizontal(|ui| {
+                if let Some(what) = &f.calibration {
+                    let saved = if f.calibrated_path.is_some() { ", copy saved" } else { "" };
+                    ui.label(RichText::new(format!("Calibrated: {what}{saved}")).small().color(theme::c(ui, GREEN)))
+                        .on_hover_text(match &f.calibrated_path {
+                            Some(p) => format!("The preview and measurements use the calibrated frame.\n{p}"),
+                            None => "The preview and measurements use the calibrated frame".into(),
+                        });
+                }
+                if let Some(path) = &f.path {
+                    ui.label(RichText::new(path).small().weak());
+                }
+            });
         }
         let size = texture.size_vec2();
         let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
@@ -552,6 +565,8 @@ mod tests {
                 width: w,
                 height: h,
                 path: Some("/tmp/x.fits".into()),
+                calibrated_path: None,
+                calibration: Some("dark, flat".into()),
                 analysis,
                 stars: Some(protocol::StarStats { count: 12, hfr: 1.8 }),
                 header: vec![("IMAGETYP".into(), "Light Frame".into())],

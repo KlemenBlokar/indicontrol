@@ -7,7 +7,10 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use protocol::{FrameType, LogLevel, MasterKind, MastersStatus, SequenceStep, ToUi};
+use protocol::{FlatCalibration, FrameType, LightSpec, LogLevel, MasterKind, MastersStatus, SequenceStep, ToUi};
+
+use crate::calibrate;
+use crate::metadata::FrameContext;
 
 use super::{Core, CoreMsg};
 
@@ -132,5 +135,56 @@ impl Core {
         }
         self.rescan_masters();
         self.stack_next();
+    }
+
+    /// The masters a sequence light taken as `ctx` gets under the running
+    /// sequence's plan; reports missing ones once per run. `None` when it
+    /// gets none.
+    pub(super) fn calibration_for(&mut self, ctx: &FrameContext) -> Option<calibrate::Plan> {
+        let plan = self.run.as_ref()?.seq.calibration;
+        if !plan.darks && !plan.flats && !plan.save_calibrated {
+            return None;
+        }
+        let light = LightSpec {
+            camera: Some(ctx.camera.clone()),
+            size: None,
+            binning: ctx.binning.map_or(1, |(h, _)| h.max(1)),
+            exposure: ctx.exposure,
+            gain: ctx.gain,
+            offset: ctx.offset,
+            temperature: ctx.temperature,
+            filter: ctx.filter.clone(),
+        };
+        let folder = self.masters_folder();
+        let chosen = protocol::masters::choose(&light, plan, &self.masters.status.masters);
+        let path = |m: Option<&protocol::MasterFrame>| m.map(|m| folder.join(&m.path));
+        let mut label = Vec::new();
+        if chosen.lights.is_some() {
+            label.push(if plan.darks { "dark" } else { "bias" }.to_owned());
+        }
+        if chosen.flat.is_some() {
+            label.push(match (chosen.flat_cal.is_some(), plan.flats_with) {
+                (false, _) => "flat".to_owned(),
+                (true, FlatCalibration::Bias) => "flat (less bias)".to_owned(),
+                (true, FlatCalibration::DarkFlats) => "flat (less dark flat)".to_owned(),
+            });
+        }
+        let out = calibrate::Plan {
+            dark: path(chosen.lights),
+            flat: path(chosen.flat),
+            flat_cal: path(chosen.flat_cal),
+            save_raw: plan.save_raw,
+            save_calibrated: plan.save_calibrated,
+            label: label.join(", "),
+        };
+        let missing = chosen.missing;
+        let fresh: Vec<String> = {
+            let run = self.run.as_mut()?;
+            missing.iter().filter(|m| run.calibration_warned.insert((*m).clone())).cloned().collect()
+        };
+        for m in fresh {
+            self.log(None, format!("No master {m}: the lights are not corrected for it"), LogLevel::Warning);
+        }
+        (!out.is_empty()).then_some(out)
     }
 }

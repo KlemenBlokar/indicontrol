@@ -131,6 +131,23 @@ cosmic rays and hot transients, written as 32-bit float with IMAGETYP
 e.g. `master_dark_120s_g100_o50_-10C_bin1_20261020-213802.fits`. Take the
 flats before their dark flats, which reuse the flats' exposure.
 
+**Lights are calibrated as they come in**, with the masters the
+Calibration section shows: the dark (or the bias without darks) is
+subtracted and the result divided by the flat, which first has its bias or
+dark flat taken off and is normalised to its median. The preview and the
+star measurements use the calibrated frame; the image panel says which
+masters were applied. A missing master is reported once per run and that
+correction skipped. Save chooses what is written:
+
+- **raw frames** (on by default): the frames as taken, to calibrate again
+  later, e.g. in Siril.
+- **calibrated frames**: each light with its masters applied, as 32-bit
+  float with CALSTAT (B, D, F) and HISTORY naming the masters, into a
+  `calibrated` folder beside the raw one. A light that gets no master is
+  saved raw even when raw frames are off.
+
+Up to four masters are kept in memory (about 100 MB each at 26 MP).
+
 **Progress** is kept with each step (the Done column). After an abort, an
 engine restart or a cloudy night, the sequence continues with only the
 frames still missing. Reset progress starts every step from zero.

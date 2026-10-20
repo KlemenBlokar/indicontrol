@@ -25,7 +25,7 @@ pub use doc::{Ack, CaptureForm, DocId, GotoDraft, SequenceDraft, SharedDoc, Sync
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
 pub use focus::{AutofocusStatus, AutofocusTriggers, FocusSettings, StarStats};
-pub use masters::{CalibrationPlan, FlatCalibration, LightSpec, MasterFrame, MasterKind, MastersStatus, Need, Purpose};
+pub use masters::{CalibrationPlan, Chosen, FlatCalibration, LightSpec, MasterFrame, MasterKind, MastersStatus, Need, Purpose};
 pub use mount::MountInfo;
 pub use solver::{SolveResult, SolveStatus, SolverKind, SolverSettings, Target};
 pub use sequence::{
@@ -34,7 +34,7 @@ pub use sequence::{
 pub use indi_link;
 
 /// Bump on any incompatible message change.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEFAULT_ENGINE_PORT: u16 = 7700;
 pub const WS_PATH: &str = "/ws";
 
@@ -245,8 +245,15 @@ pub struct FrameInfo {
     pub object: String,
     pub width: usize,
     pub height: usize,
-    /// Where the FITS file was written, if saved.
+    /// Where the FITS file was written, if saved (the calibrated copy when
+    /// only that is kept).
     pub path: Option<String>,
+    /// The calibrated copy, if written.
+    #[serde(default)]
+    pub calibrated_path: Option<String>,
+    /// Masters applied to the frame (and its preview): "dark, flat".
+    #[serde(default)]
+    pub calibration: Option<String>,
     pub analysis: Analysis,
     /// Detected stars and their median size.
     pub stars: Option<StarStats>,

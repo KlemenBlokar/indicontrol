@@ -564,6 +564,31 @@ impl SequenceView {
         if !plan.darks {
             ui.label(RichText::new("Without darks the lights still need their offset removed: a master bias.").weak());
         }
+        ui.horizontal(|ui| {
+            ui.label("Save");
+            let raw = ui
+                .checkbox(&mut plan.save_raw, "raw frames")
+                .on_hover_text("The lights as taken: keep them to calibrate again later, e.g. in Siril");
+            let calibrated = ui.checkbox(&mut plan.save_calibrated, "calibrated frames").on_hover_text(
+                "Also write each light with its masters applied (32-bit float) into a \"calibrated\" folder next to the raw ones",
+            );
+            // Something is always saved.
+            if raw.changed() && !plan.save_raw {
+                plan.save_calibrated = true;
+            }
+            if calibrated.changed() && !plan.save_calibrated {
+                plan.save_raw = true;
+            }
+        });
+        if !plan.save_raw {
+            ui.colored_label(
+                theme::c(ui, ORANGE),
+                "Without raw frames the calibration cannot be redone. Frames that get no master are still saved raw.",
+            );
+        }
+        ui.label(
+            RichText::new("The preview and star measurements of the lights use the masters found below.").weak(),
+        );
 
         let m = &state.masters;
         let needs = protocol::masters::needs(&self.draft.value.sequence, state);

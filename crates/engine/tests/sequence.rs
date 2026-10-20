@@ -130,6 +130,48 @@ async fn calibration_sequence_with_auto_flats() {
     assert_eq!(saved.flat_exposures[0].filter.as_deref(), Some("Ha"));
     assert_eq!(saved.flat_exposures[0].exposure, flat_exposure);
 
+    // Lights get the masters: dark, and the flat less its dark flat.
+    let lights = |count, save_raw| Sequence {
+        name: "Lights".into(),
+        steps: vec![SequenceStep {
+            filter_slot: Some(2),
+            exposure: Exposure::Fixed { seconds: 0.5 },
+            temperature: Some(-10.0),
+            count,
+            ..Default::default()
+        }],
+        dither_every: 0,
+        meridian_flip: false,
+        calibration: protocol::CalibrationPlan {
+            flats_with: protocol::FlatCalibration::DarkFlats,
+            save_raw,
+            save_calibrated: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    ui.send(ToEngine::StartSequence(lights(2, true))).await;
+    ui.until("lights", |u| u.state.sequence.is_none() && u.state.log.iter().any(|l| l.text.starts_with("Lights complete"))).await;
+    let frame = ui.state.last_frame.clone().unwrap();
+    assert_eq!(frame.calibration.as_deref(), Some("dark, flat (less dark flat)"));
+    let copy = frame.calibrated_path.clone().unwrap();
+    assert!(copy.ends_with("Light/Ha/calibrated/0.5s_002.fits"), "{copy}");
+    assert!(frame.path.unwrap().ends_with("Light/Ha/0.5s_002.fits"));
+    let c = Fits::parse(&std::fs::read(&copy).unwrap()).unwrap();
+    assert_eq!((c.header.get_i64("BITPIX"), c.header.get_str("CALSTAT")), (Some(-32), Some("DF")));
+    assert!(ui.state.log.iter().all(|l| !l.text.starts_with("No master")), "{:#?}", ui.state.log);
+
+    // Only the calibrated frame, numbered after the others.
+    ui.send(ToEngine::StartSequence(lights(1, false))).await;
+    ui.until("calibrated only", |u| {
+        u.state.sequence.is_none() && u.state.log.iter().filter(|l| l.text.starts_with("Lights complete")).count() == 2
+    })
+    .await;
+    let frame = ui.state.last_frame.clone().unwrap();
+    assert_eq!(frame.path, frame.calibrated_path);
+    assert!(frame.path.unwrap().ends_with("Light/Ha/calibrated/0.5s_003.fits"));
+    assert!(!dir.join("out/Light/Ha/0.5s_003.fits").exists());
+
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }

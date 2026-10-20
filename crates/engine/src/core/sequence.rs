@@ -24,7 +24,7 @@ const SIDEREAL_RATE: f64 = 1.002_737_9;
 
 pub(crate) struct Run {
     id: u64,
-    seq: Sequence,
+    pub(super) seq: Sequence,
     done: Vec<u32>,
     current: Option<usize>,
     wait: Wait,
@@ -37,6 +37,8 @@ pub(crate) struct Run {
     focused_once: bool,
     last_focus_filter: Option<u32>,
     focus_after_flip: bool,
+    /// Missing masters already reported in this run.
+    pub(super) calibration_warned: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -137,6 +139,7 @@ impl Core {
             focused_once: false,
             last_focus_filter: None,
             focus_after_flip: false,
+            calibration_warned: Default::default(),
         });
         let started = if taken > 0 {
             format!("{name} continues: {taken} of {planned} frames already taken")
@@ -937,6 +940,7 @@ mod tests {
             focused_once: false,
             last_focus_filter: None,
             focus_after_flip: false,
+            calibration_warned: Default::default(),
         }
     }
 

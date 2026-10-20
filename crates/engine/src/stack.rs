@@ -89,6 +89,16 @@ impl Input {
     }
 }
 
+/// A whole single-plane file as values: (width, height, values).
+pub fn read_f32(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
+    let (mut input, header) = Input::open(path)?;
+    let w = header.get_i64("NAXIS1").unwrap_or(0).max(0) as usize;
+    let h = header.get_i64("NAXIS2").unwrap_or(0).max(0) as usize;
+    let mut out = vec![0.0; w * h];
+    input.read(0, &mut out, &mut Vec::new()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((w, h, out))
+}
+
 /// Average `frames` into a `kind` master in `folder` (32-bit float, in the
 /// frames' ADU, header from the first frame), named after its settings.
 pub fn stack(frames: &[PathBuf], kind: MasterKind, folder: &Path) -> Result<Stacked, String> {
