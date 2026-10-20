@@ -406,8 +406,13 @@ impl SequenceView {
                         .then(|| format!("The wheel has only {} of the {label} filters.", slots.len()));
                 }
             }
+            if ui.small_button("All").clicked() {
+                p.plan_rows.iter_mut().for_each(|r| r.enabled = true);
+                self.plan_feedback = None;
+            }
             if ui.small_button("None").clicked() {
                 p.plan_rows.iter_mut().for_each(|r| r.enabled = false);
+                self.plan_feedback = None;
             }
         });
 
