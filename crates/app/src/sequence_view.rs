@@ -494,7 +494,7 @@ impl SequenceView {
                 optional_value(ui, &mut v, 1.0, 1.0..=8.0, 0.05, "");
                 ps.binning = v.map(|b| b.round() as u32);
             });
-            ui.label("Sensor");
+            ui.label("Temperature").on_hover_text("Cool the sensor to this and wait for it before the frames");
             ui.push_id("plan_temp", |ui| optional_value(ui, &mut ps.temperature, -10.0, -60.0..=40.0, 0.5, " °C"));
         });
 
