@@ -114,6 +114,9 @@ pub(crate) struct Core {
     drafts: docs::SettingsDrafts,
     /// A delayed save is scheduled.
     save_pending: bool,
+    /// Last sequence step id given out. Starts from the clock, so ids stay
+    /// unique across restarts and saved sequences.
+    next_step_id: u64,
 }
 
 impl Core {
@@ -149,8 +152,12 @@ impl Core {
             next_session: 0,
             drafts: Default::default(),
             save_pending: false,
+            next_step_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros() as u64),
         };
         core.init_drafts();
+        core.state.sequence_draft.sequence.assign_step_ids(&mut core.next_step_id);
         (core, tx)
     }
 

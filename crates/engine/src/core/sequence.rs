@@ -10,6 +10,8 @@ use protocol::{
     SequenceStatus, ToUi,
 };
 
+use protocol::DocId;
+
 use super::{Core, CoreMsg};
 
 const TEMPERATURE_TOLERANCE: f64 = 0.5;
@@ -73,7 +75,7 @@ enum FlipPhase {
 }
 
 impl Core {
-    pub(super) fn start_sequence(&mut self, seq: Sequence) -> Result<(), String> {
+    pub(super) fn start_sequence(&mut self, mut seq: Sequence) -> Result<(), String> {
         if self.run.is_some() {
             return Err("a sequence is already running".into());
         }
@@ -89,6 +91,17 @@ impl Core {
         if seq.planned_frames() == 0 {
             return Err("the sequence has no enabled frames".into());
         }
+        // The engine's draft has the latest progress of the steps it shares.
+        let draft = &self.state.sequence_draft.sequence;
+        for step in &mut seq.steps {
+            if let Some(d) = draft.steps.iter().find(|d| d.id != 0 && d.id == step.id) {
+                step.done = d.done;
+            }
+        }
+        seq.assign_step_ids(&mut self.next_step_id);
+        if seq.remaining_frames() == 0 {
+            return Err("every step is complete; reset the progress to take them again".into());
+        }
         if seq.steps.iter().any(|s| s.enabled && s.filter_slot.is_some())
             && self.state.roles.filter_wheel.is_none()
         {
@@ -97,10 +110,13 @@ impl Core {
         self.next_run_id += 1;
         let n = seq.steps.len();
         let name = if seq.name.is_empty() { "Sequence".into() } else { seq.name.clone() };
+        let done: Vec<u32> = seq.steps.iter().map(|s| s.done).collect();
+        let taken: u32 = seq.steps.iter().map(|s| s.done.min(s.count)).sum();
+        let planned = seq.planned_frames();
         self.run = Some(Run {
             id: self.next_run_id,
             seq,
-            done: vec![0; n],
+            done,
             current: None,
             wait: Wait::None,
             pause_requested: false,
@@ -113,7 +129,12 @@ impl Core {
             last_focus_filter: None,
             focus_after_flip: false,
         });
-        self.log(None, format!("{name} started"), LogLevel::Info);
+        let started = if taken > 0 {
+            format!("{name} continues: {taken} of {planned} frames already taken")
+        } else {
+            format!("{name} started")
+        };
+        self.log(None, started, LogLevel::Info);
         let run = self.run.as_ref().expect("just created");
         if let (Some(t), true) = (run.seq.target, run.seq.center_on_start) {
             let restart_guiding = self.guider_is_guiding();
@@ -319,15 +340,18 @@ impl Core {
             max,
         } = run.seq.steps[step].exposure
         else {
-            run.done[step] += 1;
+            self.count_frame(step);
             return self.sequence_next();
         };
 
         // Flats: keep frames that are close enough, and steer the exposure.
         let error = (brightest - target).abs();
         if !test && error <= 2.0 * tolerance {
-            run.done[step] += 1;
+            self.count_frame(step);
         }
+        let Some(run) = &mut self.run else {
+            return;
+        };
         let flat = &mut run.flat[step];
         if error <= tolerance {
             flat.calibrated = true;
@@ -805,6 +829,24 @@ impl Core {
                 message: r.message.clone(),
             })
             }),
+        }
+    }
+
+    /// A frame of `step` is kept: count it in the run and in the draft
+    /// step it came from, so the progress survives aborts and restarts.
+    fn count_frame(&mut self, step: usize) {
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        run.done[step] += 1;
+        let done = run.done[step];
+        run.seq.steps[step].done = done;
+        let id = run.seq.steps[step].id;
+        let draft = &mut self.state.sequence_draft.sequence;
+        if let Some(d) = draft.steps.iter_mut().find(|d| d.id == id) {
+            d.done = done;
+            self.send(self.doc_msg(DocId::Sequence, None));
+            self.save_soon();
         }
     }
 

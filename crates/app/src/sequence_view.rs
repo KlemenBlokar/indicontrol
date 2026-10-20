@@ -3,6 +3,7 @@
 use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use protocol::equipment;
+use protocol::sequence::plan::{self, PlanRow, PlanSettings};
 use protocol::sequence::presets;
 use protocol::{
     Exposure, FrameType, RunState, Sequence, SequenceDraft, SequenceOrder, SequenceStatus, SharedDoc, ToEngine,
@@ -15,15 +16,14 @@ use crate::imaging_view::ImagingView;
 const RED: Color32 = Color32::from_rgb(220, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
 
-/// Inputs of the preset builders (persisted with the UI).
+/// Inputs of the light planner and calibration presets (persisted with the UI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PresetForm {
-    light_exposure: f64,
-    light_count: u32,
-    bracket_filter: Option<u32>,
-    bracket_exposures: String,
-    bracket_count: u32,
+    plan_rows: Vec<PlanRow>,
+    plan_settings: PlanSettings,
+    /// Apply replaces the light steps (else adds to them).
+    plan_replace: bool,
     dark_exposures: String,
     dark_count: u32,
     bias_count: u32,
@@ -34,11 +34,9 @@ pub struct PresetForm {
 impl Default for PresetForm {
     fn default() -> Self {
         Self {
-            light_exposure: 300.0,
-            light_count: 20,
-            bracket_filter: None,
-            bracket_exposures: "10, 30, 60, 120, 300".into(),
-            bracket_count: 3,
+            plan_rows: Vec::new(),
+            plan_settings: PlanSettings::default(),
+            plan_replace: true,
             dark_exposures: "60, 120, 300".into(),
             dark_count: 30,
             bias_count: 50,
@@ -54,6 +52,7 @@ pub struct SequenceView {
     pub presets: PresetForm,
     library_pick: Option<String>,
     feedback: Option<(String, bool)>,
+    plan_feedback: Option<String>,
 }
 
 impl SequenceView {
@@ -63,6 +62,7 @@ impl SequenceView {
             presets,
             library_pick: None,
             feedback: None,
+            plan_feedback: None,
         }
     }
 
@@ -91,10 +91,14 @@ impl SequenceView {
                     ui.separator();
                     self.library(ui, state, actions);
                     ui.separator();
-                    self.editor(ui, &filters);
+                    self.settings(ui);
                     self.target(ui, state, mount_object);
                     ui.separator();
-                    self.presets(ui, &filters);
+                    self.planner(ui, &filters);
+                    ui.separator();
+                    self.steps(ui, &filters);
+                    ui.separator();
+                    self.calibration(ui, &filters);
                 });
             });
         egui::CentralPanel::default().show(ui, |ui| imaging.image_panel(ui, state));
@@ -104,9 +108,15 @@ impl SequenceView {
         let Some(status) = &state.sequence else {
             ui.horizontal(|ui| {
                 let seq = &self.draft.value.sequence;
-                let ready = seq.planned_frames() > 0;
+                let ready = seq.remaining_frames() > 0;
+                let label = if seq.has_progress() { "⏵ Continue sequence" } else { "⏵ Start sequence" };
                 if ui
-                    .add_enabled(ready, egui::Button::new(RichText::new("⏵ Start sequence").strong()))
+                    .add_enabled(ready, egui::Button::new(RichText::new(label).strong()))
+                    .on_disabled_hover_text(if seq.planned_frames() > 0 {
+                        "Every step is complete: reset the progress to take them again"
+                    } else {
+                        "Add steps first"
+                    })
                     .clicked()
                 {
                     actions.push(ToEngine::StartSequence(seq.clone()));
@@ -195,7 +205,7 @@ impl SequenceView {
         });
     }
 
-    fn editor(&mut self, ui: &mut egui::Ui, filters: &[String]) {
+    fn settings(&mut self, ui: &mut egui::Ui) {
         let seq = &mut self.draft.value.sequence;
         ui.horizontal(|ui| {
             ui.label("Name");
@@ -238,7 +248,11 @@ impl SequenceView {
             ui.selectable_value(&mut seq.order, SequenceOrder::Interleaved, "Interleaved")
                 .on_hover_text("One frame of each step in turn (LRGBLRGB…)");
         });
+    }
 
+    fn steps(&mut self, ui: &mut egui::Ui, filters: &[String]) {
+        let seq = &mut self.draft.value.sequence;
+        ui.label(RichText::new("Steps").strong());
         enum Edit {
             Up(usize),
             Down(usize),
@@ -249,10 +263,10 @@ impl SequenceView {
         let n = seq.steps.len();
         egui::Grid::new("steps")
             .striped(true)
-            .num_columns(11)
+            .num_columns(12)
             .spacing([6.0, 4.0])
             .show(ui, |ui| {
-                for h in ["", "#", "Type", "Filter", "Exposure", "Count", "Bin", "Gain", "Offset", "Temp °C", ""] {
+                for h in ["", "#", "Type", "Filter", "Exposure", "Count", "Done", "Bin", "Gain", "Offset", "Temp °C", ""] {
                     ui.label(RichText::new(h).small().strong());
                 }
                 ui.end_row();
@@ -272,6 +286,9 @@ impl SequenceView {
                     ui.push_id(("filter", i), |ui| filter_combo(ui, &mut step.filter_slot, filters));
                     ui.push_id(("exp", i), |ui| exposure_editor(ui, &mut step.exposure));
                     ui.add(egui::DragValue::new(&mut step.count).range(0..=9999));
+                    let done = RichText::new(step.done.to_string());
+                    ui.label(if step.done >= step.count { done.weak() } else { done })
+                        .on_hover_text("Frames already taken; the sequence continues from here");
                     ui.push_id(("bin", i), |ui| {
                         let mut v = step.binning.map(f64::from);
                         optional_value(ui, &mut v, 1.0, 1.0..=8.0, 0.05, "");
@@ -306,18 +323,25 @@ impl SequenceView {
                 seq.steps.remove(i);
             }
             Some(Edit::Duplicate(i)) => {
-                let s = seq.steps[i].clone();
+                let s = fresh(&seq.steps[i]);
                 seq.steps.insert(i + 1, s);
             }
             None => {}
         }
         ui.horizontal(|ui| {
             if ui.button("+ Add step").clicked() {
-                let step = seq.steps.last().cloned().unwrap_or_default();
+                let step = seq.steps.last().map(fresh).unwrap_or_default();
                 seq.steps.push(step);
             }
             if ui.add_enabled(!seq.steps.is_empty(), egui::Button::new("Clear")).clicked() {
                 seq.steps.clear();
+            }
+            if ui
+                .add_enabled(seq.has_progress(), egui::Button::new("Reset progress"))
+                .on_hover_text("Forget the frames taken, to run every step again")
+                .clicked()
+            {
+                seq.reset_progress();
             }
             ui.label(RichText::new(plan_summary(seq)).weak());
         });
@@ -361,8 +385,146 @@ impl SequenceView {
         });
     }
 
-    fn presets(&mut self, ui: &mut egui::Ui, filters: &[String]) {
-        egui::CollapsingHeader::new("Add from preset").default_open(true).show(ui, |ui| {
+    /// Light frames as total time per filter, turned into steps on Apply.
+    fn planner(&mut self, ui: &mut egui::Ui, filters: &[String]) {
+        let p = &mut self.presets;
+        sync_plan_rows(&mut p.plan_rows, filters.len());
+        ui.label(RichText::new("Plan light frames").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Use:").weak());
+            for (label, set) in [("LRGB", &presets::LRGB[..]), ("SHO", &presets::SHO[..])] {
+                if ui
+                    .small_button(label)
+                    .on_hover_text(format!("Use the {label} filters only"))
+                    .clicked()
+                {
+                    let slots: Vec<u32> = set.iter().filter_map(|(_, a)| presets::find_filter(filters, a)).collect();
+                    for r in &mut p.plan_rows {
+                        r.enabled = r.filter_slot.is_some_and(|s| slots.contains(&s));
+                    }
+                    self.plan_feedback = (slots.len() < set.len())
+                        .then(|| format!("The wheel has only {} of the {label} filters.", slots.len()));
+                }
+            }
+            if ui.small_button("None").clicked() {
+                p.plan_rows.iter_mut().for_each(|r| r.enabled = false);
+            }
+        });
+
+        enum RowEdit {
+            AddExposure(usize),
+            Remove(usize),
+        }
+        let mut edit = None;
+        egui::Grid::new("plan").striped(true).num_columns(6).spacing([8.0, 4.0]).show(ui, |ui| {
+            for h in ["", "Filter", "Exposure", "Total time", "Frames", ""] {
+                ui.label(RichText::new(h).small().strong());
+            }
+            ui.end_row();
+            let rows = &mut p.plan_rows;
+            for i in 0..rows.len() {
+                let slot = rows[i].filter_slot;
+                let first_of_filter = i == 0 || rows[i - 1].filter_slot != slot;
+                let r = &mut rows[i];
+                ui.push_id(("use", i), |ui| ui.checkbox(&mut r.enabled, ""));
+                let name = match slot {
+                    Some(s) => filters.get(s as usize - 1).cloned().unwrap_or(format!("#{s}")),
+                    None => "(current)".into(),
+                };
+                ui.label(if first_of_filter { RichText::new(name) } else { RichText::new(name).weak() });
+                ui.add_enabled_ui(r.enabled, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut r.exposure)
+                            .range(0.001..=3600.0)
+                            .speed(1.0)
+                            .max_decimals(3)
+                            .suffix(" s"),
+                    )
+                });
+                ui.add_enabled_ui(r.enabled, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut r.minutes)
+                            .range(0.0..=6000.0)
+                            .speed(1.0)
+                            .custom_formatter(|m, _| fmt_duration(m * 60.0))
+                            .custom_parser(parse_minutes),
+                    )
+                    .on_hover_text("Type e.g. 90, 1:30 or 1.5 h")
+                });
+                let frames = r.frames();
+                ui.label(if r.enabled {
+                    RichText::new(format!("{frames} × {} s", r.exposure))
+                } else {
+                    RichText::new("")
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("+").on_hover_text("Another exposure with this filter").clicked() {
+                        edit = Some(RowEdit::AddExposure(i));
+                    }
+                    if !first_of_filter && ui.small_button("🗙").clicked() {
+                        edit = Some(RowEdit::Remove(i));
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        match edit {
+            Some(RowEdit::AddExposure(i)) => {
+                let row = PlanRow {
+                    enabled: true,
+                    ..p.plan_rows[i].clone()
+                };
+                p.plan_rows.insert(i + 1, row);
+            }
+            Some(RowEdit::Remove(i)) => {
+                p.plan_rows.remove(i);
+            }
+            None => {}
+        }
+
+        ui.horizontal(|ui| {
+            let ps = &mut p.plan_settings;
+            ui.label("Gain");
+            ui.push_id("plan_gain", |ui| optional_value(ui, &mut ps.gain, 100.0, 0.0..=10000.0, 1.0, ""));
+            ui.label("Offset");
+            ui.push_id("plan_off", |ui| optional_value(ui, &mut ps.offset, 50.0, 0.0..=100000.0, 1.0, ""));
+            ui.label("Bin");
+            ui.push_id("plan_bin", |ui| {
+                let mut v = ps.binning.map(f64::from);
+                optional_value(ui, &mut v, 1.0, 1.0..=8.0, 0.05, "");
+                ps.binning = v.map(|b| b.round() as u32);
+            });
+            ui.label("Sensor");
+            ui.push_id("plan_temp", |ui| optional_value(ui, &mut ps.temperature, -10.0, -60.0..=40.0, 0.5, " °C"));
+        });
+
+        let frames: u32 = p.plan_rows.iter().map(PlanRow::frames).sum();
+        let seconds: f64 = p.plan_rows.iter().map(|r| r.frames() as f64 * r.exposure).sum();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Total {}, {frames} frames", fmt_duration(seconds))).strong());
+            ui.separator();
+            ui.checkbox(&mut p.plan_replace, "Replace light steps").on_hover_text(
+                "On: the plan replaces the light steps, keeping the frames already taken \
+                 with the same settings. Off: the plan's steps are added after the others.",
+            );
+            if ui.add_enabled(frames > 0, egui::Button::new("Apply")).clicked() {
+                let seq = &mut self.draft.value.sequence;
+                plan::apply(seq, &p.plan_rows, &p.plan_settings, p.plan_replace);
+                let n = p.plan_rows.iter().filter(|r| r.frames() > 0).count();
+                self.plan_feedback = Some(if p.plan_replace {
+                    format!("Light steps replaced by {n} steps.")
+                } else {
+                    format!("Added {n} light steps.")
+                });
+            }
+        });
+        if let Some(msg) = &self.plan_feedback {
+            ui.label(RichText::new(msg).weak());
+        }
+    }
+
+    fn calibration(&mut self, ui: &mut egui::Ui, filters: &[String]) {
+        egui::CollapsingHeader::new("Add calibration frames").show(ui, |ui| {
             let p = &mut self.presets;
             let steps = &mut self.draft.value.sequence.steps;
             let mut feedback = None;
@@ -372,40 +534,6 @@ impl SequenceView {
                 (1..=filters.len() as u32).map(Some).collect()
             };
             egui::Grid::new("presets").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label(RichText::new("Lights").strong());
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut p.light_exposure).range(0.001..=7200.0).suffix(" s"));
-                    ui.label("×");
-                    ui.add(egui::DragValue::new(&mut p.light_count).range(1..=9999));
-                    for (label, set) in [("LRGB", &presets::LRGB[..]), ("SHO", &presets::SHO[..])] {
-                        if ui.button(label).clicked() {
-                            let (new, missing) = presets::filter_set(filters, set, p.light_exposure, p.light_count);
-                            feedback = Some(added(label, new.len(), &missing));
-                            steps.extend(new);
-                        }
-                    }
-                });
-                ui.end_row();
-
-                ui.label(RichText::new("Bracketing").strong());
-                ui.horizontal(|ui| {
-                    filter_combo(ui, &mut p.bracket_filter, filters);
-                    ui.add(egui::TextEdit::singleline(&mut p.bracket_exposures).desired_width(140.0))
-                        .on_hover_text("Exposure times in seconds, e.g. 10, 30, 60");
-                    ui.label("×");
-                    ui.add(egui::DragValue::new(&mut p.bracket_count).range(1..=999));
-                    if ui.button("Add").clicked() {
-                        feedback = Some(match presets::parse_exposures(&p.bracket_exposures) {
-                            Ok(e) => {
-                                steps.extend(presets::bracketing(p.bracket_filter, &e, p.bracket_count));
-                                (format!("Added {} bracketing steps.", e.len()), false)
-                            }
-                            Err(e) => (e, true),
-                        });
-                    }
-                });
-                ui.end_row();
-
                 ui.label(RichText::new("Calibration").strong());
                 ui.horizontal(|ui| {
                     ui.label("Sensor at");
@@ -467,39 +595,92 @@ impl SequenceView {
     }
 }
 
-fn added(label: &str, n: usize, missing: &[&str]) -> (String, bool) {
-    if missing.is_empty() {
-        (format!("Added {n} {label} steps."), false)
-    } else {
-        (
-            format!(
-                "Added {n} {label} steps; no filter named {} in the wheel.",
-                missing.join(", ")
-            ),
-            true,
-        )
-    }
-}
-
+/// What is left to take (all of it, before the first frame).
 fn plan_summary(seq: &Sequence) -> String {
-    let frames = seq.planned_frames();
-    let secs = seq.planned_seconds();
+    let frames = seq.remaining_frames();
     let auto = seq
         .steps
         .iter()
-        .any(|s| s.enabled && s.exposure.seconds().is_none());
-    let total_mins = (secs / 60.0).round() as u64;
-    let time = if secs < 60.0 {
-        format!("{secs:.0} s")
-    } else if total_mins >= 60 {
-        format!("{} h {} min", total_mins / 60, total_mins % 60)
+        .any(|s| s.remaining() > 0 && s.exposure.seconds().is_none());
+    let time = fmt_duration(seq.remaining_seconds());
+    let flats = if auto { " + flats" } else { "" };
+    if seq.has_progress() {
+        let planned = seq.planned_frames();
+        format!("{frames} of {planned} frames left, {time} of exposure{flats}")
     } else {
-        format!("{total_mins} min")
+        format!("{frames} frames, {time} of exposure{flats}")
+    }
+}
+
+/// "45 s", "20 min", "1 h 30 min".
+fn fmt_duration(secs: f64) -> String {
+    // An empty sum is -0.0.
+    let secs = secs.max(0.0) + 0.0;
+    let mins = (secs / 60.0).round() as u64;
+    if secs < 60.0 {
+        format!("{secs:.0} s")
+    } else if mins >= 60 {
+        format!("{} h {} min", mins / 60, mins % 60)
+    } else {
+        format!("{mins} min")
+    }
+}
+
+/// Minutes from "90", "90 min", "1:30", "1.5 h", "1 h 30 min" or "45 s".
+fn parse_minutes(text: &str) -> Option<f64> {
+    let t = text.trim().to_lowercase();
+    if let Some((h, m)) = t.split_once(':') {
+        return Some(h.trim().parse::<f64>().ok()? * 60.0 + m.trim().parse::<f64>().ok()?);
+    }
+    let mut total = 0.0;
+    let mut rest = t.as_str();
+    let mut any = false;
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let n = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+        let value: f64 = rest[..n].parse().ok()?;
+        rest = rest[n..].trim_start();
+        let u = rest.find(|c: char| !c.is_alphabetic()).unwrap_or(rest.len());
+        let scale = match &rest[..u] {
+            "" | "m" | "min" | "mins" | "minute" | "minutes" => 1.0,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 60.0,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1.0 / 60.0,
+            _ => return None,
+        };
+        rest = &rest[u..];
+        total += value * scale;
+        any = true;
+    }
+    any.then_some(total)
+}
+
+/// One row per filter (or one without a wheel), keeping extra exposures.
+fn sync_plan_rows(rows: &mut Vec<PlanRow>, filters: usize) {
+    let slots: Vec<Option<u32>> = if filters == 0 {
+        vec![None]
+    } else {
+        (1..=filters as u32).map(Some).collect()
     };
-    format!(
-        "{frames} frames, {time} of exposure{}",
-        if auto { " + flats" } else { "" }
-    )
+    rows.retain(|r| slots.contains(&r.filter_slot));
+    for slot in &slots {
+        if !rows.iter().any(|r| r.filter_slot == *slot) {
+            rows.push(PlanRow {
+                filter_slot: *slot,
+                ..Default::default()
+            });
+        }
+    }
+    // Stable: extra exposures stay under their filter, in order.
+    rows.sort_by_key(|r| r.filter_slot);
+}
+
+/// A copy of `step` to edit separately: new id (from the engine), no frames taken.
+fn fresh(step: &protocol::SequenceStep) -> protocol::SequenceStep {
+    protocol::SequenceStep {
+        id: 0,
+        done: 0,
+        ..step.clone()
+    }
 }
 
 fn progress_table(ui: &mut egui::Ui, status: &SequenceStatus) {
@@ -648,6 +829,53 @@ mod tests {
         assert_eq!(plan_summary(&lights(177.0, 20)), "20 frames, 59 min of exposure");
         assert_eq!(plan_summary(&lights(179.0, 20)), "20 frames, 1 h 0 min of exposure");
         assert_eq!(plan_summary(&lights(359.0, 20)), "20 frames, 2 h 0 min of exposure");
+        let mut part = lights(60.0, 30);
+        part.steps[0].done = 10;
+        assert_eq!(plan_summary(&part), "20 of 30 frames left, 20 min of exposure");
+        assert_eq!(plan_summary(&Sequence::default()), "0 frames, 0 s of exposure");
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_minutes("90"), Some(90.0));
+        assert_eq!(parse_minutes(" 90 min"), Some(90.0));
+        assert_eq!(parse_minutes("1:30"), Some(90.0));
+        assert_eq!(parse_minutes("1.5 h"), Some(90.0));
+        assert_eq!(parse_minutes("1h30m"), Some(90.0));
+        assert_eq!(parse_minutes("1 h 30 min"), Some(90.0));
+        assert_eq!(parse_minutes("30 s"), Some(0.5));
+        assert_eq!(parse_minutes("abc"), None);
+        assert_eq!(parse_minutes("5 parsecs"), None);
+        assert_eq!(parse_minutes(""), None);
+        // What the field shows parses back to the same value.
+        for m in [0.5, 45.0, 60.0, 90.0, 600.0] {
+            assert_eq!(parse_minutes(&fmt_duration(m * 60.0)), Some(m));
+        }
+    }
+
+    #[test]
+    fn plan_rows_follow_the_wheel() {
+        let mut rows = Vec::new();
+        sync_plan_rows(&mut rows, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].filter_slot, None);
+
+        sync_plan_rows(&mut rows, 3);
+        let slots: Vec<_> = rows.iter().map(|r| r.filter_slot).collect();
+        assert_eq!(slots, vec![Some(1), Some(2), Some(3)]);
+
+        // A second exposure for filter 1 stays with it.
+        rows.push(PlanRow {
+            filter_slot: Some(1),
+            exposure: 10.0,
+            ..Default::default()
+        });
+        sync_plan_rows(&mut rows, 3);
+        assert_eq!(rows[1].filter_slot, Some(1));
+        assert_eq!(rows[1].exposure, 10.0);
+
+        sync_plan_rows(&mut rows, 2);
+        assert_eq!(rows.len(), 3, "rows of a filter no longer in the wheel go");
     }
 
     #[test]

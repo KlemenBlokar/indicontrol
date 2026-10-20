@@ -60,7 +60,11 @@ impl Core {
     fn set_doc(&mut self, doc: DocId, value: Value) -> Result<(), serde_json::Error> {
         match doc {
             DocId::Capture => self.state.capture = serde_json::from_value(value)?,
-            DocId::Sequence => self.state.sequence_draft = serde_json::from_value(value)?,
+            DocId::Sequence => {
+                self.state.sequence_draft = serde_json::from_value(value)?;
+                // New steps get ids here, so a run can find them to record progress.
+                self.state.sequence_draft.sequence.assign_step_ids(&mut self.next_step_id);
+            }
             DocId::Goto => self.state.goto = serde_json::from_value(value)?,
             DocId::ImagingSettings => self.drafts.imaging = serde_json::from_value(value)?,
             DocId::GuiderSettings => self.drafts.guider = serde_json::from_value(value)?,
@@ -91,7 +95,7 @@ impl Core {
         }
     }
 
-    fn save_soon(&mut self) {
+    pub(super) fn save_soon(&mut self) {
         if self.save_pending {
             return;
         }

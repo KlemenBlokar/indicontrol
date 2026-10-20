@@ -9,8 +9,8 @@ use engine::EngineConfig;
 use imaging::fits::Fits;
 use protocol::sequence::presets;
 use protocol::{
-    Exposure, FrameType, ImagingSettings, IndiStatus, Roles, RunState, Sequence, SequenceStep,
-    ToEngine,
+    DocId, Exposure, FrameType, ImagingSettings, IndiStatus, Roles, RunState, Sequence, SequenceDraft,
+    SequenceStep, ToEngine,
 };
 use tokio::net::TcpListener;
 
@@ -138,15 +138,20 @@ async fn calibration_sequence_with_auto_flats() {
 async fn interleaved_lights_pause_resume_and_library() {
     let Setup { mut ui, engine, dir } = setup("lights", -10.0).await;
 
-    let names = vec!["L".to_string(), "Ha".to_string()];
-    let (mut steps, missing) = presets::filter_set(&names, &presets::SHO, 0.1, 2);
-    assert_eq!(missing, vec!["SII", "OIII"]);
-    steps.push(SequenceStep {
-        filter_slot: Some(1),
-        exposure: Exposure::Fixed { seconds: 0.2 },
-        count: 2,
-        ..Default::default()
-    });
+    let steps = vec![
+        SequenceStep {
+            filter_slot: Some(2),
+            exposure: Exposure::Fixed { seconds: 0.1 },
+            count: 2,
+            ..Default::default()
+        },
+        SequenceStep {
+            filter_slot: Some(1),
+            exposure: Exposure::Fixed { seconds: 0.2 },
+            count: 2,
+            ..Default::default()
+        },
+    ];
     let seq = Sequence {
         name: "Ha+L".into(),
         object: "M 42".into(),
@@ -206,6 +211,89 @@ async fn interleaved_lights_pause_resume_and_library() {
     })
     .await;
     ui.until("stopped", |u| u.state.sequence.is_none()).await;
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn draft(ui: &TestUi) -> Sequence {
+    let value = ui.state.docs.get(&DocId::Sequence).cloned().unwrap_or_default();
+    serde_json::from_value::<SequenceDraft>(value).unwrap_or_default().sequence
+}
+
+fn done(ui: &TestUi) -> Vec<u32> {
+    draft(ui).steps.iter().map(|s| s.done).collect()
+}
+
+#[tokio::test]
+async fn progress_survives_abort_and_restart() {
+    let Setup { mut ui, engine, dir } = setup("progress", -10.0).await;
+    let step = |slot, count| SequenceStep {
+        filter_slot: Some(slot),
+        exposure: Exposure::Fixed { seconds: 0.1 },
+        count,
+        ..Default::default()
+    };
+    let seq = Sequence {
+        steps: vec![step(1, 3), step(2, 2)],
+        dither_every: 0,
+        meridian_flip: false,
+        ..Default::default()
+    };
+    let edit = ToEngine::EditDoc {
+        doc: DocId::Sequence,
+        seq: 1,
+        ops: vec![("/sequence".into(), serde_json::to_value(&seq).unwrap())],
+    };
+    ui.send(edit).await;
+    ui.until("ids", |u| {
+        let d = draft(u);
+        d.steps.len() == 2 && d.steps.iter().all(|s| s.id != 0) && d.steps[0].id != d.steps[1].id
+    })
+    .await;
+
+    // Run part of it: the engine records each frame in the draft.
+    ui.send(ToEngine::StartSequence(draft(&ui))).await;
+    ui.until("two frames", |u| done(u)[0] >= 2).await;
+    ui.send(ToEngine::AbortSequence).await;
+    ui.until("aborted", |u| u.state.sequence.is_none()).await;
+    let after_abort = done(&ui);
+    assert!(after_abort[0] >= 2 && after_abort.iter().sum::<u32>() < 5, "{after_abort:?}");
+
+    // Restart on the same state file once the draft is saved.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    engine.shutdown();
+    drop(ui);
+    let indi = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = indi.local_addr().unwrap().port();
+    tokio::spawn(fake_indi(indi, -10.0));
+    let engine = engine::start(EngineConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        web_root: None,
+        state_file: Some(dir.join("engine.json")),
+        indi: Some(("127.0.0.1".into(), port)),
+    })
+    .await
+    .unwrap();
+    let mut ui = TestUi::connect(&engine.ws_url()).await;
+    ui.until("progress restored", |u| {
+        u.state.indi_status == IndiStatus::Connected && done(u) == after_abort
+    })
+    .await;
+
+    // Starting again takes only what is missing.
+    ui.send(ToEngine::StartSequence(draft(&ui))).await;
+    let taken: u32 = after_abort.iter().sum();
+    let continues = format!("continues: {taken} of 5 frames already taken");
+    ui.until("continues", |u| u.state.log.iter().any(|l| l.text.contains(&continues))).await;
+    ui.until("complete", |u| u.state.sequence.is_none() && done(u) == vec![3, 2]).await;
+    assert_eq!(fits_files(&dir.join("out")).len(), 5, "no frame taken twice");
+
+    ui.send(ToEngine::StartSequence(draft(&ui))).await;
+    ui.until("nothing left", |u| {
+        u.state.log.iter().any(|l| l.text.contains("every step is complete"))
+    })
+    .await;
 
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);

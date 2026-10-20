@@ -79,9 +79,27 @@ end of the signal sits above 0 in noise sigmas, and saturated pixels.
 
 The Sequence tab builds a list of steps, each with frame type, filter,
 exposure, count, and optional binning, gain, offset and sensor temperature.
-Steps run one after another or interleaved (LRGBLRGB…). Presets add
-LRGB or SHO lights (filters are found by name in the wheel), exposure
-bracketing, darks, bias, flats and dark flats.
+Steps run one after another or interleaved (LRGBLRGB…).
+
+**Plan light frames** is the quick way to fill in the steps. It has a row
+for each filter in the wheel: tick the filters to use (LRGB and SHO pick
+them by name), set an exposure and the total time you want, and the number
+of frames follows. Add a second row for a filter for another exposure, for
+example a short one for a bright core. Gain, offset, binning and sensor
+temperature apply to all rows. Apply turns the plan into steps, which can
+still be edited by hand:
+
+- **Replace light steps** (the default) swaps the light steps for the plan's.
+  Frames already taken carry over to the step with the same filter,
+  exposure, binning, gain and offset, so raising L from 2 h to 3 h adds
+  only the missing hour.
+- Otherwise the plan's steps are added after the existing ones.
+
+Calibration presets add darks, bias, flats and dark flats.
+
+**Progress** is kept with each step (the Done column). After an abort, an
+engine restart or a cloudy night, the sequence continues with only the
+frames still missing. Reset progress starts every step from zero.
 
 - **Flats** use automatic exposure. Test frames, which are not saved, adjust
   the exposure until the brightest channel's median sits at the target
