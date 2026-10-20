@@ -283,12 +283,6 @@ impl Core {
                 self.send_guider();
                 Ok(())
             }
-            ToEngine::CreateMaster { kind, step } => {
-                if let Err(e) = self.create_master(kind, step) {
-                    self.log(None, format!("Cannot make the master: {e}"), LogLevel::Error);
-                }
-                Ok(())
-            }
             ToEngine::RescanMasters => {
                 self.rescan_masters();
                 Ok(())

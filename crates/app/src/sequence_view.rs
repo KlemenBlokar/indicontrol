@@ -7,7 +7,7 @@ use protocol::sequence::plan::{self, PlanRow, PlanSettings};
 use protocol::sequence::presets;
 use protocol::{
     Exposure, FlatCalibration, FrameType, MasterFrame, MasterKind, Need, Purpose, RunState, Sequence, SequenceDraft, SequenceOrder,
-    SequenceStatus, SharedDoc, ToEngine, UiState,
+    SequenceStatus, Setup, SharedDoc, ToEngine, UiState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,12 @@ pub struct PresetForm {
     dark_count: u32,
     bias_count: u32,
     calib_temperature: Option<f64>,
+    calib_gain: Option<f64>,
+    calib_offset: Option<f64>,
+    calib_binning: Option<u32>,
     flat_count: u32,
+    /// 1-based slots to make flats (and dark flats) for.
+    flat_filters: Vec<u32>,
 }
 
 impl Default for PresetForm {
@@ -43,7 +48,11 @@ impl Default for PresetForm {
             dark_count: 30,
             bias_count: 50,
             calib_temperature: Some(-10.0),
+            calib_gain: None,
+            calib_offset: None,
+            calib_binning: None,
             flat_count: 25,
+            flat_filters: Vec::new(),
         }
     }
 }
@@ -55,8 +64,6 @@ pub struct SequenceView {
     library_pick: Option<String>,
     feedback: Option<(String, bool)>,
     plan_feedback: Option<String>,
-    /// The needed master whose Create form is open: kind, purpose, what.
-    create_master: Option<(MasterKind, Purpose, String)>,
 }
 
 impl SequenceView {
@@ -67,7 +74,6 @@ impl SequenceView {
             library_pick: None,
             feedback: None,
             plan_feedback: None,
-            create_master: None,
         }
     }
 
@@ -105,7 +111,7 @@ impl SequenceView {
                     ui.separator();
                     self.masters(ui, state, actions);
                     ui.separator();
-                    self.calibration(ui, &filters);
+                    self.calibration(ui, state, &filters);
                 });
             });
         egui::CentralPanel::default().show(ui, |ui| imaging.image_panel(ui, state));
@@ -115,14 +121,17 @@ impl SequenceView {
         let Some(status) = &state.sequence else {
             ui.horizontal(|ui| {
                 let seq = &self.draft.value.sequence;
-                let ready = seq.remaining_frames() > 0;
+                let mixed = seq.setup().err();
+                let ready = seq.remaining_frames() > 0 && mixed.is_none();
                 let label = if seq.has_progress() { "⏵ Continue sequence" } else { "⏵ Start sequence" };
                 if ui
                     .add_enabled(ready, egui::Button::new(RichText::new(label).strong()))
-                    .on_disabled_hover_text(if seq.planned_frames() > 0 {
-                        "Every step is complete: reset the progress to take them again"
-                    } else {
-                        "Add steps first"
+                    .on_disabled_hover_text(match &mixed {
+                        Some(why) => capitalised(why),
+                        None if seq.planned_frames() > 0 => {
+                            "Every step is complete: reset the progress to take them again".into()
+                        }
+                        None => "Add steps first".into(),
                     })
                     .clicked()
                 {
@@ -558,19 +567,13 @@ impl SequenceView {
 
         let m = &state.masters;
         let needs = protocol::masters::needs(&self.draft.value.sequence, state);
-        // Making a master runs a sequence of its own.
-        let busy = if state.sequence.is_some() {
-            Some("a sequence is running")
-        } else if m.creating.is_some() {
-            Some("a master is being made")
-        } else {
-            None
-        };
-        let key = |n: &Need| (n.kind, n.purpose, n.what.clone());
-        if needs.is_empty() {
+        let makes_masters = matches!(self.draft.value.sequence.setup(), Ok(Some(Setup::Covered | Setup::Panel)));
+        if makes_masters {
+            ui.label(RichText::new("These calibration steps each make a master when complete.").weak());
+        } else if needs.is_empty() {
             ui.label(RichText::new("No enabled light steps, so no masters needed.").weak());
         } else {
-            egui::Grid::new("masters_needed").striped(true).num_columns(5).show(ui, |ui| {
+            egui::Grid::new("masters_needed").striped(true).num_columns(4).show(ui, |ui| {
                 for n in &needs {
                     ui.label(need_name(n));
                     ui.label(RichText::new(match n.purpose {
@@ -580,68 +583,21 @@ impl SequenceView {
                     .weak());
                     ui.label(&n.what);
                     need_status(ui, n);
-                    let open = self.create_master.as_ref() == Some(&key(n));
-                    let label = if n.found.is_some() { "New…" } else { "Create…" };
-                    let hover = if n.found.is_some() {
-                        "Take frames and make a new master to replace this one"
-                    } else {
-                        "Take frames and average them into this master"
-                    };
-                    let button = ui.add_enabled(
-                        busy.is_none() && n.spec.is_some(),
-                        egui::Button::selectable(open, label).small(),
-                    );
-                    let button = match (busy, &n.spec) {
-                        (Some(why), _) => button.on_disabled_hover_text(format!("Not now: {why}")),
-                        (None, None) => button.on_disabled_hover_text("Make the flat first"),
-                        _ => button.on_hover_text(hover),
-                    };
-                    if button.clicked() {
-                        self.create_master = if open { None } else { Some(key(n)) };
-                    }
                     ui.end_row();
                 }
             });
-        }
-        if let Some(text) = &m.creating {
-            ui.colored_label(theme::c(ui, YELLOW), format!("{text}…"));
-        }
-        // The open Create form, while its master is still needed.
-        let open = self.create_master.clone().and_then(|k| needs.iter().find(|n| key(n) == k));
-        if let Some(n) = open {
-            let p = &mut self.presets;
-            let frames = match n.kind {
-                MasterKind::Dark => &mut p.dark_count,
-                MasterKind::Bias => &mut p.bias_count,
-                MasterKind::Flat => &mut p.flat_count,
-            };
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new(format!("New master {}: {}", need_name(n).to_lowercase(), n.what)).strong());
-                ui.horizontal(|ui| {
-                    ui.label("Average");
-                    ui.add(egui::DragValue::new(frames).range(1..=500));
-                    ui.label("frames");
-                });
-                ui.colored_label(theme::c(ui, ORANGE), n.setup_hint());
+            if needs.iter().any(|n| n.found.is_none()) {
                 ui.label(
                     RichText::new(
-                        "The frames are saved like any others; the master goes into the masters folder.",
+                        "To make the missing ones: \"Fill in from the plan\" under Add calibration frames, \
+                         save these steps to the library, clear them and add the calibration steps.",
                     )
                     .weak(),
                 );
-                ui.horizontal(|ui| {
-                    let step = n.capture_step(*frames);
-                    if ui.add_enabled(busy.is_none() && step.is_some(), egui::Button::new("Start")).clicked()
-                        && let Some(step) = step
-                    {
-                        actions.push(ToEngine::CreateMaster { kind: n.kind, step });
-                        self.create_master = None;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.create_master = None;
-                    }
-                });
-            });
+            }
+        }
+        if let Some(text) = &m.creating {
+            ui.colored_label(theme::c(ui, YELLOW), format!("{text}…"));
         }
 
         ui.horizontal(|ui| {
@@ -686,21 +642,83 @@ impl SequenceView {
         }
     }
 
-    fn calibration(&mut self, ui: &mut egui::Ui, filters: &[String]) {
+    /// Calibration steps, each averaged into a master when complete. A
+    /// sequence takes one kind of frames: covered (darks, bias) or flats.
+    fn calibration(&mut self, ui: &mut egui::Ui, state: &UiState, filters: &[String]) {
         egui::CollapsingHeader::new("Add calibration frames").show(ui, |ui| {
-            let p = &mut self.presets;
+            ui.label(
+                RichText::new(
+                    "Each dark, bias or flat step is averaged into a master in the masters folder when it is complete.",
+                )
+                .weak(),
+            );
+            if ui
+                .small_button("Fill in from the plan")
+                .on_hover_text(
+                    "The camera settings of the light steps, and the exposures and filters still without a master. \
+                     Then save the lights to the library, clear the steps and add these.",
+                )
+                .clicked()
+            {
+                self.feedback = Some((self.fill_from_plan(state), false));
+            }
+            let current = self.draft.value.sequence.setup();
             let steps = &mut self.draft.value.sequence.steps;
+            let p = &mut self.presets;
             let mut feedback = None;
-            let all_filters: Vec<Option<u32>> = if filters.is_empty() {
-                vec![None]
-            } else {
-                (1..=filters.len() as u32).map(Some).collect()
+            // Adds `new` with the camera settings, unless the steps are of
+            // another kind.
+            let mut add = |new: Vec<protocol::SequenceStep>, what: &str, p: &PresetForm| -> (String, bool) {
+                if new.is_empty() {
+                    return ("Pick the filters first.".into(), true);
+                }
+                steps.extend(new.into_iter().map(|s| protocol::SequenceStep {
+                    gain: p.calib_gain,
+                    offset: p.calib_offset,
+                    binning: p.calib_binning,
+                    ..s
+                }));
+                (format!("Added {what}."), false)
+            };
+            // Enabled when the steps are empty or of the same kind.
+            let button = |ui: &mut egui::Ui, label: &str, setup: Setup, hover: &str| {
+                let refusal = match &current {
+                    Ok(Some(s)) if *s != setup => Some(format!(
+                        "The steps need {}; these need {}. Save the steps to the library and clear them first.",
+                        s.label(),
+                        setup.label()
+                    )),
+                    Err(why) => Some(capitalised(why)),
+                    _ => None,
+                };
+                let b = ui.add_enabled(refusal.is_none(), egui::Button::new(label));
+                match refusal {
+                    Some(why) => b.on_disabled_hover_text(why),
+                    None => b.on_hover_text(hover),
+                }
+                .clicked()
             };
             egui::Grid::new("presets").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label(RichText::new("Calibration").strong());
+                ui.label("Camera");
                 ui.horizontal(|ui| {
-                    ui.label("Sensor at");
-                    optional_value(ui, &mut p.calib_temperature, -10.0, -60.0..=40.0, 0.5, " °C");
+                    ui.label("Gain");
+                    ui.push_id("calib_gain", |ui| optional_value(ui, &mut p.calib_gain, 100.0, 0.0..=10000.0, 1.0, ""));
+                    ui.label("Offset");
+                    ui.push_id("calib_off", |ui| optional_value(ui, &mut p.calib_offset, 50.0, 0.0..=100000.0, 1.0, ""));
+                    ui.label("Bin");
+                    ui.push_id("calib_bin", |ui| {
+                        let mut v = p.calib_binning.map(f64::from);
+                        optional_value(ui, &mut v, 1.0, 1.0..=8.0, 0.05, "");
+                        p.calib_binning = v.map(|b| b.round() as u32);
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Sensor at");
+                ui.horizontal(|ui| {
+                    ui.push_id("calib_temp", |ui| {
+                        optional_value(ui, &mut p.calib_temperature, -10.0, -60.0..=40.0, 0.5, " °C")
+                    });
                     ui.label(RichText::new("(darks & bias)").weak());
                 });
                 ui.end_row();
@@ -708,42 +726,77 @@ impl SequenceView {
                 ui.label("Darks");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut p.dark_exposures).desired_width(140.0))
-                        .on_hover_text("Exposure times in seconds");
-                    ui.label("×");
-                    ui.add(egui::DragValue::new(&mut p.dark_count).range(1..=999));
-                    if ui.button("Add").clicked() {
-                        feedback = Some(match presets::parse_exposures(&p.dark_exposures) {
+                        .on_hover_text("Exposure times in seconds: a step and a master each");
+                    ui.label("s ×");
+                    ui.add(egui::DragValue::new(&mut p.dark_count).range(1..=500));
+                    if button(ui, "Add darks", Setup::Covered, "A step per exposure, with the telescope covered") {
+                        match presets::parse_exposures(&p.dark_exposures) {
+                            Ok(e) if e.is_empty() => feedback = Some(("Enter the exposure times.".into(), true)),
                             Ok(e) => {
-                                steps.extend(presets::darks(&e, p.dark_count, p.calib_temperature));
-                                (format!("Added {} dark steps.", e.len()), false)
+                                let n = e.len();
+                                feedback = Some(add(
+                                    presets::darks(&e, p.dark_count, p.calib_temperature),
+                                    &plural(n, "dark step"),
+                                    p,
+                                ))
                             }
-                            Err(e) => (e, true),
-                        });
+                            Err(e) => feedback = Some((e, true)),
+                        }
                     }
                 });
                 ui.end_row();
 
                 ui.label("Bias");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut p.bias_count).range(1..=999));
-                    if ui.button("Add").clicked() {
-                        steps.push(presets::bias(p.bias_count, p.calib_temperature));
-                        feedback = Some(("Added a bias step.".into(), false));
+                    ui.add(egui::DragValue::new(&mut p.bias_count).range(1..=500));
+                    ui.label("frames");
+                    if button(ui, "Add bias", Setup::Covered, "Shortest exposures, with the telescope covered") {
+                        feedback = Some(add(vec![presets::bias(p.bias_count, p.calib_temperature)], "a bias step", p));
                     }
                 });
                 ui.end_row();
 
                 ui.label("Flats");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut p.flat_count).range(1..=999));
-                    ui.label("per filter");
-                    if ui.button("Add flats").on_hover_text("Auto exposure to ~45 % of full scale").clicked() {
-                        steps.extend(presets::flats(&all_filters, p.flat_count));
-                        feedback = Some((format!("Added {} flat steps.", all_filters.len()), false));
+                ui.horizontal_wrapped(|ui| {
+                    for (i, name) in filters.iter().enumerate() {
+                        let slot = i as u32 + 1;
+                        let mut on = p.flat_filters.contains(&slot);
+                        if ui.checkbox(&mut on, name).changed() {
+                            p.flat_filters.retain(|&s| s != slot);
+                            if on {
+                                p.flat_filters.push(slot);
+                                p.flat_filters.sort_unstable();
+                            }
+                        }
                     }
-                    if ui.button("Add dark flats").on_hover_text("Same exposure as the matching flats").clicked() {
-                        steps.extend(presets::dark_flats(&all_filters, p.flat_count));
-                        feedback = Some((format!("Added {} dark-flat steps.", all_filters.len()), false));
+                    if !filters.is_empty() && ui.small_button("All").clicked() {
+                        p.flat_filters = (1..=filters.len() as u32).collect();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut p.flat_count).range(1..=500));
+                    ui.label("frames each");
+                    // Without a wheel, the flats are taken through whatever is in.
+                    let slots: Vec<Option<u32>> = if filters.is_empty() {
+                        vec![None]
+                    } else {
+                        p.flat_filters.iter().filter(|&&s| s as usize <= filters.len()).map(|&s| Some(s)).collect()
+                    };
+                    if button(ui, "Add flats", Setup::Panel, "A step per filter, auto exposure to ~45 % of full scale") {
+                        let n = slots.len();
+                        feedback = Some(add(presets::flats(&slots, p.flat_count), &plural(n, "flat step"), p));
+                    }
+                    if button(
+                        ui,
+                        "Add dark flats",
+                        Setup::Covered,
+                        "A step per filter at the exposure its flats took, with the telescope covered",
+                    ) {
+                        let n = slots.len();
+                        feedback = Some(add(presets::dark_flats(&slots, p.flat_count), &plural(n, "dark-flat step"), p));
                     }
                 });
                 ui.end_row();
@@ -756,6 +809,63 @@ impl SequenceView {
             }
         });
     }
+
+    /// Camera settings of the first light step, and the dark exposures
+    /// and flat filters still without a master (all of them if none is
+    /// missing).
+    fn fill_from_plan(&mut self, state: &UiState) -> String {
+        let seq = &self.draft.value.sequence;
+        let needs = protocol::masters::needs(seq, state);
+        let Some(first) = needs.first() else {
+            return "The plan has no light steps.".into();
+        };
+        let p = &mut self.presets;
+        // The values the lights will be taken with, the camera's current
+        // ones where the step leaves them.
+        let light = &first.light;
+        let spec = first.spec.as_ref();
+        p.calib_gain = spec.and_then(|s| s.gain).or(light.gain);
+        p.calib_offset = spec.and_then(|s| s.offset).or(light.offset);
+        p.calib_binning = light.binning.or(spec.map(|s| s.binning));
+        p.calib_temperature = light.temperature;
+        let missing: Vec<&Need> = needs.iter().filter(|n| n.found.is_none()).collect();
+        let pick = if missing.is_empty() { needs.iter().collect() } else { missing };
+        let mut exposures: Vec<f64> = Vec::new();
+        let mut slots: Vec<u32> = Vec::new();
+        for n in &pick {
+            match (n.kind, n.purpose, &n.spec) {
+                (MasterKind::Dark, Purpose::Lights, Some(spec)) if !exposures.contains(&spec.exposure) => {
+                    exposures.push(spec.exposure)
+                }
+                (MasterKind::Flat, _, _) => slots.extend(n.light.filter_slot),
+                _ => {}
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        if !exposures.is_empty() {
+            exposures.sort_by(f64::total_cmp);
+            p.dark_exposures = exposures.iter().map(|e| protocol::masters::seconds(*e)).collect::<Vec<_>>().join(", ");
+        }
+        if !slots.is_empty() {
+            p.flat_filters = slots;
+        }
+        if pick.len() < needs.len() {
+            "Filled in what the plan is missing.".into()
+        } else {
+            "Nothing is missing; filled in all the plan uses.".into()
+        }
+    }
+}
+
+/// "3 dark steps", "1 flat step".
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn need_name(n: &Need) -> &'static str {
@@ -898,6 +1008,7 @@ fn fresh(step: &protocol::SequenceStep) -> protocol::SequenceStep {
     protocol::SequenceStep {
         id: 0,
         done: 0,
+        frames: Vec::new(),
         ..step.clone()
     }
 }

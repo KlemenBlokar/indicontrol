@@ -78,27 +78,19 @@ fn fits_files(dir: &Path) -> Vec<PathBuf> {
 async fn calibration_sequence_with_auto_flats() {
     let Setup { mut ui, engine, dir } = setup("calib", 0.0).await;
 
-    let mut steps = presets::darks(&[0.5], 2, Some(-10.0));
-    steps.extend(presets::flats(&[Some(2)], 2));
-    steps.extend(presets::dark_flats(&[Some(2)], 1));
-    let seq = Sequence {
-        name: "Calibration".into(),
-        steps,
-        ..Default::default()
-    };
-    ui.send(ToEngine::StartSequence(seq)).await;
-    ui.until("sequence start", |u| u.state.sequence.is_some()).await;
-    ui.until("sequence end", |u| {
-        u.state.sequence.is_none() && u.state.log.iter().any(|l| l.text.contains("complete"))
-    })
-    .await;
-    assert!(
-        ui.state.log.iter().any(|l| l.text == "Calibration complete: 5 frames"),
-        "{:#?}",
-        ui.state.log
-    );
+    // Covered and flat-panel frames do not share a sequence.
+    let mut mixed = presets::darks(&[0.5], 2, Some(-10.0));
+    mixed.extend(presets::flats(&[Some(2)], 2));
+    ui.send(ToEngine::StartSequence(Sequence { steps: mixed, ..Default::default() })).await;
+    ui.until("mixed refused", |u| u.state.log.iter().any(|l| l.text.contains("separate sequences"))).await;
 
-    let files = fits_files(&dir.join("out"));
+    // Flats first: the dark flats take their exposure.
+    run(&mut ui, "Darks", presets::darks(&[0.5], 2, Some(-10.0))).await;
+    run(&mut ui, "Flats", presets::flats(&[Some(2)], 2)).await;
+    run(&mut ui, "Dark flats", presets::dark_flats(&[Some(2)], 1)).await;
+
+    let files: Vec<PathBuf> =
+        fits_files(&dir.join("out")).into_iter().filter(|p| !p.starts_with(dir.join("out/masters"))).collect();
     let rel: Vec<String> = files
         .iter()
         .map(|p| p.strip_prefix(dir.join("out")).unwrap().display().to_string())
@@ -125,6 +117,13 @@ async fn calibration_sequence_with_auto_flats() {
     assert_eq!(df.header.get_str("IMAGETYP"), Some("Dark Frame"));
     assert_eq!(df.header.get_f64("EXPTIME"), Some(flat_exposure));
 
+    // A master per step.
+    let kinds: Vec<_> = ui.state.masters.masters.iter().map(|m| (m.kind, m.filter.clone(), m.frames)).collect();
+    use protocol::MasterKind::*;
+    for want in [(Dark, Some("L".to_string()), Some(2)), (Flat, Some("Ha".to_string()), Some(2)), (Dark, Some("Ha".to_string()), Some(1))] {
+        assert!(kinds.contains(&want), "{want:?} in {kinds:?}");
+    }
+
     // The flat exposure is remembered across restarts.
     let saved = engine::PersistedState::load(&dir.join("engine.json"));
     assert_eq!(saved.flat_exposures.len(), 1);
@@ -133,6 +132,18 @@ async fn calibration_sequence_with_auto_flats() {
 
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Run `steps` as sequence `name` and wait for it and its masters.
+async fn run(ui: &mut TestUi, name: &str, steps: Vec<SequenceStep>) {
+    let masters = ui.state.masters.masters.len();
+    let seq = Sequence { name: name.into(), steps, ..Default::default() };
+    ui.send(ToEngine::StartSequence(seq)).await;
+    let complete = format!("{name} complete");
+    ui.until(&complete, |u| u.state.sequence.is_none() && u.state.log.iter().any(|l| l.text.starts_with(&complete)))
+        .await;
+    ui.until("its master", |u| u.state.masters.creating.is_none() && u.state.masters.masters.len() == masters + 1)
+        .await;
 }
 
 #[tokio::test]
@@ -301,42 +312,48 @@ async fn progress_survives_abort_and_restart() {
 }
 
 #[tokio::test]
-async fn creates_a_master_dark() {
+async fn a_complete_dark_step_makes_a_master() {
     let Setup { mut ui, engine, dir } = setup("master", 0.0).await;
-    let step = SequenceStep {
-        frame_type: FrameType::Dark,
-        exposure: Exposure::Fixed { seconds: 0.1 },
-        count: 3,
+    let seq = Sequence {
+        steps: vec![SequenceStep {
+            frame_type: FrameType::Dark,
+            exposure: Exposure::Fixed { seconds: 0.1 },
+            count: 4,
+            ..Default::default()
+        }],
         ..Default::default()
     };
-    // The wrong kind of frames is refused.
-    ui.send(ToEngine::CreateMaster {
-        kind: protocol::MasterKind::Flat,
-        step: step.clone(),
-    })
-    .await;
-    ui.until("refused", |u| u.state.log.iter().any(|l| l.text.contains("needs flat frames"))).await;
+    let edit = ToEngine::EditDoc {
+        doc: DocId::Sequence,
+        seq: 1,
+        ops: vec![("/sequence".into(), serde_json::to_value(&seq).unwrap())],
+    };
+    ui.send(edit).await;
+    ui.until("id", |u| draft(u).steps.first().is_some_and(|s| s.id != 0)).await;
 
-    ui.send(ToEngine::CreateMaster {
-        kind: protocol::MasterKind::Dark,
-        step,
-    })
-    .await;
-    ui.until("taking frames", |u| u.state.masters.creating.is_some()).await;
+    // Interrupted: no master yet, but the frames taken are recorded.
+    ui.send(ToEngine::StartSequence(draft(&ui))).await;
+    ui.until("two frames", |u| done(u)[0] >= 2).await;
+    ui.send(ToEngine::AbortSequence).await;
+    ui.until("aborted", |u| u.state.sequence.is_none()).await;
+    let taken = draft(&ui).steps[0].clone();
+    assert_eq!(taken.frames.len() as u32, taken.done);
+    assert!(ui.state.masters.masters.is_empty() && ui.state.masters.creating.is_none());
+
+    // Continued: the step completes and all four frames are averaged.
+    ui.send(ToEngine::StartSequence(draft(&ui))).await;
     ui.until("master in the folder", |u| {
         let m = &u.state.masters;
-        m.creating.is_none() && m.masters.iter().any(|f| f.kind == protocol::MasterKind::Dark && f.frames == Some(3))
+        m.creating.is_none() && m.masters.iter().any(|f| f.kind == protocol::MasterKind::Dark && f.frames == Some(4))
     })
     .await;
     let master = &ui.state.masters.masters[0];
     assert_eq!(master.exposure, Some(0.1));
     assert!(master.path.starts_with("master_dark_0.1s_"), "{}", master.path);
     // The raw frames stay where frames go, the master in the masters folder.
-    let raws = fits_files(&dir.join("out/Dark"));
-    assert_eq!(raws.len(), 3, "{raws:?}");
+    assert_eq!(fits_files(&dir.join("out/Dark")).len(), 4);
     assert!(dir.join("out/masters").join(&master.path).is_file());
-    // The draft is not touched.
-    assert!(draft(&ui).steps.is_empty());
+    assert_eq!(draft(&ui).steps[0].frames.len(), 4);
 
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);

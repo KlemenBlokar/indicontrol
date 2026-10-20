@@ -1,12 +1,13 @@
 //! Calibration masters: the masters folder is read in the background (at
 //! start, every minute, when the settings change and on request) and the
-//! result sent to all UIs. Missing masters are made by running a one-step
-//! sequence and averaging the frames it kept.
+//! result sent to all UIs. Each completed dark, bias or flat step of a
+//! sequence is averaged into a master there.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use protocol::{Exposure, FrameType, LogLevel, MasterKind, MastersStatus, Sequence, SequenceStep, ToUi};
+use protocol::{FrameType, LogLevel, MasterKind, MastersStatus, SequenceStep, ToUi};
 
 use super::{Core, CoreMsg};
 
@@ -19,20 +20,11 @@ pub(super) struct MastersScan {
     running: bool,
     /// Asked for again while running.
     again: bool,
-    /// What is being made, shown with the status.
+    /// What is being stacked, shown with the status.
     creating: Option<String>,
+    /// Completed steps waiting for their turn.
+    queue: VecDeque<(MasterKind, Vec<PathBuf>)>,
 }
-
-/// A sequence run taking a master's frames.
-#[derive(Debug)]
-pub(crate) struct MasterJob {
-    kind: MasterKind,
-    /// The kept frames, as saved.
-    pub frames: Vec<PathBuf>,
-}
-
-/// Frames to average, at most.
-const MAX_FRAMES: u32 = 500;
 
 impl Core {
     pub(super) fn masters_folder(&self) -> PathBuf {
@@ -81,53 +73,40 @@ impl Core {
         self.send(self.masters_msg());
     }
 
-    pub(super) fn create_master(&mut self, kind: MasterKind, step: SequenceStep) -> Result<(), String> {
-        let wanted = match kind {
-            MasterKind::Dark => FrameType::Dark,
-            MasterKind::Flat => FrameType::Flat,
-            MasterKind::Bias => FrameType::Bias,
+    /// `step` has all its frames: average them into a master, after the
+    /// ones already waiting.
+    pub(super) fn stack_master(&mut self, step: &SequenceStep) {
+        let kind = match step.frame_type {
+            FrameType::Dark => MasterKind::Dark,
+            FrameType::Bias => MasterKind::Bias,
+            FrameType::Flat => MasterKind::Flat,
+            FrameType::Light => return,
         };
-        if step.frame_type != wanted {
-            return Err(format!("a master {} needs {} frames", kind.label(), wanted.label().to_lowercase()));
+        let frames: Vec<PathBuf> = step.frames.iter().map(PathBuf::from).collect();
+        if frames.is_empty() {
+            return;
         }
-        if step.count < 1 || step.count > MAX_FRAMES {
-            return Err(format!("take between 1 and {MAX_FRAMES} frames"));
+        if (frames.len() as u32) < step.count {
+            let text = format!(
+                "Only {} of the {} {} frames are known (taken before they were recorded); stacking those",
+                frames.len(),
+                step.count,
+                kind.label()
+            );
+            self.log(None, text, LogLevel::Warning);
         }
-        if self.masters.creating.is_some() {
-            return Err("a master is still being stacked; wait for it".into());
+        self.masters.queue.push_back((kind, frames));
+        if self.masters.creating.is_none() {
+            self.stack_next();
         }
-        let what = match (&step.exposure, kind) {
-            (Exposure::Fixed { seconds }, MasterKind::Dark) => format!("dark {}", super::sequence::fmt_seconds(*seconds)),
-            _ => kind.label().to_owned(),
-        };
-        let seq = Sequence {
-            name: format!("Master {what}"),
-            steps: vec![SequenceStep {
-                enabled: true,
-                id: 0,
-                done: 0,
-                ..step
-            }],
-            target: None,
-            center_on_start: false,
-            meridian_flip: false,
-            dither_every: 0,
-            autofocus: Default::default(),
-            ..Default::default()
-        };
-        self.start_sequence(seq)?;
-        if let Some(run) = &mut self.run {
-            run.master = Some(MasterJob { kind, frames: Vec::new() });
-        }
-        self.set_creating(Some(format!("Taking frames for the master {what}")));
-        Ok(())
     }
 
-    /// The master's frames are in: average them in the background.
-    pub(super) fn stack_master(&mut self, job: MasterJob) {
-        let MasterJob { kind, frames } = job;
-        let n = frames.len();
-        let text = format!("Stacking {n} {} frames", kind.label());
+    fn stack_next(&mut self) {
+        let Some((kind, frames)) = self.masters.queue.pop_front() else {
+            self.set_creating(None);
+            return;
+        };
+        let text = format!("Stacking {} {} frames", frames.len(), kind.label());
         self.log(None, format!("{text} into a master"), LogLevel::Info);
         self.set_creating(Some(text));
         let folder = self.masters_folder();
@@ -151,14 +130,7 @@ impl Core {
             }
             Err(e) => self.log(None, format!("Could not make the master: {e}"), LogLevel::Error),
         }
-        self.set_creating(None);
         self.rescan_masters();
-    }
-
-    /// The master run ended early: nothing to stack.
-    pub(super) fn master_abandoned(&mut self) {
-        if self.masters.creating.is_some() {
-            self.set_creating(None);
-        }
+        self.stack_next();
     }
 }

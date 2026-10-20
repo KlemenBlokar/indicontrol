@@ -6,7 +6,7 @@ use std::time::Duration;
 use protocol::equipment::{self, Control};
 use guiding::SettleOutcome;
 use protocol::{
-    CaptureRequest, Exposure, FlatRecord, FrameType, LogLevel, RunState, Sequence, SequenceOrder,
+    CaptureRequest, Exposure, FlatRecord, FrameType, LogLevel, RunState, Sequence, SequenceOrder, Setup,
     SequenceStatus, ToUi,
 };
 
@@ -37,8 +37,6 @@ pub(crate) struct Run {
     focused_once: bool,
     last_focus_filter: Option<u32>,
     focus_after_flip: bool,
-    /// The frames are for a master, stacked when the run completes.
-    pub(super) master: Option<super::calibration::MasterJob>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,11 +91,20 @@ impl Core {
         if seq.planned_frames() == 0 {
             return Err("the sequence has no enabled frames".into());
         }
+        if seq.setup()? != Some(Setup::Sky) {
+            // Calibration frames: nothing to point at.
+            seq.target = None;
+            seq.center_on_start = false;
+            seq.meridian_flip = false;
+            seq.dither_every = 0;
+            seq.autofocus = Default::default();
+        }
         // The engine's draft has the latest progress of the steps it shares.
         let draft = &self.state.sequence_draft.sequence;
         for step in &mut seq.steps {
             if let Some(d) = draft.steps.iter().find(|d| d.id != 0 && d.id == step.id) {
                 step.done = d.done;
+                step.frames = d.frames.clone();
             }
         }
         seq.assign_step_ids(&mut self.next_step_id);
@@ -130,7 +137,6 @@ impl Core {
             focused_once: false,
             last_focus_filter: None,
             focus_after_flip: false,
-            master: None,
         });
         let started = if taken > 0 {
             format!("{name} continues: {taken} of {planned} frames already taken")
@@ -181,25 +187,19 @@ impl Core {
     }
 
     pub(super) fn abort_sequence(&mut self) {
-        if let Some(run) = self.run.take() {
+        if self.run.take().is_some() {
             self.abort_solve();
             self.abort_autofocus();
             self.abort_capture();
             self.log(None, "Sequence aborted", LogLevel::Warning);
             self.send_sequence();
-            if run.master.is_some() {
-                self.master_abandoned();
-            }
         }
     }
 
     pub(super) fn sequence_failed(&mut self, reason: String) {
-        if let Some(run) = self.run.take() {
+        if self.run.take().is_some() {
             self.log(None, format!("Sequence stopped: {reason}"), LogLevel::Error);
             self.send_sequence();
-            if run.master.is_some() {
-                self.master_abandoned();
-            }
         }
     }
 
@@ -218,13 +218,9 @@ impl Core {
         let Some(step) = pick_step(run) else {
             let total: u32 = run.done.iter().sum();
             let name = run.seq.name.clone();
-            let master = run.master.take();
             self.run = None;
             self.log(None, format!("{} complete: {total} frames", if name.is_empty() { "Sequence" } else { &name }), LogLevel::Info);
             self.send_sequence();
-            if let Some(job) = master {
-                self.stack_master(job);
-            }
             return;
         };
         run.current = Some(step);
@@ -851,18 +847,24 @@ impl Core {
         let Some(run) = &mut self.run else {
             return;
         };
-        if let (Some(job), Some(path)) = (&mut run.master, path) {
-            job.frames.push(path.into());
+        let s = &mut run.seq.steps[step];
+        let calibration = s.frame_type != FrameType::Light;
+        if let (true, Some(path)) = (calibration, path) {
+            s.frames.push(path);
         }
         run.done[step] += 1;
         let done = run.done[step];
-        run.seq.steps[step].done = done;
-        let id = run.seq.steps[step].id;
+        s.done = done;
+        let s = s.clone();
         let draft = &mut self.state.sequence_draft.sequence;
-        if let Some(d) = draft.steps.iter_mut().find(|d| d.id == id) {
+        if let Some(d) = draft.steps.iter_mut().find(|d| d.id == s.id) {
             d.done = done;
+            d.frames = s.frames.clone();
             self.send(self.doc_msg(DocId::Sequence, None));
             self.save_soon();
+        }
+        if calibration && done == s.count {
+            self.stack_master(&s);
         }
     }
 
@@ -932,7 +934,6 @@ mod tests {
             message: String::new(),
             lights_since_dither: 0,
             lights_since_focus: 0,
-            master: None,
             focused_once: false,
             last_focus_filter: None,
             focus_after_flip: false,

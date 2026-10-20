@@ -60,6 +60,9 @@ pub struct SequenceStep {
     pub temperature: Option<f64>,
     /// Frames already taken; a run continues from here.
     pub done: u32,
+    /// Calibration steps: the frames kept so far, as saved on the engine,
+    /// averaged into a master once the step is complete.
+    pub frames: Vec<String>,
 }
 
 impl SequenceStep {
@@ -83,6 +86,7 @@ impl Default for SequenceStep {
             offset: None,
             temperature: None,
             done: 0,
+            frames: Vec::new(),
         }
     }
 }
@@ -172,7 +176,31 @@ impl Sequence {
     pub fn reset_progress(&mut self) {
         for s in &mut self.steps {
             s.done = 0;
+            s.frames.clear();
         }
+    }
+
+    /// What the enabled steps need in front of the telescope, or why they
+    /// cannot share a run. `None` without enabled steps.
+    pub fn setup(&self) -> Result<Option<Setup>, String> {
+        let mut found: Option<(Setup, FrameType)> = None;
+        for s in self.steps.iter().filter(|s| s.enabled) {
+            let setup = Setup::of(s.frame_type);
+            match found {
+                None => found = Some((setup, s.frame_type)),
+                Some((first, ty)) if first != setup => {
+                    return Err(format!(
+                        "{} and {} frames need {} and {}: make them separate sequences",
+                        ty.label().to_lowercase(),
+                        s.frame_type.label().to_lowercase(),
+                        first.label(),
+                        setup.label()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(found.map(|(s, _)| s))
     }
 
     /// Gives steps without one (or sharing one) a fresh id from `next`.
@@ -184,6 +212,35 @@ impl Sequence {
                 s.id = *next;
                 seen.insert(s.id);
             }
+        }
+    }
+}
+
+/// What a frame type needs in front of the telescope. A sequence takes
+/// frames of one kind only, and calibration frames make a master per step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    Sky,
+    /// Darks, dark flats and bias.
+    Covered,
+    /// Flats.
+    Panel,
+}
+
+impl Setup {
+    pub fn of(frame_type: FrameType) -> Setup {
+        match frame_type {
+            FrameType::Light => Setup::Sky,
+            FrameType::Dark | FrameType::Bias => Setup::Covered,
+            FrameType::Flat => Setup::Panel,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Setup::Sky => "the sky",
+            Setup::Covered => "a covered telescope",
+            Setup::Panel => "a flat panel",
         }
     }
 }
@@ -434,6 +491,20 @@ mod tests {
 
     fn names(n: &[&str]) -> Vec<String> {
         n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn one_setup_per_sequence() {
+        let mut seq = Sequence { steps: darks(&[60.0], 10, None), ..Default::default() };
+        seq.steps.push(bias(20, None));
+        seq.steps.extend(dark_flats(&[Some(1)], 5));
+        assert_eq!(seq.setup(), Ok(Some(Setup::Covered)));
+        seq.steps.extend(flats(&[Some(1)], 5));
+        let e = seq.setup().unwrap_err();
+        assert!(e.contains("dark and flat frames"), "{e}");
+        seq.steps.last_mut().unwrap().enabled = false;
+        assert_eq!(seq.setup(), Ok(Some(Setup::Covered)), "disabled steps do not count");
+        assert_eq!(Sequence::default().setup(), Ok(None));
     }
 
     #[test]
