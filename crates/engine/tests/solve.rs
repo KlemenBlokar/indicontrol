@@ -46,6 +46,7 @@ async fn setup(name: &str, hour_angle_min: f64, kind: SolverKind) -> (TestUi, en
     let imaging = ImagingSettings {
         output_dir: dir.join("out").display().to_string(),
         file_template: "{type}_{seq:03}".into(),
+        ..Default::default()
     };
     ui.send(ToEngine::SetRoles(roles.clone())).await;
     ui.send(ToEngine::SetSolverSettings(solver.clone())).await;

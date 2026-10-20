@@ -290,6 +290,7 @@ mod tests {
         let settings = ImagingSettings {
             output_dir: dir.display().to_string(),
             file_template: "{type}/{filter}".into(),
+            ..Default::default()
         };
         let first = output_path(&settings, &ctx());
         assert!(first.ends_with("Light/Ha_0001.fits"), "{}", first.display());

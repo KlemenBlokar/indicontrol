@@ -230,6 +230,14 @@ impl ImagingView {
         egui::CollapsingHeader::new("Output files").show(ui, |ui| {
             ui.label("Folder (on the engine's computer)");
             ui.add(egui::TextEdit::singleline(&mut self.settings_edit.value.output_dir).desired_width(f32::INFINITY));
+            ui.label("Calibration masters folder").on_hover_text(
+                "Darks, flats and bias to match with the light frames; subfolders count too",
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings_edit.value.masters_dir)
+                    .hint_text("masters, in the folder above")
+                    .desired_width(f32::INFINITY),
+            );
             ui.label("File name template").on_hover_text(
                 "Tokens: {object} {type} {filter} {exposure} {gain} {offset} {temp} {bin} \
                  {camera} {date} (night of the session) {time} (UTC) {seq} {seq:04}",

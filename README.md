@@ -97,6 +97,26 @@ still be edited by hand:
 
 Calibration presets add darks, bias, flats and dark flats.
 
+**Calibration** lists the masters the light steps need and whether the
+masters folder has them. Choose what the lights get, saved with the
+sequence:
+
+- **Darks**: one per exposure, matching gain, offset, binning and sensor
+  temperature (±2 °C). Without darks the lights get a master bias instead,
+  to remove the offset.
+- **Flats**: one per filter and binning, calibrated with either a master
+  bias or dark flats (darks at the flat's exposure and gain).
+
+The masters folder defaults to `masters` in the output folder; set another
+under Imaging, Output files. The engine reads it, subfolders included, at
+start, every minute and on Rescan. A file counts as a master when it has a
+stack count (STACKCNT or NCOMBINE), floating-point pixels, or "master" or
+"stack" in its name, and its type comes from IMAGETYP/FRAME or the name.
+Single frames, lights and unreadable files are listed under "Not used"
+with the reason. A master whose header lacks a value it should match
+(offset, say) is still used but shown in yellow, since it could not be
+checked; a fully described one is preferred, then the newest.
+
 **Progress** is kept with each step (the Done column). After an abort, an
 engine restart or a cloudy night, the sequence continues with only the
 frames still missing. Reset progress starts every step from zero.

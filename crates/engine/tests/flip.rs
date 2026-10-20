@@ -57,6 +57,7 @@ async fn guided_setup(name: &str, hour_angle_min: f64) -> (TestUi, engine::Engin
     let imaging = ImagingSettings {
         output_dir: dir.join("out").display().to_string(),
         file_template: "{type}_{seq:03}".into(),
+        ..Default::default()
     };
     ui.send(ToEngine::SetImagingSettings(imaging.clone())).await;
     ui.until("settings", |u| {

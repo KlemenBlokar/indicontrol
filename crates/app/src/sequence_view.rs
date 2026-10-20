@@ -6,8 +6,8 @@ use protocol::equipment;
 use protocol::sequence::plan::{self, PlanRow, PlanSettings};
 use protocol::sequence::presets;
 use protocol::{
-    Exposure, FrameType, RunState, Sequence, SequenceDraft, SequenceOrder, SequenceStatus, SharedDoc, ToEngine,
-    UiState,
+    Exposure, FlatCalibration, FrameType, MasterFrame, MasterKind, Need, Purpose, RunState, Sequence, SequenceDraft, SequenceOrder,
+    SequenceStatus, SharedDoc, ToEngine, UiState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,8 @@ use crate::imaging_view::ImagingView;
 
 const RED: Color32 = Color32::from_rgb(220, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
+const GREEN: Color32 = Color32::from_rgb(60, 180, 75);
+const YELLOW: Color32 = Color32::from_rgb(220, 200, 60);
 
 /// Inputs of the light planner and calibration presets (persisted with the UI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +99,8 @@ impl SequenceView {
                     self.planner(ui, &filters);
                     ui.separator();
                     self.steps(ui, &filters);
+                    ui.separator();
+                    self.masters(ui, state, actions);
                     ui.separator();
                     self.calibration(ui, &filters);
                 });
@@ -528,6 +532,89 @@ impl SequenceView {
         }
     }
 
+    /// Which corrections the lights get, the masters that takes, and what
+    /// the masters folder has.
+    fn masters(&mut self, ui: &mut egui::Ui, state: &UiState, actions: &mut Vec<ToEngine>) {
+        ui.label(RichText::new("Calibration").strong());
+        let plan = &mut self.draft.value.sequence.calibration;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut plan.darks, "Darks")
+                .on_hover_text("Subtract a master dark matching each light's exposure, gain, offset and temperature");
+            ui.checkbox(&mut plan.flats, "Flats").on_hover_text("Divide by a master flat for each filter");
+            if plan.flats {
+                ui.separator();
+                ui.label("flats calibrated with");
+                ui.radio_value(&mut plan.flats_with, FlatCalibration::Bias, "Bias");
+                ui.radio_value(&mut plan.flats_with, FlatCalibration::DarkFlats, "Dark flats")
+                    .on_hover_text("Darks at the flats' exposure, often better than bias on CMOS cameras");
+            }
+        });
+        if !plan.darks {
+            ui.label(RichText::new("Without darks the lights still need their offset removed: a master bias.").weak());
+        }
+
+        let m = &state.masters;
+        let needs = protocol::masters::needs(&self.draft.value.sequence, state);
+        if needs.is_empty() {
+            ui.label(RichText::new("No enabled light steps, so no masters needed.").weak());
+        } else {
+            egui::Grid::new("masters_needed").striped(true).num_columns(4).show(ui, |ui| {
+                for n in &needs {
+                    ui.label(need_name(n));
+                    ui.label(RichText::new(match n.purpose {
+                        Purpose::Lights => "for the lights",
+                        Purpose::Flats => "for the flats",
+                    })
+                    .weak());
+                    ui.label(&n.what);
+                    need_status(ui, n);
+                    ui.end_row();
+                }
+            });
+        }
+
+        ui.horizontal(|ui| {
+            if ui.small_button("Rescan").on_hover_text("Read the folder again now").clicked() {
+                actions.push(ToEngine::RescanMasters);
+            }
+            ui.label(format!("{} masters in", m.masters.len()));
+            // Long paths would widen the panel.
+            ui.add(egui::Label::new(RichText::new(&m.folder).monospace()).truncate())
+                .on_hover_text(format!(
+                    "{}\nSet it under Imaging, Output files. It is read every minute; subfolders count too.",
+                    m.folder
+                ));
+        });
+        if let Some(e) = &m.error {
+            ui.colored_label(theme::c(ui, ORANGE), e);
+        }
+        if !m.masters.is_empty() {
+            egui::CollapsingHeader::new("All masters").id_salt("masters_all").show(ui, |ui| {
+                egui::Grid::new("masters_all_grid").striped(true).num_columns(3).show(ui, |ui| {
+                    for f in &m.masters {
+                        ui.label(f.kind.label());
+                        ui.label(&f.path);
+                        ui.label(RichText::new(master_details(f)).weak());
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+        if !m.skipped.is_empty() {
+            let n = m.skipped.len();
+            let title = format!("Not used ({n} file{})", if n == 1 { "" } else { "s" });
+            egui::CollapsingHeader::new(title).id_salt("masters_skipped").show(ui, |ui| {
+                egui::Grid::new("masters_skipped_grid").striped(true).num_columns(2).show(ui, |ui| {
+                    for (path, why) in &m.skipped {
+                        ui.label(path);
+                        ui.label(RichText::new(why).weak());
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+    }
+
     fn calibration(&mut self, ui: &mut egui::Ui, filters: &[String]) {
         egui::CollapsingHeader::new("Add calibration frames").show(ui, |ui| {
             let p = &mut self.presets;
@@ -598,6 +685,62 @@ impl SequenceView {
             }
         });
     }
+}
+
+fn need_name(n: &Need) -> &'static str {
+    match (n.kind, n.purpose) {
+        (MasterKind::Dark, Purpose::Flats) => "Dark flat",
+        (MasterKind::Dark, _) => "Dark",
+        (MasterKind::Flat, _) => "Flat",
+        (MasterKind::Bias, _) => "Bias",
+    }
+}
+
+/// The master found: green when it fully matches, yellow when its header
+/// lacks values it could not be checked against; orange when missing.
+fn need_status(ui: &mut egui::Ui, n: &Need) {
+    let Some(found) = &n.found else {
+        ui.colored_label(theme::c(ui, ORANGE), "missing");
+        return;
+    };
+    let unknown = n.unverified();
+    let details = master_details(found);
+    if unknown.is_empty() {
+        ui.colored_label(theme::c(ui, GREEN), &found.path).on_hover_text(details);
+    } else {
+        let why = format!("{} unknown", unknown.join(", "));
+        ui.colored_label(theme::c(ui, YELLOW), format!("{} ? ({why})", found.path))
+            .on_hover_text(format!("{details}\nThe header has no {}, so that could not be checked.", unknown.join(" or ")));
+    }
+}
+
+/// "120 s, gain 100, −10.1 °C, bin 1, Red, 30 frames, 2026-10-01".
+fn master_details(m: &MasterFrame) -> String {
+    let mut parts = Vec::new();
+    if m.kind == MasterKind::Dark
+        && let Some(e) = m.exposure
+    {
+        parts.push(format!("{e} s"));
+    }
+    if let Some(f) = &m.filter {
+        parts.push(f.clone());
+    }
+    if let Some(g) = m.gain {
+        parts.push(format!("gain {g}"));
+    }
+    if let Some(o) = m.offset {
+        parts.push(format!("offset {o}"));
+    }
+    if let Some(t) = m.temperature {
+        parts.push(format!("{t:.1} °C"));
+    }
+    parts.push(format!("bin {}", m.binning.unwrap_or(1)));
+    parts.push(format!("{}×{}", m.width, m.height));
+    if let Some(n) = m.frames {
+        parts.push(format!("{n} frames"));
+    }
+    parts.push(m.date.get(..10).unwrap_or(&m.date).to_owned());
+    parts.join(", ")
 }
 
 /// What is left to take (all of it, before the first frame).
@@ -891,15 +1034,38 @@ mod tests {
         draft.sequence.steps = presets::darks(&[60.0, 120.0], 10, Some(-10.0));
         draft.sequence.steps.extend(presets::flats(&[Some(1), None], 5));
         draft.sequence.steps.push(presets::bias(20, None));
+        draft.sequence.steps.push(SequenceStep::default());
         let draft = draft.clone();
         let mut imaging = ImagingView::new(true);
-        let idle = UiState::default();
+        let dark = MasterFrame {
+            path: "dark.fits".into(),
+            kind: MasterKind::Dark,
+            camera: None,
+            width: 10,
+            height: 10,
+            binning: None,
+            exposure: Some(60.0),
+            gain: None,
+            offset: None,
+            temperature: None,
+            filter: None,
+            frames: Some(20),
+            date: "2026-10-01".into(),
+        };
+        let idle = UiState {
+            masters: protocol::MastersStatus {
+                masters: vec![dark],
+                skipped: vec![("raw.fits".into(), "a single dark frame, not a master".into())],
+                ..Default::default()
+            },
+            ..UiState::default()
+        };
         let running = UiState {
             sequence: Some(SequenceStatus {
                 sequence: draft.sequence.clone(),
                 state: RunState::Running,
                 current_step: Some(1),
-                done: vec![10, 3, 0, 0, 0],
+                done: vec![10, 3, 0, 0, 0, 0],
                 message: "Step 2: frame 4 of 10".into(),
             }),
             ..UiState::default()

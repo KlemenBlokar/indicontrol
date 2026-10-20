@@ -50,6 +50,7 @@ async fn setup(name: &str, initial_temp: f64) -> Setup {
     let settings = ImagingSettings {
         output_dir: dir.join("out").display().to_string(),
         file_template: "{type}/{filter}/{exposure}s_{seq:03}".into(),
+        ..Default::default()
     };
     ui.send(ToEngine::SetImagingSettings(settings.clone())).await;
     ui.until("settings", |u| u.state.roles == roles && u.state.imaging == settings).await;

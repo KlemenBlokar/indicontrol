@@ -1,6 +1,7 @@
 //! The engine core: a single task that owns the INDI connection and all
 //! engine state. UI sessions and helper tasks talk to it through [`CoreMsg`].
 
+mod calibration;
 mod capture;
 mod docs;
 mod focus;
@@ -58,6 +59,9 @@ pub(crate) enum CoreMsg {
         timer: solve::SolveTimer,
     },
     FocusTimeout { id: u64, epoch: u64 },
+    MastersScanned(Box<protocol::MastersStatus>),
+    /// Time to re-read the masters folder.
+    MastersTick,
     /// Write the state file (delayed after document edits).
     Save,
 }
@@ -117,6 +121,7 @@ pub(crate) struct Core {
     /// Last sequence step id given out. Starts from the clock, so ids stay
     /// unique across restarts and saved sequences.
     next_step_id: u64,
+    masters: calibration::MastersScan,
 }
 
 impl Core {
@@ -155,6 +160,7 @@ impl Core {
             next_step_id: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as u64),
+            masters: Default::default(),
         };
         core.init_drafts();
         core.state.sequence_draft.sequence.assign_step_ids(&mut core.next_step_id);
@@ -165,6 +171,16 @@ impl Core {
         if self.state.indi.autoconnect {
             self.connect();
         }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(calibration::RESCAN_EVERY);
+            loop {
+                every.tick().await; // the first tick is immediate
+                if tx.send(CoreMsg::MastersTick).is_err() {
+                    break;
+                }
+            }
+        });
         loop {
             tokio::select! {
                 msg = self.rx.recv() => match msg {
@@ -183,6 +199,8 @@ impl Core {
                 let _ = reply.send(self.session());
             }
             CoreMsg::Save => self.save_now(),
+            CoreMsg::MastersTick => self.rescan_masters(),
+            CoreMsg::MastersScanned(status) => self.masters_scanned(*status),
             CoreMsg::ConnectResult { attempt, result } => {
                 if attempt != self.attempt {
                     return; // superseded; dropping the client closes it
@@ -263,6 +281,10 @@ impl Core {
                 self.send_guider();
                 Ok(())
             }
+            ToEngine::RescanMasters => {
+                self.rescan_masters();
+                Ok(())
+            }
             ToEngine::SetImagingSettings(settings) => {
                 if settings.output_dir.trim().is_empty() {
                     self.log(None, "Output directory must not be empty", LogLevel::Error);
@@ -271,6 +293,7 @@ impl Core {
                     self.save();
                     self.send(ToUi::ImagingSettings(settings));
                     self.reset_drafts();
+                    self.rescan_masters();
                 }
                 Ok(())
             }
@@ -720,6 +743,7 @@ impl Core {
             ToUi::Roles(self.state.roles.clone()),
             ToUi::Optics(self.state.optics.clone()),
             ToUi::ImagingSettings(self.state.imaging.clone()),
+            self.masters_msg(),
             ToUi::Devices(devices),
             self.capture_msg(),
             ToUi::SequenceLibrary {

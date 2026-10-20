@@ -296,21 +296,25 @@ pub struct Fits {
     pub data: Vec<u8>,
 }
 
+/// The primary header and its length in bytes (whole blocks), from the
+/// start of a file; the data need not be there.
+pub fn read_header(bytes: &[u8]) -> Result<(Header, usize), FitsError> {
+    if !bytes.starts_with(b"SIMPLE  =") {
+        return Err(FitsError::NotFits);
+    }
+    let mut header = Header::default();
+    for (i, raw) in bytes.as_chunks::<CARD>().0.iter().enumerate() {
+        if raw.starts_with(b"END") && raw[3..].iter().all(|&b| b == b' ') {
+            return Ok((header, ((i + 1) * CARD).div_ceil(BLOCK) * BLOCK));
+        }
+        header.cards.push(Card::parse(raw));
+    }
+    Err(FitsError::NoEnd)
+}
+
 impl Fits {
     pub fn parse(bytes: &[u8]) -> Result<Fits, FitsError> {
-        if !bytes.starts_with(b"SIMPLE  =") {
-            return Err(FitsError::NotFits);
-        }
-        let mut header = Header::default();
-        let mut end = None;
-        for (i, raw) in bytes.as_chunks::<CARD>().0.iter().enumerate() {
-            if raw.starts_with(b"END") && raw[3..].iter().all(|&b| b == b' ') {
-                end = Some((i + 1) * CARD);
-                break;
-            }
-            header.cards.push(Card::parse(raw));
-        }
-        let header_len = end.ok_or(FitsError::NoEnd)?.div_ceil(BLOCK) * BLOCK;
+        let (header, header_len) = read_header(bytes)?;
         let len = data_len(&header)?;
         let have = bytes.len().saturating_sub(header_len);
         if have < len {

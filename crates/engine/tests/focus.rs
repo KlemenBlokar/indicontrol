@@ -45,6 +45,7 @@ async fn setup(name: &str) -> (TestUi, engine::EngineHandle, std::path::PathBuf)
     let imaging = ImagingSettings {
         output_dir: dir.join("out").display().to_string(),
         file_template: "{type}_{filter}_{seq:03}".into(),
+        ..Default::default()
     };
     ui.send(ToEngine::SetRoles(roles.clone())).await;
     ui.send(ToEngine::SetFocusSettings(focus.clone())).await;

@@ -7,6 +7,7 @@
 mod catalog;
 mod core;
 mod frame;
+mod masters;
 mod metadata;
 mod server;
 pub mod solver;

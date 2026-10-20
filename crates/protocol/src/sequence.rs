@@ -116,6 +116,8 @@ pub struct Sequence {
     /// Re-centre the target after a meridian flip.
     pub center_after_flip: bool,
     pub autofocus: crate::AutofocusTriggers,
+    /// Corrections the lights get, deciding which masters are needed.
+    pub calibration: crate::masters::CalibrationPlan,
 }
 
 impl Default for Sequence {
@@ -132,6 +134,7 @@ impl Default for Sequence {
             center_on_start: true,
             center_after_flip: true,
             autofocus: Default::default(),
+            calibration: Default::default(),
         }
     }
 }

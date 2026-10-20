@@ -15,6 +15,7 @@ pub mod doc;
 pub mod equipment;
 pub mod focus;
 pub mod guider;
+pub mod masters;
 pub mod mount;
 pub mod sequence;
 pub mod solver;
@@ -24,6 +25,7 @@ pub use doc::{Ack, CaptureForm, DocId, GotoDraft, SequenceDraft, SharedDoc, Sync
 pub use guider::{GuideOutput, GuideStep, GuiderSettings, GuiderState, GuiderStatus};
 pub use imaging::{Analysis, ChannelStats};
 pub use focus::{AutofocusStatus, AutofocusTriggers, FocusSettings, StarStats};
+pub use masters::{CalibrationPlan, FlatCalibration, LightSpec, MasterFrame, MasterKind, MastersStatus, Need, Purpose};
 pub use mount::MountInfo;
 pub use solver::{SolveResult, SolveStatus, SolverKind, SolverSettings, Target};
 pub use sequence::{
@@ -32,7 +34,7 @@ pub use sequence::{
 pub use indi_link;
 
 /// Bump on any incompatible message change.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_ENGINE_PORT: u16 = 7700;
 pub const WS_PATH: &str = "/ws";
 
@@ -216,6 +218,9 @@ pub struct ImagingSettings {
     /// {filter} {exposure} {gain} {offset} {temp} {bin} {camera} {date}
     /// (night of the session) {time} (UTC) {seq} / {seq:04}.
     pub file_template: String,
+    /// Folder with calibration masters (on the engine's machine); empty:
+    /// `masters` in `output_dir`.
+    pub masters_dir: String,
 }
 
 impl Default for ImagingSettings {
@@ -223,6 +228,7 @@ impl Default for ImagingSettings {
         Self {
             output_dir: String::new(),
             file_template: DEFAULT_FILE_TEMPLATE.into(),
+            masters_dir: String::new(),
         }
     }
 }
@@ -337,6 +343,8 @@ pub enum ToUi {
         value: serde_json::Value,
         ack: Option<Ack>,
     },
+    /// Calibration masters found in the masters folder.
+    Masters(Box<MastersStatus>),
     /// Answer to [`ToEngine::FindObjects`], sent only to the UI that asked.
     ObjectsFound { query: String, objects: Vec<CatalogObject> },
 }
@@ -375,6 +383,8 @@ pub enum ToEngine {
     Capture(CaptureRequest),
     AbortCapture,
     SetImagingSettings(ImagingSettings),
+    /// Read the masters folder again now (it is also re-read every minute).
+    RescanMasters,
     StartSequence(Sequence),
     PauseSequence,
     ResumeSequence,
@@ -461,6 +471,7 @@ pub struct UiState {
     pub frames_captured: u32,
     pub last_frame: Option<FrameInfo>,
     pub imaging: ImagingSettings,
+    pub masters: MastersStatus,
     pub sequence: Option<SequenceStatus>,
     pub library: Vec<Sequence>,
     pub guider: GuiderStatus,
@@ -496,6 +507,7 @@ impl Default for UiState {
             frames_captured: 0,
             last_frame: None,
             imaging: ImagingSettings::default(),
+            masters: MastersStatus::default(),
             sequence: None,
             library: Vec::new(),
             guider: GuiderStatus::default(),
@@ -569,6 +581,7 @@ impl UiState {
             }
             ToUi::Frame(info) => self.last_frame = Some(*info),
             ToUi::ImagingSettings(s) => self.imaging = s,
+            ToUi::Masters(m) => self.masters = *m,
             ToUi::Sequence { status } => self.sequence = status.map(|s| *s),
             ToUi::SequenceLibrary { sequences } => self.library = sequences,
             ToUi::Guider { status } => self.guider = *status,
@@ -781,6 +794,7 @@ mod tests {
             ToEngine::LoadProfile { name: "Esprit".into() },
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
             ToEngine::FindObjects { query: "Orion".into() },
+            ToEngine::RescanMasters,
             ToEngine::EditDoc {
                 doc: DocId::Sequence,
                 seq: 4,
