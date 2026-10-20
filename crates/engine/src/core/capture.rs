@@ -309,6 +309,7 @@ impl Core {
                     .map(|c| c.median)
                     .fold(0.0, f64::max)
                     / a.adc_max.max(1) as f64;
+                let path = out.info.path.clone();
                 let text = match &out.info.path {
                     Some(p) => format!("Saved {p}"),
                     None => format!("Captured {} ({}×{})", out.info.camera, out.info.width, out.info.height),
@@ -328,7 +329,7 @@ impl Core {
                     let purpose = job.purpose;
                     self.finish_capture();
                     match purpose {
-                        Purpose::Sequence => self.sequence_frame_done(brightest),
+                        Purpose::Sequence => self.sequence_frame_done(brightest, path),
                         Purpose::Focus => self.focus_frame_done(stars),
                         Purpose::Solve => self.solve_capture_done(),
                         Purpose::User => {}

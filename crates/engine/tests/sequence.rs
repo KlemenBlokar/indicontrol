@@ -299,3 +299,45 @@ async fn progress_survives_abort_and_restart() {
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn creates_a_master_dark() {
+    let Setup { mut ui, engine, dir } = setup("master", 0.0).await;
+    let step = SequenceStep {
+        frame_type: FrameType::Dark,
+        exposure: Exposure::Fixed { seconds: 0.1 },
+        count: 3,
+        ..Default::default()
+    };
+    // The wrong kind of frames is refused.
+    ui.send(ToEngine::CreateMaster {
+        kind: protocol::MasterKind::Flat,
+        step: step.clone(),
+    })
+    .await;
+    ui.until("refused", |u| u.state.log.iter().any(|l| l.text.contains("needs flat frames"))).await;
+
+    ui.send(ToEngine::CreateMaster {
+        kind: protocol::MasterKind::Dark,
+        step,
+    })
+    .await;
+    ui.until("taking frames", |u| u.state.masters.creating.is_some()).await;
+    ui.until("master in the folder", |u| {
+        let m = &u.state.masters;
+        m.creating.is_none() && m.masters.iter().any(|f| f.kind == protocol::MasterKind::Dark && f.frames == Some(3))
+    })
+    .await;
+    let master = &ui.state.masters.masters[0];
+    assert_eq!(master.exposure, Some(0.1));
+    assert!(master.path.starts_with("master_dark_0.1s_"), "{}", master.path);
+    // The raw frames stay where frames go, the master in the masters folder.
+    let raws = fits_files(&dir.join("out/Dark"));
+    assert_eq!(raws.len(), 3, "{raws:?}");
+    assert!(dir.join("out/masters").join(&master.path).is_file());
+    // The draft is not touched.
+    assert!(draft(&ui).steps.is_empty());
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}

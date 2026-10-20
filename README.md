@@ -117,6 +117,18 @@ with the reason. A master whose header lacks a value it should match
 (offset, say) is still used but shown in yellow, since it could not be
 checked; a fully described one is preferred, then the newest.
 
+**Create…** on a missing master (or **New…** to replace one) takes the
+frames for it and averages them into the masters folder. Choose how many
+frames; cover the telescope for darks and bias, put the flat panel on for
+flats (their exposure is found automatically). It runs as a sequence of its
+own, so it can be watched, paused and aborted like any other; the frames
+are saved as usual. The master is a winsorized κσ-clipped mean (κ = 3),
+which drops cosmic rays and hot transients, written as 32-bit float with
+IMAGETYP "Master Dark/Flat/Bias" and STACKCNT, and named after what it
+matches, e.g. `master_dark_120s_g100_o50_-10C_bin1_20261020-213802.fits`.
+Dark flats can be made once their flat exists, since they take its
+exposure.
+
 **Progress** is kept with each step (the Done column). After an abort, an
 engine restart or a cloudy night, the sequence continues with only the
 frames still missing. Reset progress starts every step from zero.

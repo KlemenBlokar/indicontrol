@@ -60,6 +60,7 @@ pub(crate) enum CoreMsg {
     },
     FocusTimeout { id: u64, epoch: u64 },
     MastersScanned(Box<protocol::MastersStatus>),
+    MasterStacked(Box<Result<crate::stack::Stacked, String>>),
     /// Time to re-read the masters folder.
     MastersTick,
     /// Write the state file (delayed after document edits).
@@ -201,6 +202,7 @@ impl Core {
             CoreMsg::Save => self.save_now(),
             CoreMsg::MastersTick => self.rescan_masters(),
             CoreMsg::MastersScanned(status) => self.masters_scanned(*status),
+            CoreMsg::MasterStacked(result) => self.master_stacked(*result),
             CoreMsg::ConnectResult { attempt, result } => {
                 if attempt != self.attempt {
                     return; // superseded; dropping the client closes it
@@ -279,6 +281,12 @@ impl Core {
                 self.send(self.mount_msg());
                 self.push_optics();
                 self.send_guider();
+                Ok(())
+            }
+            ToEngine::CreateMaster { kind, step } => {
+                if let Err(e) = self.create_master(kind, step) {
+                    self.log(None, format!("Cannot make the master: {e}"), LogLevel::Error);
+                }
                 Ok(())
             }
             ToEngine::RescanMasters => {

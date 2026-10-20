@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::equipment::{self, Control};
-use crate::{FrameType, Sequence, SequenceStep, UiState};
+use crate::{Exposure, FrameType, Sequence, SequenceStep, UiState};
 
 /// Exposure match: within this many seconds, or this fraction.
 const EXPOSURE_TOLERANCE: (f64, f64) = (0.01, 0.005);
@@ -118,6 +118,8 @@ pub struct Need {
     /// "120 s, gain 100, -10 °C, bin 1".
     pub what: String,
     pub found: Option<MasterFrame>,
+    /// The (first) light step needing it.
+    pub light: SequenceStep,
 }
 
 impl Need {
@@ -129,6 +131,57 @@ impl Need {
             _ => Vec::new(),
         }
     }
+
+    /// The step that takes `frames` frames for this master, or `None` while
+    /// what it must match is not known.
+    pub fn capture_step(&self, frames: u32) -> Option<SequenceStep> {
+        let spec = self.spec.as_ref()?;
+        let light = &self.light;
+        let base = SequenceStep {
+            count: frames,
+            binning: light.binning,
+            gain: spec.gain,
+            offset: spec.offset,
+            ..Default::default()
+        };
+        Some(match (self.kind, self.purpose) {
+            (MasterKind::Dark, Purpose::Lights) => SequenceStep {
+                frame_type: FrameType::Dark,
+                exposure: Exposure::Fixed { seconds: spec.exposure },
+                temperature: light.temperature,
+                ..base
+            },
+            // Dark flats: the flat's exposure and gain, at whatever
+            // temperature the flats had.
+            (MasterKind::Dark, Purpose::Flats) => SequenceStep {
+                frame_type: FrameType::Dark,
+                exposure: Exposure::Fixed { seconds: spec.exposure },
+                ..base
+            },
+            (MasterKind::Bias, purpose) => SequenceStep {
+                frame_type: FrameType::Bias,
+                exposure: Exposure::Minimum,
+                temperature: if purpose == Purpose::Lights { light.temperature } else { None },
+                ..base
+            },
+            (MasterKind::Flat, _) => SequenceStep {
+                frame_type: FrameType::Flat,
+                exposure: Exposure::DEFAULT_FLAT,
+                filter_slot: light.filter_slot,
+                gain: light.gain,
+                offset: light.offset,
+                ..base
+            },
+        })
+    }
+
+    /// What to do before taking the frames.
+    pub fn setup_hint(&self) -> &'static str {
+        match self.kind {
+            MasterKind::Flat => "Put the flat panel on (or point at an even sky) before starting.",
+            _ => "Cover the telescope (lid on, no light leaks) before starting.",
+        }
+    }
 }
 
 /// The masters `seq`'s enabled light steps need under its calibration plan,
@@ -137,27 +190,27 @@ pub fn needs(seq: &Sequence, state: &UiState) -> Vec<Need> {
     let masters = &state.masters.masters;
     let plan = seq.calibration;
     let mut out: Vec<Need> = Vec::new();
-    let mut add = |kind, purpose, spec: Option<LightSpec>, what: String| {
+    let mut add = |kind, purpose, spec: Option<LightSpec>, what: String, light: &SequenceStep| {
         if out.iter().any(|n| n.kind == kind && n.purpose == purpose && n.what == what) {
             return;
         }
         let found = spec.as_ref().and_then(|s| s.find(kind, masters)).cloned();
-        out.push(Need { kind, purpose, spec, what, found });
+        out.push(Need { kind, purpose, spec, what, found, light: light.clone() });
     };
     for step in seq.steps.iter().filter(|s| s.enabled && s.count > 0) {
         let Some(light) = LightSpec::for_step(step, state) else {
             continue;
         };
         if plan.darks {
-            add(MasterKind::Dark, Purpose::Lights, Some(light.clone()), light.describe(MasterKind::Dark));
+            add(MasterKind::Dark, Purpose::Lights, Some(light.clone()), light.describe(MasterKind::Dark), step);
         } else {
             // Without darks the lights still need their offset removed.
-            add(MasterKind::Bias, Purpose::Lights, Some(light.clone()), light.describe(MasterKind::Bias));
+            add(MasterKind::Bias, Purpose::Lights, Some(light.clone()), light.describe(MasterKind::Bias), step);
         }
         if !plan.flats {
             continue;
         }
-        add(MasterKind::Flat, Purpose::Flats, Some(light.clone()), light.describe(MasterKind::Flat));
+        add(MasterKind::Flat, Purpose::Flats, Some(light.clone()), light.describe(MasterKind::Flat), step);
         // The flats' own calibration follows the flat's settings.
         let flat = light.find(MasterKind::Flat, masters);
         let flat_spec = LightSpec {
@@ -168,7 +221,7 @@ pub fn needs(seq: &Sequence, state: &UiState) -> Vec<Need> {
         };
         match plan.flats_with {
             FlatCalibration::Bias => {
-                add(MasterKind::Bias, Purpose::Flats, Some(flat_spec.clone()), flat_spec.describe(MasterKind::Bias))
+                add(MasterKind::Bias, Purpose::Flats, Some(flat_spec.clone()), flat_spec.describe(MasterKind::Bias), step)
             }
             FlatCalibration::DarkFlats => {
                 let filter = light.filter.clone().unwrap_or_else(|| "no".into());
@@ -176,14 +229,14 @@ pub fn needs(seq: &Sequence, state: &UiState) -> Vec<Need> {
                     Some(exposure) => {
                         let spec = LightSpec { exposure, ..flat_spec };
                         let what = format!("{} (for the {filter} flat)", spec.describe(MasterKind::Dark));
-                        add(MasterKind::Dark, Purpose::Flats, Some(spec), what);
+                        add(MasterKind::Dark, Purpose::Flats, Some(spec), what, step);
                     }
                     None => {
                         let what = match flat {
                             Some(f) => format!("exposure of the {filter} flat (not in {})", f.path),
                             None => format!("exposure of the {filter} flat, once there is one"),
                         };
-                        add(MasterKind::Dark, Purpose::Flats, None, what)
+                        add(MasterKind::Dark, Purpose::Flats, None, what, step)
                     }
                 }
             }
@@ -198,6 +251,12 @@ pub fn needs(seq: &Sequence, state: &UiState) -> Vec<Need> {
     out
 }
 
+/// "120", "1.5", "0.11": no float noise.
+fn seconds(s: f64) -> String {
+    let text = if s >= 1.0 { format!("{s:.2}") } else { format!("{s:.3}") };
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 /// The masters folder as last read by the engine.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MastersStatus {
@@ -208,6 +267,8 @@ pub struct MastersStatus {
     pub skipped: Vec<(String, String)>,
     /// The folder itself could not be read.
     pub error: Option<String>,
+    /// A master being made: "Stacking 20 dark frames".
+    pub creating: Option<String>,
 }
 
 /// What a light step's masters must match.
@@ -354,7 +415,7 @@ impl LightSpec {
     pub fn describe(&self, kind: MasterKind) -> String {
         let mut parts = Vec::new();
         match kind {
-            MasterKind::Dark => parts.push(format!("{} s", self.exposure)),
+            MasterKind::Dark => parts.push(format!("{} s", seconds(self.exposure))),
             MasterKind::Flat => parts.push(self.filter.clone().map_or("no filter".into(), |f| format!("{f} filter"))),
             MasterKind::Bias => {}
         }
@@ -490,6 +551,16 @@ mod tests {
         assert!(s.unknowns(MasterKind::Flat, &masters[1]).is_empty(), "flats need no offset");
     }
 
+    #[test]
+    fn exposures_read_well() {
+        assert_eq!(seconds(120.0), "120");
+        assert_eq!(seconds(1.5), "1.5");
+        assert_eq!(seconds(0.11034314385775865), "0.11");
+        assert_eq!(seconds(0.0123), "0.012");
+        assert_eq!(seconds(2.0), "2");
+        assert_eq!(seconds(0.0), "0");
+    }
+
     mod planning {
         use super::*;
         use crate::{Exposure, Roles};
@@ -533,6 +604,30 @@ mod tests {
                 "one dark per exposure; flat and bias once (same filter)"
             );
             assert!(n.iter().all(|n| n.found.is_none()));
+        }
+
+        #[test]
+        fn create_takes_matching_frames() {
+            use MasterKind::*;
+            let mut s = seq(CalibrationPlan::default(), &[60.0]);
+            s.steps[0].temperature = Some(-10.0);
+            s.steps[0].filter_slot = Some(2);
+            let n = needs(&s, &state(vec![]));
+            let dark = n[0].capture_step(20).unwrap();
+            assert_eq!((dark.frame_type, dark.count, dark.exposure), (FrameType::Dark, 20, Exposure::Fixed { seconds: 60.0 }));
+            assert_eq!((dark.gain, dark.offset, dark.temperature), (Some(100.0), Some(50.0), Some(-10.0)));
+            assert_eq!(dark.filter_slot, None, "no need to move the wheel");
+            let flat = n.iter().find(|n| n.kind == Flat).unwrap().capture_step(25).unwrap();
+            assert_eq!((flat.frame_type, flat.filter_slot, flat.temperature), (FrameType::Flat, Some(2), None));
+            assert_eq!(flat.exposure, Exposure::DEFAULT_FLAT);
+            let bias = n.iter().find(|n| n.kind == Bias).unwrap().capture_step(50).unwrap();
+            assert_eq!((bias.frame_type, bias.exposure, bias.temperature), (FrameType::Bias, Exposure::Minimum, None));
+            assert!(n[0].setup_hint().contains("Cover"));
+
+            // Dark flats wait for their flat.
+            let plan = CalibrationPlan { flats_with: FlatCalibration::DarkFlats, ..Default::default() };
+            let n = needs(&seq(plan, &[60.0]), &state(vec![]));
+            assert_eq!(n.last().unwrap().capture_step(20), None);
         }
 
         #[test]

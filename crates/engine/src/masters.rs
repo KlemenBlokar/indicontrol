@@ -56,7 +56,8 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-fn read_header(path: &Path) -> Result<Header, String> {
+/// The primary header and where the data starts.
+pub(crate) fn read_header(path: &Path) -> Result<(Header, usize), String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     let mut block = vec![0u8; 2880];
@@ -64,7 +65,7 @@ fn read_header(path: &Path) -> Result<Header, String> {
         file.read_exact(&mut block).map_err(|_| "not a FITS file (header ends early)".to_string())?;
         bytes.extend_from_slice(&block);
         match fits::read_header(&bytes) {
-            Ok((h, _)) => return Ok(h),
+            Ok(found) => return Ok(found),
             Err(fits::FitsError::NoEnd) => continue,
             Err(_) => return Err("not a FITS file".into()),
         }
@@ -73,7 +74,7 @@ fn read_header(path: &Path) -> Result<Header, String> {
 }
 
 fn read(path: &Path, rel: &str) -> Result<MasterFrame, String> {
-    let h = read_header(path)?;
+    let (h, _) = read_header(path)?;
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let typed = ["IMAGETYP", "FRAME"].iter().find_map(|k| h.get_str(k)).map(str::to_owned);
     let kind = typed

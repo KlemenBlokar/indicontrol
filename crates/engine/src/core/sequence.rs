@@ -37,6 +37,8 @@ pub(crate) struct Run {
     focused_once: bool,
     last_focus_filter: Option<u32>,
     focus_after_flip: bool,
+    /// The frames are for a master, stacked when the run completes.
+    pub(super) master: Option<super::calibration::MasterJob>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +130,7 @@ impl Core {
             focused_once: false,
             last_focus_filter: None,
             focus_after_flip: false,
+            master: None,
         });
         let started = if taken > 0 {
             format!("{name} continues: {taken} of {planned} frames already taken")
@@ -178,19 +181,25 @@ impl Core {
     }
 
     pub(super) fn abort_sequence(&mut self) {
-        if self.run.take().is_some() {
+        if let Some(run) = self.run.take() {
             self.abort_solve();
             self.abort_autofocus();
             self.abort_capture();
             self.log(None, "Sequence aborted", LogLevel::Warning);
             self.send_sequence();
+            if run.master.is_some() {
+                self.master_abandoned();
+            }
         }
     }
 
     pub(super) fn sequence_failed(&mut self, reason: String) {
-        if self.run.take().is_some() {
+        if let Some(run) = self.run.take() {
             self.log(None, format!("Sequence stopped: {reason}"), LogLevel::Error);
             self.send_sequence();
+            if run.master.is_some() {
+                self.master_abandoned();
+            }
         }
     }
 
@@ -209,9 +218,13 @@ impl Core {
         let Some(step) = pick_step(run) else {
             let total: u32 = run.done.iter().sum();
             let name = run.seq.name.clone();
+            let master = run.master.take();
             self.run = None;
             self.log(None, format!("{} complete: {total} frames", if name.is_empty() { "Sequence" } else { &name }), LogLevel::Info);
             self.send_sequence();
+            if let Some(job) = master {
+                self.stack_master(job);
+            }
             return;
         };
         run.current = Some(step);
@@ -321,7 +334,7 @@ impl Core {
 
     /// Called by the capture code after each sequence frame.
     /// `brightest` is the highest channel median as a fraction of full scale.
-    pub(super) fn sequence_frame_done(&mut self, brightest: f64) {
+    pub(super) fn sequence_frame_done(&mut self, brightest: f64, path: Option<String>) {
         let Some(run) = &mut self.run else {
             return;
         };
@@ -340,14 +353,14 @@ impl Core {
             max,
         } = run.seq.steps[step].exposure
         else {
-            self.count_frame(step);
+            self.count_frame(step, path);
             return self.sequence_next();
         };
 
         // Flats: keep frames that are close enough, and steer the exposure.
         let error = (brightest - target).abs();
         if !test && error <= 2.0 * tolerance {
-            self.count_frame(step);
+            self.count_frame(step, path);
         }
         let Some(run) = &mut self.run else {
             return;
@@ -834,10 +847,13 @@ impl Core {
 
     /// A frame of `step` is kept: count it in the run and in the draft
     /// step it came from, so the progress survives aborts and restarts.
-    fn count_frame(&mut self, step: usize) {
+    fn count_frame(&mut self, step: usize, path: Option<String>) {
         let Some(run) = &mut self.run else {
             return;
         };
+        if let (Some(job), Some(path)) = (&mut run.master, path) {
+            job.frames.push(path.into());
+        }
         run.done[step] += 1;
         let done = run.done[step];
         run.seq.steps[step].done = done;
@@ -878,7 +894,7 @@ fn pick_step(run: &Run) -> Option<usize> {
     }
 }
 
-fn fmt_seconds(s: f64) -> String {
+pub(super) fn fmt_seconds(s: f64) -> String {
     if s >= 1.0 {
         format!("{:.1} s", s)
     } else {
@@ -916,6 +932,7 @@ mod tests {
             message: String::new(),
             lights_since_dither: 0,
             lights_since_focus: 0,
+            master: None,
             focused_once: false,
             last_focus_filter: None,
             focus_after_flip: false,

@@ -55,6 +55,8 @@ pub struct SequenceView {
     library_pick: Option<String>,
     feedback: Option<(String, bool)>,
     plan_feedback: Option<String>,
+    /// The needed master whose Create form is open: kind, purpose, what.
+    create_master: Option<(MasterKind, Purpose, String)>,
 }
 
 impl SequenceView {
@@ -65,6 +67,7 @@ impl SequenceView {
             library_pick: None,
             feedback: None,
             plan_feedback: None,
+            create_master: None,
         }
     }
 
@@ -555,10 +558,19 @@ impl SequenceView {
 
         let m = &state.masters;
         let needs = protocol::masters::needs(&self.draft.value.sequence, state);
+        // Making a master runs a sequence of its own.
+        let busy = if state.sequence.is_some() {
+            Some("a sequence is running")
+        } else if m.creating.is_some() {
+            Some("a master is being made")
+        } else {
+            None
+        };
+        let key = |n: &Need| (n.kind, n.purpose, n.what.clone());
         if needs.is_empty() {
             ui.label(RichText::new("No enabled light steps, so no masters needed.").weak());
         } else {
-            egui::Grid::new("masters_needed").striped(true).num_columns(4).show(ui, |ui| {
+            egui::Grid::new("masters_needed").striped(true).num_columns(5).show(ui, |ui| {
                 for n in &needs {
                     ui.label(need_name(n));
                     ui.label(RichText::new(match n.purpose {
@@ -568,8 +580,67 @@ impl SequenceView {
                     .weak());
                     ui.label(&n.what);
                     need_status(ui, n);
+                    let open = self.create_master.as_ref() == Some(&key(n));
+                    let label = if n.found.is_some() { "New…" } else { "Create…" };
+                    let hover = if n.found.is_some() {
+                        "Take frames and make a new master to replace this one"
+                    } else {
+                        "Take frames and average them into this master"
+                    };
+                    let button = ui.add_enabled(
+                        busy.is_none() && n.spec.is_some(),
+                        egui::Button::selectable(open, label).small(),
+                    );
+                    let button = match (busy, &n.spec) {
+                        (Some(why), _) => button.on_disabled_hover_text(format!("Not now: {why}")),
+                        (None, None) => button.on_disabled_hover_text("Make the flat first"),
+                        _ => button.on_hover_text(hover),
+                    };
+                    if button.clicked() {
+                        self.create_master = if open { None } else { Some(key(n)) };
+                    }
                     ui.end_row();
                 }
+            });
+        }
+        if let Some(text) = &m.creating {
+            ui.colored_label(theme::c(ui, YELLOW), format!("{text}…"));
+        }
+        // The open Create form, while its master is still needed.
+        let open = self.create_master.clone().and_then(|k| needs.iter().find(|n| key(n) == k));
+        if let Some(n) = open {
+            let p = &mut self.presets;
+            let frames = match n.kind {
+                MasterKind::Dark => &mut p.dark_count,
+                MasterKind::Bias => &mut p.bias_count,
+                MasterKind::Flat => &mut p.flat_count,
+            };
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new(format!("New master {}: {}", need_name(n).to_lowercase(), n.what)).strong());
+                ui.horizontal(|ui| {
+                    ui.label("Average");
+                    ui.add(egui::DragValue::new(frames).range(1..=500));
+                    ui.label("frames");
+                });
+                ui.colored_label(theme::c(ui, ORANGE), n.setup_hint());
+                ui.label(
+                    RichText::new(
+                        "The frames are saved like any others; the master goes into the masters folder.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    let step = n.capture_step(*frames);
+                    if ui.add_enabled(busy.is_none() && step.is_some(), egui::Button::new("Start")).clicked()
+                        && let Some(step) = step
+                    {
+                        actions.push(ToEngine::CreateMaster { kind: n.kind, step });
+                        self.create_master = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.create_master = None;
+                    }
+                });
             });
         }
 

@@ -34,7 +34,7 @@ pub use sequence::{
 pub use indi_link;
 
 /// Bump on any incompatible message change.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const DEFAULT_ENGINE_PORT: u16 = 7700;
 pub const WS_PATH: &str = "/ws";
 
@@ -385,6 +385,9 @@ pub enum ToEngine {
     SetImagingSettings(ImagingSettings),
     /// Read the masters folder again now (it is also re-read every minute).
     RescanMasters,
+    /// Take `step`'s frames (darks, bias or flats), average them into a
+    /// master in the masters folder.
+    CreateMaster { kind: MasterKind, step: SequenceStep },
     StartSequence(Sequence),
     PauseSequence,
     ResumeSequence,
@@ -795,6 +798,10 @@ mod tests {
             ToEngine::SetGuiderSettings(GuiderSettings::default()),
             ToEngine::FindObjects { query: "Orion".into() },
             ToEngine::RescanMasters,
+            ToEngine::CreateMaster {
+                kind: MasterKind::Dark,
+                step: SequenceStep::default(),
+            },
             ToEngine::EditDoc {
                 doc: DocId::Sequence,
                 seq: 4,
