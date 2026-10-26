@@ -77,7 +77,8 @@ pub struct SequenceStep {
 impl SequenceStep {
     /// Calibration frames that make the same master (the count aside).
     pub fn same_calibration(&self, other: &SequenceStep) -> bool {
-        plan::same_frames(self, other) && self.temperature == other.temperature
+        (self.frame_type, self.filter_slot, &self.exposure, self.binning, self.gain, self.offset, self.temperature)
+            == (other.frame_type, other.filter_slot, &other.exposure, other.binning, other.gain, other.offset, other.temperature)
     }
 
     /// Frames still to take.
@@ -422,127 +423,132 @@ pub mod presets {
             })
             .collect()
     }
-
-    /// Parse "10, 30 60;120" into seconds.
-    pub fn parse_exposures(s: &str) -> Result<Vec<f64>, String> {
-        s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-            .filter(|p| !p.is_empty())
-            .map(|p| match p.trim_end_matches('s').parse::<f64>() {
-                Ok(v) if v >= 0.0 && v.is_finite() => Ok(v),
-                _ => Err(format!("'{p}' is not an exposure time")),
-            })
-            .collect()
-    }
 }
 
-/// Light frames planned as total time per filter; turned into steps.
-pub mod plan {
+/// The light steps, edited as a plan: per filter an exposure and a total
+/// time, with the camera settings shared by all of them.
+pub mod lights {
     use super::*;
 
-    /// One filter (or one exposure of a filter) in the plan.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    #[serde(default)]
-    pub struct PlanRow {
-        pub enabled: bool,
-        pub filter_slot: Option<u32>,
-        pub exposure: f64,
-        /// Total exposure time wanted, in minutes.
-        pub minutes: f64,
+    /// The light steps the plan edits: not the ones made for masters.
+    pub fn is_light(s: &SequenceStep) -> bool {
+        s.frame_type == FrameType::Light && !s.auto
     }
 
-    impl Default for PlanRow {
-        fn default() -> Self {
-            Self {
-                enabled: false,
-                filter_slot: None,
-                exposure: 120.0,
-                minutes: 60.0,
+    /// Frames for `minutes` of `exposure` (rounded up).
+    pub fn frames(minutes: f64, exposure: f64) -> u32 {
+        if exposure <= 0.0 {
+            return 0;
+        }
+        // Tolerate float noise: 60 min of 120 s is 30 frames, not 31.
+        (minutes * 60.0 / exposure - 1e-9).ceil().max(0.0) as u32
+    }
+
+    /// Total exposure time a step plans, in minutes.
+    pub fn minutes(s: &SequenceStep) -> f64 {
+        s.exposure.seconds().unwrap_or(0.0) * s.count as f64 / 60.0
+    }
+
+    /// A row of the plan: a light step, or a filter of the wheel without one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Row {
+        Step(usize),
+        Unused(Option<u32>),
+    }
+
+    /// Rows by filter slot (as the wheel has them), a filter's exposures in
+    /// step order; every filter of a wheel with `filters` slots has one.
+    pub fn rows(seq: &Sequence, filters: usize) -> Vec<Row> {
+        let mut rows: Vec<(Option<u32>, Row)> =
+            seq.steps.iter().enumerate().filter(|(_, s)| is_light(s)).map(|(i, s)| (s.filter_slot, Row::Step(i))).collect();
+        let slots: Vec<Option<u32>> =
+            if filters == 0 { vec![None] } else { (1..=filters as u32).map(Some).collect() };
+        for slot in slots {
+            if !rows.iter().any(|(s, _)| *s == slot) {
+                rows.push((slot, Row::Unused(slot)));
+            }
+        }
+        // Stable: a filter's steps keep their order.
+        rows.sort_by_key(|(slot, _)| slot.unwrap_or(0));
+        rows.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Camera settings of the lights (those of the first).
+    pub fn settings(seq: &Sequence) -> SequenceStep {
+        seq.steps.iter().find(|s| is_light(s)).cloned().unwrap_or_default()
+    }
+
+    /// Ticks or unticks a row; a filter without a step gets one, with the
+    /// lights' settings, after the steps of lower slots.
+    pub fn set_enabled(seq: &mut Sequence, row: Row, on: bool) {
+        match row {
+            Row::Step(i) => seq.steps[i].enabled = on,
+            Row::Unused(_) if !on => {}
+            Row::Unused(filter_slot) => {
+                let base = settings(seq);
+                let exposure = 120.0;
+                let step = SequenceStep {
+                    filter_slot,
+                    exposure: Exposure::Fixed { seconds: exposure },
+                    count: frames(60.0, exposure),
+                    binning: base.binning,
+                    gain: base.gain,
+                    offset: base.offset,
+                    temperature: base.temperature,
+                    ..Default::default()
+                };
+                let slot = filter_slot.unwrap_or(0);
+                let at = seq
+                    .steps
+                    .iter()
+                    .rposition(|s| is_light(s) && s.filter_slot.unwrap_or(0) < slot)
+                    .map_or_else(|| seq.steps.iter().position(is_light).unwrap_or(seq.steps.len()), |i| i + 1);
+                seq.steps.insert(at, step);
             }
         }
     }
 
-    impl PlanRow {
-        /// Frames needed to reach the planned time (rounded up).
-        pub fn frames(&self) -> u32 {
-            if !self.enabled || self.exposure <= 0.0 {
-                return 0;
-            }
-            // Tolerate float noise: 60 min of 120 s is 30 frames, not 31.
-            (self.minutes * 60.0 / self.exposure - 1e-9).ceil().max(0.0) as u32
-        }
+    /// Another exposure for the filter of step `i`, right after it.
+    pub fn add_exposure(seq: &mut Sequence, i: usize) {
+        let s = SequenceStep { id: 0, done: 0, frames: Vec::new(), enabled: true, ..seq.steps[i].clone() };
+        seq.steps.insert(i + 1, s);
     }
 
-    /// Camera settings shared by all rows.
-    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-    #[serde(default)]
-    pub struct PlanSettings {
-        pub binning: Option<u32>,
-        pub gain: Option<f64>,
-        pub offset: Option<f64>,
-        pub temperature: Option<f64>,
+    /// New frames: the ones taken before count no more.
+    fn restart(s: &mut SequenceStep) {
+        s.done = 0;
+        s.frames.clear();
     }
 
-    /// Steps for the plan: one light step per enabled row with frames.
-    pub fn steps(rows: &[PlanRow], settings: &PlanSettings) -> Vec<SequenceStep> {
-        rows.iter()
-            .filter(|r| r.frames() > 0)
-            .map(|r| SequenceStep {
-                frame_type: FrameType::Light,
-                filter_slot: r.filter_slot,
-                exposure: Exposure::Fixed { seconds: r.exposure },
-                count: r.frames(),
-                binning: settings.binning,
-                gain: settings.gain,
-                offset: settings.offset,
-                temperature: settings.temperature,
-                ..Default::default()
-            })
-            .collect()
-    }
-
-    /// Same frames: progress on one counts for the other.
-    pub(crate) fn same_frames(a: &SequenceStep, b: &SequenceStep) -> bool {
-        a.frame_type == b.frame_type
-            && a.filter_slot == b.filter_slot
-            && a.exposure == b.exposure
-            && a.binning == b.binning
-            && a.gain == b.gain
-            && a.offset == b.offset
-    }
-
-    /// Puts the plan into `seq`. `replace` swaps out all light steps (in
-    /// place of the first one); frames already taken carry over to the new
-    /// step with the same settings, which then plans at least that many.
-    /// Otherwise the plan's steps are added at the end.
-    pub fn apply(seq: &mut Sequence, rows: &[PlanRow], settings: &PlanSettings, replace: bool) {
-        let mut new = steps(rows, settings);
-        if !replace {
-            seq.steps.extend(new);
+    /// Changes step `i`'s exposure, keeping its total time.
+    pub fn set_exposure(seq: &mut Sequence, i: usize, seconds: f64) {
+        let s = &mut seq.steps[i];
+        if s.exposure.seconds() == Some(seconds) {
             return;
         }
-        let at = seq
-            .steps
-            .iter()
-            .position(|s| s.frame_type == FrameType::Light)
-            .unwrap_or(seq.steps.len());
-        let mut old: Vec<SequenceStep> = Vec::new();
-        seq.steps.retain(|s| {
-            let light = s.frame_type == FrameType::Light;
-            if light {
-                old.push(s.clone());
-            }
-            !light
-        });
-        for step in &mut new {
-            if let Some(i) = old.iter().position(|o| same_frames(o, step)) {
-                let o = old.remove(i);
-                // Keeping the id lets a running sequence keep counting here.
-                step.id = o.id;
-                step.done = o.done;
-                step.count = step.count.max(o.done);
-            }
+        let total = minutes(s);
+        s.exposure = Exposure::Fixed { seconds };
+        s.count = frames(total, seconds);
+        restart(s);
+    }
+
+    /// Changes step `i`'s total time; never fewer frames than taken.
+    pub fn set_minutes(seq: &mut Sequence, i: usize, minutes: f64) {
+        let s = &mut seq.steps[i];
+        if let Some(e) = s.exposure.seconds() {
+            s.count = frames(minutes, e).max(s.done);
         }
-        seq.steps.splice(at..at, new);
+    }
+
+    /// Gives every light step `new`'s binning, gain, offset and temperature.
+    /// Frames taken with another binning, gain or offset count no more.
+    pub fn set_settings(seq: &mut Sequence, new: &SequenceStep) {
+        for s in seq.steps.iter_mut().filter(|s| is_light(s)) {
+            if (s.binning, s.gain, s.offset) != (new.binning, new.gain, new.offset) {
+                restart(s);
+            }
+            (s.binning, s.gain, s.offset, s.temperature) = (new.binning, new.gain, new.offset, new.temperature);
+        }
     }
 }
 
@@ -593,8 +599,6 @@ mod tests {
 
     #[test]
     fn exposure_lists_and_totals() {
-        assert_eq!(parse_exposures("10, 30 60;120s").unwrap(), vec![10.0, 30.0, 60.0, 120.0]);
-        assert!(parse_exposures("10, x").is_err());
         let step = |seconds, count, done| SequenceStep {
             exposure: Exposure::Fixed { seconds },
             count,
@@ -676,90 +680,67 @@ mod tests {
         assert_eq!(next, 102, "nothing to do the second time");
     }
 
-    mod planning {
-        use super::super::plan::*;
+    mod plan {
+        use super::super::lights::*;
         use super::super::*;
 
-        fn row(filter: u32, exposure: f64, minutes: f64) -> PlanRow {
-            PlanRow {
-                enabled: true,
-                filter_slot: Some(filter),
-                exposure,
-                minutes,
+        fn light(slot: u32, seconds: f64, count: u32) -> SequenceStep {
+            SequenceStep {
+                filter_slot: Some(slot),
+                exposure: Exposure::Fixed { seconds },
+                count,
+                ..Default::default()
             }
         }
 
         #[test]
         fn frames_from_time() {
-            assert_eq!(row(1, 120.0, 60.0).frames(), 30);
-            assert_eq!(row(1, 180.0, 60.0).frames(), 20);
-            assert_eq!(row(1, 300.0, 60.0).frames(), 12);
-            assert_eq!(row(1, 7.0, 1.0).frames(), 9, "rounds up to reach the time");
-            assert_eq!(PlanRow { enabled: false, ..row(1, 60.0, 60.0) }.frames(), 0);
+            assert_eq!(frames(60.0, 120.0), 30);
+            assert_eq!(frames(60.0, 180.0), 20);
+            assert_eq!(frames(1.0, 7.0), 9, "rounds up to reach the time");
+            assert_eq!(frames(60.0, 0.0), 0);
+            assert_eq!(minutes(&light(1, 120.0, 30)), 60.0);
         }
 
         #[test]
-        fn plan_becomes_light_steps() {
-            let settings = PlanSettings {
-                gain: Some(100.0),
-                temperature: Some(-10.0),
-                ..Default::default()
-            };
-            let rows = [row(1, 60.0, 120.0), row(2, 120.0, 60.0), row(3, 120.0, 0.0)];
-            let s = steps(&rows, &settings);
-            assert_eq!(s.len(), 2, "rows without frames are left out");
-            assert_eq!((s[0].filter_slot, s[0].count), (Some(1), 120));
-            assert_eq!((s[1].filter_slot, s[1].count), (Some(2), 30));
-            assert!(s.iter().all(|s| s.gain == Some(100.0) && s.temperature == Some(-10.0)));
+        fn a_row_per_filter() {
+            let mut seq = Sequence { steps: vec![light(3, 60.0, 10), light(1, 120.0, 5), light(1, 30.0, 5)], ..Default::default() };
+            seq.steps.push(SequenceStep { auto: true, ..super::super::presets::flats(&[Some(2)], 5).remove(0) });
+            assert_eq!(rows(&seq, 3), vec![Row::Step(1), Row::Step(2), Row::Unused(Some(2)), Row::Step(0)]);
+            assert_eq!(rows(&Sequence::default(), 0), vec![Row::Unused(None)], "no wheel: the filter in place");
         }
 
         #[test]
-        fn add_appends() {
-            let mut seq = Sequence {
-                steps: vec![SequenceStep::default()],
-                ..Default::default()
-            };
-            apply(&mut seq, &[row(1, 60.0, 60.0)], &PlanSettings::default(), false);
+        fn ticking_a_filter_adds_its_step_in_wheel_order() {
+            let mut seq = Sequence { steps: vec![light(1, 60.0, 10), light(3, 60.0, 10)], ..Default::default() };
+            seq.steps[0].gain = Some(100.0);
+            set_enabled(&mut seq, Row::Unused(Some(2)), true);
+            let slots: Vec<_> = seq.steps.iter().map(|s| s.filter_slot).collect();
+            assert_eq!(slots, vec![Some(1), Some(2), Some(3)]);
+            assert_eq!((seq.steps[1].gain, seq.steps[1].count), (Some(100.0), 30), "the lights' settings, 1 h of 120 s");
+            set_enabled(&mut seq, Row::Step(1), false);
+            assert!(!seq.steps[1].enabled && seq.steps[1].count == 30, "unticked keeps its plan");
+        }
+
+        #[test]
+        fn edits_keep_progress_only_for_the_same_frames() {
+            let mut seq = Sequence { steps: vec![light(1, 60.0, 60)], ..Default::default() };
+            seq.steps[0].done = 40;
+            set_minutes(&mut seq, 0, 90.0);
+            assert_eq!((seq.steps[0].count, seq.steps[0].done), (90, 40));
+            set_minutes(&mut seq, 0, 10.0);
+            assert_eq!(seq.steps[0].count, 40, "never fewer than taken");
+            set_settings(&mut seq, &SequenceStep { temperature: Some(-10.0), ..light(1, 60.0, 0) });
+            assert_eq!(seq.steps[0].done, 40, "the temperature alone keeps them");
+            set_exposure(&mut seq, 0, 120.0);
+            assert_eq!((seq.steps[0].count, seq.steps[0].done), (20, 0), "same 40 min; other frames");
+            seq.steps[0].done = 5;
+            set_settings(&mut seq, &SequenceStep { gain: Some(100.0), ..light(1, 60.0, 0) });
+            assert_eq!((seq.steps[0].gain, seq.steps[0].done), (Some(100.0), 0));
+
+            add_exposure(&mut seq, 0);
             assert_eq!(seq.steps.len(), 2);
-            assert_eq!(seq.steps[1].count, 60);
-        }
-
-        #[test]
-        fn replace_keeps_progress_and_other_frames() {
-            let settings = PlanSettings::default();
-            let mut seq = Sequence::default();
-            seq.steps.push(super::super::presets::bias(10, None));
-            apply(&mut seq, &[row(1, 60.0, 60.0), row(2, 120.0, 60.0)], &settings, true);
-            assert_eq!(seq.steps.len(), 3, "added after the bias");
-            seq.steps[1].id = 11;
-            seq.steps[1].done = 40;
-            seq.steps[2].id = 12;
-            seq.steps[2].done = 30;
-
-            // More L, R dropped to half an hour, B new.
-            let rows = [row(1, 60.0, 90.0), row(2, 120.0, 30.0), row(3, 120.0, 60.0)];
-            apply(&mut seq, &rows, &settings, true);
-            let s = &seq.steps;
-            assert_eq!(s.len(), 4);
-            assert_eq!(s[0].frame_type, FrameType::Bias, "non-light steps stay");
-            assert_eq!((s[1].id, s[1].done, s[1].count), (11, 40, 90));
-            assert_eq!((s[2].id, s[2].done, s[2].count), (12, 30, 30), "never plans fewer than taken");
-            assert_eq!((s[3].id, s[3].done, s[3].count), (0, 0, 30));
-
-            // A different exposure is different frames: no progress carried.
-            apply(&mut seq, &[row(1, 30.0, 90.0)], &settings, true);
-            assert_eq!(seq.steps.len(), 2);
-            assert_eq!((seq.steps[1].done, seq.steps[1].count), (0, 180));
-        }
-
-        #[test]
-        fn replace_puts_lights_where_they_were() {
-            let mut seq = Sequence::default();
-            apply(&mut seq, &[row(1, 60.0, 60.0)], &PlanSettings::default(), true);
-            seq.steps.extend(super::super::presets::flats(&[Some(1)], 20));
-            apply(&mut seq, &[row(1, 60.0, 60.0), row(2, 60.0, 60.0)], &PlanSettings::default(), true);
-            let types: Vec<FrameType> = seq.steps.iter().map(|s| s.frame_type).collect();
-            assert_eq!(types, vec![FrameType::Light, FrameType::Light, FrameType::Flat]);
+            assert_eq!((seq.steps[1].filter_slot, seq.steps[1].id, seq.steps[1].done), (Some(1), 0, 0));
         }
     }
 }

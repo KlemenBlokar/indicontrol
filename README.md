@@ -77,23 +77,17 @@ end of the signal sits above 0 in noise sigmas, and saturated pixels.
 
 ## Sequences
 
-The Sequence tab builds a list of steps, each with frame type, filter,
-exposure, count, and optional binning, gain, offset and sensor temperature.
-Steps run one after another or interleaved (LRGBLRGB…).
+The Sequence tab plans the light frames of a target and takes the
+calibration masters they need.
 
-**Plan light frames** is the quick way to fill in the steps. It has a row
-for each filter in the wheel: tick the filters to use (LRGB and SHO pick
-them by name), set an exposure and the total time you want, and the number
-of frames follows. Add a second row for a filter for another exposure, for
-example a short one for a bright core. Gain, offset, binning and sensor
-temperature apply to all rows. Apply turns the plan into steps, which can
-still be edited by hand:
-
-- **Replace light steps** (the default) swaps the light steps for the plan's.
-  Frames already taken carry over to the step with the same filter,
-  exposure, binning, gain and offset, so raising L from 2 h to 3 h adds
-  only the missing hour.
-- Otherwise the plan's steps are added after the existing ones.
+**Lights** has a row for each filter in the wheel: tick the filters to use
+(LRGB and SHO pick them by name), set an exposure and the total time you
+want, and the number of frames follows. **+** adds another exposure for a
+filter, for example a short one for a bright core. Gain, offset, binning and
+sensor temperature apply to all rows. Rows run one after another or
+interleaved (LRGBLRGB…). The Done column counts the frames taken; raising
+L from 2 h to 3 h adds only the missing hour, while a new exposure, gain,
+offset or binning starts that row again.
 
 The run buttons at the top take one kind of frames at a time, so the
 cover or the panel never has to change halfway:
@@ -108,9 +102,10 @@ step for each, with the settings it must match (exposure, gain, offset,
 binning, sensor temperature, filter). They are not listed with the steps:
 the Calibration section shows each master's progress ("12 / 30 taken")
 until it is made, and the step then goes. Frames already taken carry
-over, so an interrupted run continues. Steps
-added by hand under Add calibration frames (a darks library, say) run with
-them. Take covered frames and flats before the lights, so the lights are
+over, so an interrupted run continues. Frames per master are set in the
+Calibration section (30 darks, 50 bias, 25 flats by default). For a darks
+library on a cloudy night, load the target's sequence and take its covered
+frames. Take covered frames and flats before the lights, so the lights are
 calibrated as they come in; dark flats wait until their flat exists.
 Problems show at the bottom of the editor: masters still missing, and
 masters whose header lacks a value that could not be checked.
@@ -167,10 +162,9 @@ frames still missing. Reset progress starts every step from zero.
 
 - **Flats** use automatic exposure. Test frames, which are not saved, adjust
   the exposure until the brightest channel's median sits at the target
-  (45 % ± 5 % by default). When that would take an exposure outside 1–5 s
-  (the step's "gain for" range), the gain changes instead: short flats can
-  show the panel's flicker, and a lower gain collects more light for the
-  same level. The gain is measured as it changes, so its units do not
+  (45 % ± 5 % by default). When that would take an exposure outside
+  1–5 s, the gain changes instead: short flats can show the panel's
+  flicker, and a lower gain collects more light for the same level. The gain is measured as it changes, so its units do not
   matter, and it stays fixed once a step has frames. Without a gain
   control, or at its limit, the exposure leaves the range (0.01–30 s). If
   even that cannot reach the target, the status says to dim or brighten
