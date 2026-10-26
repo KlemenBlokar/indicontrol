@@ -54,6 +54,9 @@ async fn setup(name: &str, initial_temp: f64) -> Setup {
     };
     ui.send(ToEngine::SetImagingSettings(settings.clone())).await;
     ui.until("settings", |u| u.state.roles == roles && u.state.imaging == settings).await;
+    // Not the masters in the default folder, read at start.
+    let masters = dir.join("out/masters").display().to_string();
+    ui.until("own masters folder", |u| u.state.masters.folder == masters).await;
     Setup { ui, engine, dir }
 }
 
@@ -396,6 +399,89 @@ async fn a_complete_dark_step_makes_a_master() {
     assert_eq!(fits_files(&dir.join("out/Dark")).len(), 4);
     assert!(dir.join("out/masters").join(&master.path).is_file());
     assert_eq!(draft(&ui).steps[0].frames.len(), 4);
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_draft_runs_one_kind_of_its_frames() {
+    let Setup { mut ui, engine, dir } = setup("draft-run", 0.0).await;
+    let light = SequenceStep {
+        exposure: Exposure::Fixed { seconds: 0.1 },
+        count: 2,
+        ..Default::default()
+    };
+    let dark = SequenceStep {
+        frame_type: FrameType::Dark,
+        exposure: Exposure::Fixed { seconds: 0.1 },
+        count: 3,
+        auto: true,
+        ..Default::default()
+    };
+    let seq = Sequence {
+        name: "M 31".into(),
+        steps: vec![light, dark],
+        dither_every: 0,
+        meridian_flip: false,
+        center_on_start: false,
+        ..Default::default()
+    };
+    // As the UI sends them: the edit, then the command without waiting.
+    ui.send(ToEngine::EditDoc {
+        doc: DocId::Sequence,
+        seq: 1,
+        ops: vec![("/sequence".into(), serde_json::to_value(&seq).unwrap())],
+    })
+    .await;
+    ui.send(ToEngine::StartDraft { setup: protocol::Setup::Covered }).await;
+    ui.until("covered run", |u| u.state.log.iter().any(|l| l.text.contains("M 31: covered frames started"))).await;
+    ui.until("master made", |u| {
+        let m = &u.state.masters;
+        m.creating.is_none() && m.masters.iter().any(|f| f.kind == protocol::MasterKind::Dark && f.frames == Some(3))
+    })
+    .await;
+    // The generated step has made its master and leaves the draft.
+    ui.until("dark step gone", |u| done(u) == vec![0]).await;
+    assert_eq!(fits_files(&dir.join("out")).iter().filter(|p| p.starts_with(dir.join("out/Light"))).count(), 0);
+
+    ui.send(ToEngine::StartDraft { setup: protocol::Setup::Sky }).await;
+    ui.until("lights done", |u| u.state.sequence.is_none() && done(u) == vec![2]).await;
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn flats_on_a_bright_panel_lower_the_gain() {
+    let Setup { mut ui, engine, dir } = setup("flat-gain", 0.0).await;
+    // At gain 200 the panel is 10× brighter: 45 % in 0.14 s, under the
+    // 1–5 s window. At gain 0 it takes 1.4 s.
+    let at_gain = |steps: Vec<SequenceStep>| -> Vec<SequenceStep> {
+        steps.into_iter().map(|s| SequenceStep { gain: Some(200.0), ..s }).collect()
+    };
+    run(&mut ui, "Flats", at_gain(presets::flats(&[Some(1)], 2))).await;
+    run(&mut ui, "Dark flats", at_gain(presets::dark_flats(&[Some(1)], 1))).await;
+
+    let files = fits_files(&dir.join("out"));
+    let header = |part: &str| {
+        let p = files.iter().find(|p| p.to_string_lossy().contains(part)).unwrap_or_else(|| panic!("{part} in {files:?}"));
+        Fits::parse(&std::fs::read(p).unwrap()).unwrap().header
+    };
+    let flat = header("/Flat/L/");
+    let (gain, exposure) = (flat.get_f64("GAIN").unwrap(), flat.get_f64("EXPTIME").unwrap());
+    assert!(gain < 200.0, "gain {gain}");
+    assert!((1.0..=5.0).contains(&exposure), "{exposure} s");
+    let level = (1000.0 + RATE * exposure * gain_factor(gain)) / 65535.0;
+    assert!((level - 0.45).abs() <= 0.05, "level {level}");
+    assert!(ui.state.log.iter().any(|l| l.text.contains("(the step's: 200)")), "the gain change is logged");
+
+    // Dark flats are taken like the flats: same exposure and gain.
+    let df = header("/Dark/L/");
+    assert_eq!((df.get_f64("GAIN"), df.get_f64("EXPTIME")), (Some(gain), Some(exposure)));
+    let saved = engine::PersistedState::load(&dir.join("engine.json"));
+    assert_eq!(saved.flat_exposures[0].gain, Some(200));
+    assert_eq!(saved.flat_exposures[0].flat_gain, Some(gain));
 
     engine.shutdown();
     let _ = std::fs::remove_dir_all(dir);

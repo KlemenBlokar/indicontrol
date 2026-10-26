@@ -25,8 +25,11 @@ pub(super) struct MastersScan {
     again: bool,
     /// What is being stacked, shown with the status.
     creating: Option<String>,
-    /// Completed steps waiting for their turn.
-    queue: VecDeque<(MasterKind, Vec<PathBuf>)>,
+    /// Completed steps waiting for their turn, with the id of a generated
+    /// step, which leaves the draft once its master is saved.
+    queue: VecDeque<(MasterKind, Vec<PathBuf>, Option<u64>)>,
+    /// The generated step being stacked now.
+    stacking: Option<u64>,
 }
 
 impl Core {
@@ -98,17 +101,19 @@ impl Core {
             );
             self.log(None, text, LogLevel::Warning);
         }
-        self.masters.queue.push_back((kind, frames));
+        self.masters.queue.push_back((kind, frames, step.auto.then_some(step.id)));
         if self.masters.creating.is_none() {
             self.stack_next();
         }
     }
 
     fn stack_next(&mut self) {
-        let Some((kind, frames)) = self.masters.queue.pop_front() else {
+        let Some((kind, frames, step)) = self.masters.queue.pop_front() else {
+            self.masters.stacking = None;
             self.set_creating(None);
             return;
         };
+        self.masters.stacking = step;
         let text = format!("Stacking {} {} frames", frames.len(), kind.label());
         self.log(None, format!("{text} into a master"), LogLevel::Info);
         self.set_creating(Some(text));
@@ -130,6 +135,17 @@ impl Core {
                     s.rejected * 100.0
                 );
                 self.log(None, text, LogLevel::Info);
+                // A generated step has done its job; a failed one keeps its
+                // frames to try again.
+                if let Some(id) = self.masters.stacking.take() {
+                    let steps = &mut self.state.sequence_draft.sequence.steps;
+                    let before = steps.len();
+                    steps.retain(|s| !(s.id == id && s.auto && s.done >= s.count));
+                    if steps.len() != before {
+                        self.send(self.doc_msg(protocol::DocId::Sequence, None));
+                        self.save_soon();
+                    }
+                }
             }
             Err(e) => self.log(None, format!("Could not make the master: {e}"), LogLevel::Error),
         }

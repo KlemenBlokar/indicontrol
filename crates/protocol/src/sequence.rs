@@ -15,6 +15,11 @@ pub enum Exposure {
         tolerance: f64,
         min: f64,
         max: f64,
+        /// Exposures to aim for (seconds): when the flats would need one
+        /// outside, the gain is changed instead. Short ones can show the
+        /// panel's flicker. `None` keeps the step's gain.
+        #[serde(default)]
+        window: Option<(f64, f64)>,
     },
     /// Same exposure as the flats last taken with this filter, binning and gain
     /// (for dark flats).
@@ -29,6 +34,7 @@ impl Exposure {
         tolerance: 0.05,
         min: 0.01,
         max: 30.0,
+        window: Some((1.0, 5.0)),
     };
 
     /// Known duration in seconds, if not decided at run time.
@@ -63,9 +69,17 @@ pub struct SequenceStep {
     /// Calibration steps: the frames kept so far, as saved on the engine,
     /// averaged into a master once the step is complete.
     pub frames: Vec<String>,
+    /// Made from the masters the lights miss; replaced when they are
+    /// worked out again.
+    pub auto: bool,
 }
 
 impl SequenceStep {
+    /// Calibration frames that make the same master (the count aside).
+    pub fn same_calibration(&self, other: &SequenceStep) -> bool {
+        plan::same_frames(self, other) && self.temperature == other.temperature
+    }
+
     /// Frames still to take.
     pub fn remaining(&self) -> u32 {
         if self.enabled { self.count.saturating_sub(self.done) } else { 0 }
@@ -87,6 +101,7 @@ impl Default for SequenceStep {
             temperature: None,
             done: 0,
             frames: Vec::new(),
+            auto: false,
         }
     }
 }
@@ -203,6 +218,49 @@ impl Sequence {
         Ok(found.map(|(s, _)| s))
     }
 
+    /// A copy that runs only the steps for `setup`.
+    pub fn only(&self, setup: Setup) -> Sequence {
+        let mut seq = self.clone();
+        for s in &mut seq.steps {
+            s.enabled &= Setup::of(s.frame_type) == setup;
+        }
+        seq
+    }
+
+    /// Replaces the generated steps for `setup` with `new`, which are added
+    /// at the end. Frames already taken carry over to the new step with the
+    /// same settings; steps the hand-made ones already cover are left out.
+    pub fn put_calibration(&mut self, setup: Setup, new: Vec<SequenceStep>) {
+        let same = SequenceStep::same_calibration;
+        let mut old = Vec::new();
+        self.steps.retain(|s| {
+            let ours = s.auto && Setup::of(s.frame_type) == setup;
+            if ours {
+                old.push(s.clone());
+            }
+            !ours
+        });
+        for mut step in new {
+            if self.steps.iter().any(|s| s.enabled && same(s, &step)) {
+                continue;
+            }
+            if let Some(i) = old.iter().position(|o| same(o, &step)) {
+                let o = old.remove(i);
+                step.id = o.id;
+                step.done = o.done;
+                step.frames = o.frames;
+                step.count = step.count.max(o.done);
+            }
+            step.auto = true;
+            self.steps.push(step);
+        }
+    }
+
+    /// The enabled step taking the frames `step` would, if any.
+    pub fn matching(&self, step: &SequenceStep) -> Option<&SequenceStep> {
+        self.steps.iter().find(|s| s.enabled && s.same_calibration(step))
+    }
+
     /// Gives steps without one (or sharing one) a fresh id from `next`.
     pub fn assign_step_ids(&mut self, next: &mut u64) {
         let mut seen = std::collections::HashSet::new();
@@ -218,7 +276,7 @@ impl Sequence {
 
 /// What a frame type needs in front of the telescope. A sequence takes
 /// frames of one kind only, and calibration frames make a master per step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Setup {
     Sky,
     /// Darks, dark flats and bias.
@@ -270,13 +328,17 @@ impl SequenceStatus {
     }
 }
 
-/// Flat exposure found by auto-exposure, reused for dark flats.
+/// Flat exposure found by auto-exposure, reused for dark flats and as the
+/// first guess next time. Found by filter, binning and the step's gain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlatRecord {
     pub filter: Option<String>,
     pub binning: u32,
     pub gain: Option<i64>,
     pub exposure: f64,
+    /// The gain the flats were taken with, when the search changed it.
+    #[serde(default)]
+    pub flat_gain: Option<f64>,
 }
 
 /// Ready-made step lists. Filters are found by name in the wheel.
@@ -439,7 +501,7 @@ pub mod plan {
     }
 
     /// Same frames: progress on one counts for the other.
-    fn same_frames(a: &SequenceStep, b: &SequenceStep) -> bool {
+    pub(crate) fn same_frames(a: &SequenceStep, b: &SequenceStep) -> bool {
         a.frame_type == b.frame_type
             && a.filter_slot == b.filter_slot
             && a.exposure == b.exposure
@@ -552,6 +614,48 @@ mod tests {
         assert!(seq.has_progress());
         seq.reset_progress();
         assert!(!seq.has_progress());
+    }
+
+    #[test]
+    fn runs_one_kind_of_frames() {
+        let mut seq = Sequence { steps: darks(&[60.0], 10, None), ..Default::default() };
+        seq.steps.extend(flats(&[Some(1)], 5));
+        seq.steps.push(SequenceStep::default());
+        assert!(seq.setup().is_err());
+        let covered = seq.only(Setup::Covered);
+        assert_eq!(covered.setup(), Ok(Some(Setup::Covered)));
+        assert_eq!(covered.remaining_frames(), 10);
+        assert_eq!(seq.only(Setup::Sky).remaining_frames(), 10);
+    }
+
+    #[test]
+    fn generated_steps_keep_progress() {
+        let manual = darks(&[300.0], 20, Some(-10.0));
+        let mut seq = Sequence { steps: manual.clone(), ..Default::default() };
+        seq.steps.push(SequenceStep::default());
+        // The manual 300 s darks already cover that one.
+        seq.put_calibration(Setup::Covered, darks(&[60.0, 300.0], 30, Some(-10.0)));
+        assert_eq!(seq.steps.len(), 3);
+        let generated = &mut seq.steps[2];
+        assert!(generated.auto && generated.exposure == Exposure::Fixed { seconds: 60.0 });
+        generated.id = 9;
+        generated.done = 12;
+        generated.frames = vec!["a.fits".into()];
+
+        // Worked out again: same frames carry over, flats are left alone.
+        seq.steps.extend(flats(&[Some(1)], 5).into_iter().map(|s| SequenceStep { auto: true, ..s }));
+        seq.put_calibration(Setup::Covered, darks(&[60.0], 30, Some(-10.0)));
+        let g: Vec<_> = seq.steps.iter().filter(|s| s.frame_type == FrameType::Dark && s.auto).collect();
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].id, g[0].done, g[0].frames.len()), (9, 12, 1));
+        assert_eq!(seq.steps.iter().filter(|s| s.frame_type == FrameType::Flat).count(), 1);
+
+        // Another temperature is other frames; nothing missing drops them.
+        seq.put_calibration(Setup::Covered, darks(&[60.0], 30, Some(-20.0)));
+        assert_eq!(seq.steps.iter().find(|s| s.auto && s.frame_type == FrameType::Dark).unwrap().done, 0);
+        seq.put_calibration(Setup::Covered, Vec::new());
+        assert!(!seq.steps.iter().any(|s| s.auto && s.frame_type == FrameType::Dark));
+        assert_eq!(seq.steps[0], manual[0], "hand-made steps stay");
     }
 
     #[test]

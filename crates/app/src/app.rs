@@ -711,6 +711,7 @@ impl eframe::App for App {
                 actions.push(ToEngine::EditDoc { doc, seq, ops });
             }
         }
+        actions.append(&mut self.sequence.after_edits);
         if !actions.is_empty() {
             self.send_all(actions);
         }

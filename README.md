@@ -95,9 +95,25 @@ still be edited by hand:
   only the missing hour.
 - Otherwise the plan's steps are added after the existing ones.
 
-Add calibration frames adds dark, bias, flat and dark-flat steps with the
-camera settings given there; "Fill in from the plan" takes those from the
-light steps, with the exposures and filters still missing a master.
+The run buttons at the top take one kind of frames at a time, so the
+cover or the panel never has to change halfway:
+
+- **Take covered frames** makes the darks, bias and dark flats the lights
+  are missing (cover the telescope).
+- **Take flats** makes the missing flats (turn on the panel).
+- **Start lights** takes the light steps.
+
+The Take buttons work out the missing masters again each time and add a
+step for each, with the settings it must match (exposure, gain, offset,
+binning, sensor temperature, filter). They are not listed with the steps:
+the Calibration section shows each master's progress ("12 / 30 taken")
+until it is made, and the step then goes. Frames already taken carry
+over, so an interrupted run continues. Steps
+added by hand under Add calibration frames (a darks library, say) run with
+them. Take covered frames and flats before the lights, so the lights are
+calibrated as they come in; dark flats wait until their flat exists.
+Problems show at the bottom of the editor: masters still missing, and
+masters whose header lacks a value that could not be checked.
 
 **Calibration** lists the masters the light steps need and whether the
 masters folder has them. Choose what the lights get, saved with the
@@ -119,12 +135,9 @@ with the reason. A master whose header lacks a value it should match
 (offset, say) is still used but shown in yellow, since it could not be
 checked; a fully described one is preferred, then the newest.
 
-**Masters** are made by sequences of calibration steps. A sequence takes
-one kind of frames: lights, covered frames (darks, dark flats, bias) or
-flats, so it never needs the cover or the panel changed halfway; Start
-refuses a mix. Each calibration step is averaged into a master in the
-masters folder once it has all its frames, also when that takes several
-runs (the step keeps the paths of its frames). The raw frames are saved as
+**Masters** are made by calibration steps. Each is averaged into a master
+in the masters folder once it has all its frames, also when that takes
+several runs (the step keeps the paths of its frames). The raw frames are saved as
 usual. The master is a winsorized κσ-clipped mean (κ = 3), which drops
 cosmic rays and hot transients, written as 32-bit float with IMAGETYP
 "Master Dark/Flat/Bias" and STACKCNT, and named after what it matches,
@@ -154,9 +167,20 @@ frames still missing. Reset progress starts every step from zero.
 
 - **Flats** use automatic exposure. Test frames, which are not saved, adjust
   the exposure until the brightest channel's median sits at the target
-  (45 % ± 5 % by default). Sky flats keep adjusting as the light changes.
-- **Dark flats** reuse the exposure found for flats with the same filter,
-  binning and gain. The engine remembers it across sessions.
+  (45 % ± 5 % by default). When that would take an exposure outside 1–5 s
+  (the step's "gain for" range), the gain changes instead: short flats can
+  show the panel's flicker, and a lower gain collects more light for the
+  same level. The gain is measured as it changes, so its units do not
+  matter, and it stays fixed once a step has frames. Without a gain
+  control, or at its limit, the exposure leaves the range (0.01–30 s). If
+  even that cannot reach the target, the status says to dim or brighten
+  the light; test frames go on until it fits (up to 10 minutes). Sky flats
+  keep adjusting as the light changes.
+- **Remembered**: the exposure and gain found per filter, binning and gain
+  are kept across sessions and tried first next time.
+- **Dark flats** reuse the exposure and gain found for the flats with the
+  same filter, binning and gain. The bias or dark flats for the flats wait
+  until the flats exist, since they must match the flats' gain.
 - **Temperature**: a step with a temperature cools the sensor and waits
   until it is within 0.5 °C of the target before exposing.
 

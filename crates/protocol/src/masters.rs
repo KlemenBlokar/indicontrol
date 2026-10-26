@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::equipment::{self, Control};
-use crate::{FrameType, Sequence, SequenceStep, UiState};
+use crate::{Exposure, FrameType, Sequence, SequenceStep, Setup, UiState};
 
 /// Exposure match: within this many seconds, or this fraction.
 const EXPOSURE_TOLERANCE: (f64, f64) = (0.01, 0.005);
@@ -228,12 +228,17 @@ pub fn needs(seq: &Sequence, state: &UiState) -> Vec<Need> {
             temperature: None,
             ..light.clone()
         };
+        // The flats may be taken at another gain than the lights, so their
+        // calibration waits for them.
+        let filter = light.filter.clone().unwrap_or_else(|| "no".into());
         match plan.flats_with {
-            FlatCalibration::Bias => {
+            FlatCalibration::Bias if flat.is_some() => {
                 add(MasterKind::Bias, Purpose::Flats, Some(flat_spec.clone()), flat_spec.describe(MasterKind::Bias), step)
             }
+            FlatCalibration::Bias => {
+                add(MasterKind::Bias, Purpose::Flats, None, format!("gain of the {filter} flat, once there is one"), step)
+            }
             FlatCalibration::DarkFlats => {
-                let filter = light.filter.clone().unwrap_or_else(|| "no".into());
                 match flat.and_then(|f| f.exposure) {
                     Some(exposure) => {
                         let spec = LightSpec { exposure, ..flat_spec };
@@ -257,6 +262,54 @@ pub fn needs(seq: &Sequence, state: &UiState) -> Vec<Need> {
         (_, MasterKind::Flat) => 1,
         _ => 2,
     });
+    out
+}
+
+/// Frames per master, for the steps [`missing_steps`] makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasterCounts {
+    pub dark: u32,
+    pub bias: u32,
+    /// Flats and dark flats.
+    pub flat: u32,
+}
+
+/// Steps to make the masters in `needs` that are missing and are taken
+/// with `setup`, with the settings they must match. Dark flats wait until
+/// their flat exists, as its exposure is what they match.
+pub fn missing_steps(needs: &[Need], setup: Setup, counts: MasterCounts) -> Vec<SequenceStep> {
+    let mut out: Vec<SequenceStep> = Vec::new();
+    for n in needs.iter().filter(|n| n.found.is_none()) {
+        let Some(spec) = &n.spec else {
+            continue;
+        };
+        let step = |frame_type, exposure, count, temperature| SequenceStep {
+            frame_type,
+            exposure,
+            count,
+            binning: Some(spec.binning),
+            gain: spec.gain,
+            offset: spec.offset,
+            temperature,
+            ..Default::default()
+        };
+        let step = match (n.kind, n.purpose) {
+            (MasterKind::Flat, _) => SequenceStep {
+                filter_slot: n.light.filter_slot,
+                ..step(FrameType::Flat, Exposure::DEFAULT_FLAT, counts.flat, None)
+            },
+            (MasterKind::Bias, _) => step(FrameType::Bias, Exposure::Minimum, counts.bias, spec.temperature),
+            (MasterKind::Dark, Purpose::Lights) => {
+                step(FrameType::Dark, Exposure::Fixed { seconds: spec.exposure }, counts.dark, spec.temperature)
+            }
+            (MasterKind::Dark, Purpose::Flats) => {
+                step(FrameType::Dark, Exposure::Fixed { seconds: spec.exposure }, counts.flat, None)
+            }
+        };
+        if Setup::of(step.frame_type) == setup && !out.contains(&step) {
+            out.push(step);
+        }
+    }
     out
 }
 
@@ -613,6 +666,7 @@ mod tests {
                 "one dark per exposure; flat and bias once (same filter)"
             );
             assert!(n.iter().all(|n| n.found.is_none()));
+            assert!(n[3].spec.is_none(), "the flats' bias follows their gain, unknown before there is a flat");
         }
 
         #[test]
@@ -650,6 +704,50 @@ mod tests {
             assert_eq!(df.spec.as_ref().map(|s| (s.exposure, s.gain)), Some((1.5, Some(0.0))));
             assert!(df.found.is_some(), "matched at the flat's exposure and gain");
             assert!(df.what.contains("for the no flat"), "{}", df.what);
+        }
+
+        #[test]
+        fn steps_for_the_missing_masters() {
+            let counts = MasterCounts { dark: 30, bias: 50, flat: 25 };
+            let mut s = seq(CalibrationPlan::default(), &[60.0, 120.0]);
+            s.steps[0].temperature = Some(-10.0);
+            let mut dark = master(MasterKind::Dark);
+            (dark.camera, dark.filter) = (None, None);
+            let n = needs(&s, &state(vec![dark]));
+            assert!(n[1].found.is_some(), "the 120 s dark exists");
+
+            let covered = missing_steps(&n, Setup::Covered, counts);
+            let summary: Vec<_> = covered.iter().map(|s| (s.frame_type, s.exposure.seconds(), s.count, s.temperature)).collect();
+            assert_eq!(
+                summary,
+                vec![(FrameType::Dark, Some(60.0), 30, Some(-10.0))],
+                "the missing dark at the lights' temperature; the flats' bias waits for the flat"
+            );
+            assert!(covered.iter().all(|s| s.gain == Some(100.0) && s.offset == Some(50.0) && s.binning == Some(1)));
+
+            // Flats taken at gain 0: their bias is too.
+            let flat = MasterFrame { gain: Some(0.0), filter: None, camera: None, ..master(MasterKind::Flat) };
+            let mut dark = master(MasterKind::Dark);
+            (dark.camera, dark.filter) = (None, None);
+            let with_flat = needs(&s, &state(vec![dark.clone(), flat]));
+            let bias = missing_steps(&with_flat, Setup::Covered, counts);
+            let bias: Vec<_> = bias.iter().filter(|s| s.frame_type == FrameType::Bias).collect();
+            assert_eq!(bias.len(), 1);
+            assert_eq!((bias[0].gain, bias[0].count), (Some(0.0), 50));
+
+            let flats = missing_steps(&n, Setup::Panel, counts);
+            assert_eq!(flats.len(), 1, "one filter");
+            assert!(matches!(flats[0].exposure, Exposure::AutoFlat { .. }));
+            assert!(missing_steps(&n, Setup::Sky, counts).is_empty());
+
+            // Dark flats once the flat exists, at its exposure.
+            s.calibration.flats_with = FlatCalibration::DarkFlats;
+            let n = needs(&s, &state(vec![]));
+            assert!(missing_steps(&n, Setup::Covered, counts).iter().all(|s| s.exposure.seconds().is_some() && s.count == 30));
+            let flat = MasterFrame { exposure: Some(1.5), filter: None, camera: None, ..master(MasterKind::Flat) };
+            let n = needs(&s, &state(vec![flat]));
+            let df = missing_steps(&n, Setup::Covered, counts);
+            assert_eq!(df.last().map(|s| (s.exposure.seconds(), s.count)), Some((Some(1.5), 25)));
         }
     }
 }

@@ -4,6 +4,7 @@
 mod calibration;
 mod capture;
 mod docs;
+mod flat;
 mod focus;
 mod guider;
 mod mount;
@@ -317,6 +318,21 @@ impl Core {
                 Ok(())
             }
             ToEngine::StartSequence(seq) => {
+                if let Err(e) = self.start_sequence(seq) {
+                    self.log(None, format!("Cannot start sequence: {e}"), LogLevel::Error);
+                }
+                Ok(())
+            }
+            ToEngine::StartDraft { setup } => {
+                let mut seq = self.state.sequence_draft.sequence.only(setup);
+                let what = match setup {
+                    protocol::Setup::Sky => None,
+                    protocol::Setup::Covered => Some(("Covered frames", "covered frames")),
+                    protocol::Setup::Panel => Some(("Flats", "flats")),
+                };
+                if let Some((alone, after)) = what {
+                    seq.name = if seq.name.is_empty() { alone.into() } else { format!("{}: {after}", seq.name) };
+                }
                 if let Err(e) = self.start_sequence(seq) {
                     self.log(None, format!("Cannot start sequence: {e}"), LogLevel::Error);
                 }

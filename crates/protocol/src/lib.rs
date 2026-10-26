@@ -34,7 +34,7 @@ pub use sequence::{
 pub use indi_link;
 
 /// Bump on any incompatible message change.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEFAULT_ENGINE_PORT: u16 = 7700;
 pub const WS_PATH: &str = "/ws";
 
@@ -393,6 +393,9 @@ pub enum ToEngine {
     /// Read the masters folder again now (it is also re-read every minute).
     RescanMasters,
     StartSequence(Sequence),
+    /// Run the engine's draft sequence, only its steps for `setup`; their
+    /// progress is kept in the draft.
+    StartDraft { setup: Setup },
     PauseSequence,
     ResumeSequence,
     AbortSequence,

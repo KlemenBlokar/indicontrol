@@ -75,7 +75,9 @@ async fn capture_saves_fits_with_metadata() {
     assert_eq!(stats.zero as usize, ZEROS);
     assert_eq!(stats.saturated as usize, SATURATED);
     assert_eq!(frame.analysis.adc_max, 65535);
-    assert!((21000.0..21041.0).contains(&stats.median), "{}", stats.median);
+    // The fake camera's gain scales the light.
+    let level = (1000.0 + RATE * gain_factor(120.0)).min(60_000.0);
+    assert!((level..level + 41.0).contains(&stats.median), "{}", stats.median);
     let (preview_id, jpeg) = &ui.previews[0];
     assert_eq!(*preview_id, frame.id);
     assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
@@ -98,7 +100,7 @@ async fn capture_saves_fits_with_metadata() {
     assert!(h.get_str("DATE-OBS").is_some());
     assert!(h.get_str("OBJCTRA").is_some() && h.get_f64("RA").is_some());
     assert_eq!(h.get_f64("CCD-TEMP"), Some(-10.0), "driver value kept");
-    assert_eq!(saved.data, Fits::parse(&test_frame(1.0)).unwrap().data);
+    assert_eq!(saved.data, Fits::parse(&test_frame_at_gain(1.0, gain_factor(120.0), FOCUS_START, &[])).unwrap().data);
 
     // A UI connecting later sees the last frame immediately.
     let mut late = TestUi::connect(&engine.ws_url()).await;

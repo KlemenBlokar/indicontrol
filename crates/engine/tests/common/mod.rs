@@ -38,7 +38,17 @@ pub fn test_frame(exposure: f64) -> Vec<u8> {
 
 /// [`test_frame`] at a focuser position, with extra header cards.
 pub fn test_frame_with(exposure: f64, focus: f64, extra: &[Card]) -> Vec<u8> {
-    let level = (1000.0 + RATE * exposure).min(60_000.0);
+    test_frame_at_gain(exposure, 1.0, focus, extra)
+}
+
+/// The signal a gain multiplies the light by: 0.1 dB per unit (ZWO-like).
+pub fn gain_factor(gain: f64) -> f64 {
+    10f64.powf(gain / 200.0)
+}
+
+/// [`test_frame_with`] with the light scaled by `factor` (the gain).
+pub fn test_frame_at_gain(exposure: f64, factor: f64, focus: f64, extra: &[Card]) -> Vec<u8> {
+    let level = (1000.0 + RATE * exposure * factor).min(60_000.0);
     let sigma = star_sigma(focus);
     // Constant flux: peak falls as stars spread out.
     let peak = 4000.0 * 1.44 / (sigma * sigma);
@@ -294,6 +304,7 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
     // Darks see no light.
     let mut dark = false;
     let mut focus = FOCUS_START;
+    let mut gain = 0.0;
     loop {
         let n = match sock.read(&mut buf).await {
             Ok(0) | Err(_) => return seen,
@@ -335,6 +346,10 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
             let msg = &chunk[chunk.rfind("<newNumberVector").unwrap()..];
             if msg.contains(r#"name="SIM_HIDE_PRIMARY""#) {
                 sky.primary_hidden = true;
+            } else if msg.contains(r#"name="CCD_GAIN""#) {
+                gain = number_in(msg, "GAIN");
+                let m = format!(r#"<setNumberVector device="Cam" name="CCD_GAIN" state="Ok"><oneNumber name="GAIN">{gain}</oneNumber></setNumberVector>"#);
+                sock.write_all(m.as_bytes()).await.unwrap();
             } else if msg.contains(r#"name="FILTER_SLOT""#) {
                 let slot = number_in(msg, "FILTER_SLOT_VALUE");
                 sock.write_all(br#"<setNumberVector device="Wheel" name="FILTER_SLOT" state="Busy"><oneNumber name="FILTER_SLOT_VALUE">1</oneNumber></setNumberVector>"#).await.unwrap();
@@ -398,8 +413,9 @@ async fn serve(mut sock: TcpStream, initial_temp: f64, hour_angle_min: f64) -> S
                 let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
                 let jd = imaging::astro::julian_day(unix);
                 let (tra, tdec) = imaging::astro::precess(reported.0 + error.0, reported.1 + error.1, jd, imaging::astro::J2000);
-                let frame = test_frame_with(
+                let frame = test_frame_at_gain(
                     if dark { 0.0 } else { exposure },
+                    gain_factor(gain),
                     focus,
                     &[Card::new("TRUERA", tra * 15.0, ""), Card::new("TRUEDEC", tdec, "")],
                 );

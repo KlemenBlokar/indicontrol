@@ -17,7 +17,9 @@ use super::{Core, CoreMsg};
 const TEMPERATURE_TOLERANCE: f64 = 0.5;
 const TEMPERATURE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Test exposures allowed to find a flat exposure before giving up.
-const MAX_FLAT_TESTS: u32 = 10;
+const MAX_FLAT_TESTS: u32 = 15;
+/// How long test frames go on while the flat source is too bright or dark.
+const FLAT_SOURCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const FLIP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Sidereal hours per solar hour.
 const SIDEREAL_RATE: f64 = 1.002_737_9;
@@ -44,15 +46,21 @@ pub(crate) struct Run {
 #[derive(Debug, Clone, Default)]
 struct FlatState {
     exposure: Option<f64>,
+    /// The gain the search chose (`None`: the step's).
+    gain: Option<f64>,
     calibrated: bool,
     tests: u32,
+    /// The previous test frame, to learn how the gain scales the signal.
+    last: Option<super::flat::Sample>,
+    /// Since when the source has been too bright or dark, and what to do.
+    source: Option<(std::time::Instant, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Wait {
     None,
     Temperature { step: usize, target: f64 },
-    Frame { step: usize, test: bool, exposure: f64 },
+    Frame { step: usize, test: bool, exposure: f64, gain: Option<f64> },
     /// Guiding is settling after a dither.
     Settle,
     /// Waiting for the target to reach the flip point.
@@ -256,7 +264,7 @@ impl Core {
             return;
         }
 
-        let (exposure, test) = match self.resolve_exposure(step) {
+        let (exposure, test, gain) = match self.resolve_exposure(step) {
             Ok(v) => v,
             Err(e) => return self.sequence_failed(e),
         };
@@ -266,16 +274,23 @@ impl Core {
             exposure,
             frame_type: s.frame_type,
             binning: s.binning,
-            gain: s.gain,
+            gain,
             offset: s.offset,
             filter_slot: s.filter_slot,
             object: run.seq.object.clone(),
             save: !test,
             repeat: false,
         };
-        run.wait = Wait::Frame { step, test, exposure };
+        run.wait = Wait::Frame { step, test, exposure, gain };
         run.message = if test {
-            format!("Flat step {}: test exposure {}", step + 1, fmt_seconds(exposure))
+            let at = match gain {
+                Some(g) if gain != s.gain => format!(" at gain {g}"),
+                _ => String::new(),
+            };
+            match &run.flat[step].source {
+                Some((_, fix)) => format!("Flat step {}: {fix}; test exposure {}{at}", step + 1, fmt_seconds(exposure)),
+                None => format!("Flat step {}: test exposure {}{at}", step + 1, fmt_seconds(exposure)),
+            }
         } else {
             format!(
                 "Step {}: frame {} of {} ({})",
@@ -291,20 +306,18 @@ impl Core {
         }
     }
 
-    /// Exposure for the next frame of `step`, and whether it is a test frame.
-    fn resolve_exposure(&self, step: usize) -> Result<(f64, bool), String> {
+    /// Exposure for the next frame of `step`, whether it is a test frame,
+    /// and the gain to take it with.
+    fn resolve_exposure(&self, step: usize) -> Result<(f64, bool, Option<f64>), String> {
         let run = self.run.as_ref().expect("running");
         let s = &run.seq.steps[step];
         match &s.exposure {
-            Exposure::Fixed { seconds } => Ok((*seconds, false)),
-            Exposure::Minimum => Ok((self.camera_min_exposure(), false)),
+            Exposure::Fixed { seconds } => Ok((*seconds, false, s.gain)),
+            Exposure::Minimum => Ok((self.camera_min_exposure(), false, s.gain)),
             Exposure::MatchFlat => {
                 let key = self.flat_key(step);
-                self.state
-                    .flat_exposures
-                    .iter()
-                    .find(|r| (r.filter.as_ref(), r.binning, r.gain) == (key.filter.as_ref(), key.binning, key.gain))
-                    .map(|r| (r.exposure, false))
+                self.flat_record(&key)
+                    .map(|r| (r.exposure, false, r.flat_gain.or(s.gain)))
                     .ok_or_else(|| {
                         format!(
                             "no flat exposure known for {} — take flats first",
@@ -314,21 +327,27 @@ impl Core {
             }
             Exposure::AutoFlat { min, max, .. } => {
                 let f = &run.flat[step];
-                let exposure = f
-                    .exposure
-                    .or_else(|| {
-                        let key = self.flat_key(step);
-                        self.state
-                            .flat_exposures
-                            .iter()
-                            .find(|r| (r.filter.as_ref(), r.binning, r.gain) == (key.filter.as_ref(), key.binning, key.gain))
-                            .map(|r| r.exposure)
-                    })
-                    .unwrap_or(1.0)
-                    .clamp(*min, *max);
-                Ok((exposure, !f.calibrated))
+                let record = self.flat_record(&self.flat_key(step));
+                let exposure = f.exposure.or(record.map(|r| r.exposure)).unwrap_or(1.0).clamp(*min, *max);
+                let gain = f.gain.or(record.and_then(|r| r.flat_gain)).or(s.gain);
+                Ok((exposure, !f.calibrated, gain))
             }
         }
+    }
+
+    /// What was found for flats like `key` before.
+    fn flat_record(&self, key: &FlatRecord) -> Option<&FlatRecord> {
+        self.state
+            .flat_exposures
+            .iter()
+            .find(|r| (r.filter.as_ref(), r.binning, r.gain) == (key.filter.as_ref(), key.binning, key.gain))
+    }
+
+    /// The camera's gain now and its range, if it has a gain control.
+    fn camera_gain(&self) -> Option<(f64, f64, f64)> {
+        let cache = self.client.as_ref()?.cache();
+        let cam = cache.devices.get(self.state.roles.main_camera.as_ref()?)?;
+        equipment::control_value(cam, Control::Gain).map(|n| (n.value, n.min, n.max))
     }
 
     /// Called by the capture code after each sequence frame.
@@ -337,7 +356,7 @@ impl Core {
         let Some(run) = &mut self.run else {
             return;
         };
-        let Wait::Frame { step, test, exposure } = run.wait else {
+        let Wait::Frame { step, test, exposure, gain } = run.wait else {
             return;
         };
         run.wait = Wait::None;
@@ -350,6 +369,7 @@ impl Core {
             tolerance,
             min,
             max,
+            window,
         } = run.seq.steps[step].exposure
         else {
             self.count_frame(step, path);
@@ -357,56 +377,90 @@ impl Core {
         };
 
         // Flats: keep frames that are close enough, and steer the exposure.
-        let error = (brightest - target).abs();
-        if !test && error <= 2.0 * tolerance {
+        if !test && (brightest - target).abs() <= 2.0 * tolerance {
             self.count_frame(step, path);
         }
+        let camera = self.camera_gain();
         let Some(run) = &mut self.run else {
             return;
         };
+        let step_gain = run.seq.steps[step].gain;
+        // Frames of a step share one gain, so it changes only before the first.
+        let gain_range = match (window, camera) {
+            (Some(_), Some((_, lo, hi))) if run.done[step] == 0 => Some((lo, hi)),
+            _ => None,
+        };
+        let limits = super::flat::Limits {
+            target,
+            tolerance,
+            min: min.max(self.camera_min_exposure()),
+            max,
+            window,
+            gain_range,
+        };
+        let run = self.run.as_mut().expect("checked");
+        let now = super::flat::Sample {
+            exposure,
+            gain: gain.or(camera.map(|c| c.0)),
+            brightest,
+        };
         let flat = &mut run.flat[step];
-        if error <= tolerance {
-            flat.calibrated = true;
-            flat.exposure = Some(exposure);
-            let record = self.flat_key(step);
-            self.remember_flat(FlatRecord { exposure, ..record });
-            return self.sequence_next();
-        }
-        flat.calibrated = false;
-        if test {
-            flat.tests += 1;
-        }
-        let next = if brightest >= 0.95 {
-            exposure / 4.0
-        } else if brightest <= 0.01 {
-            exposure * 8.0
-        } else {
-            exposure * target / brightest
-        };
+        let next = super::flat::next(&limits, now, flat.last);
+        flat.last = Some(now);
         let level = format!("{:.0} %", brightest * 100.0);
-        let failure = if next < min && exposure <= min {
-            Some(format!("flat source too bright ({level} at {}) — dim it", fmt_seconds(min)))
-        } else if next > max && exposure >= max {
-            Some(format!("flat source too dark ({level} at {}) — brighten it", fmt_seconds(max)))
-        } else if flat.tests > MAX_FLAT_TESTS {
-            Some(format!("could not find a flat exposure (last: {level} at {})", fmt_seconds(exposure)))
-        } else {
-            None
+        let at = |exposure: f64, gain: Option<f64>| match gain {
+            Some(g) => format!("{} at gain {g}", fmt_seconds(exposure)),
+            None => fmt_seconds(exposure),
         };
-        if let Some(e) = failure {
-            return self.sequence_failed(e);
+        match next {
+            super::flat::Next::Done => {
+                let found_now = !std::mem::replace(&mut flat.calibrated, true);
+                flat.exposure = Some(exposure);
+                flat.gain = now.gain;
+                flat.source = None;
+                let record = self.flat_key(step);
+                let flat_gain = now.gain.filter(|g| record.gain != Some(g.round() as i64));
+                if let Some(g) = flat_gain.filter(|_| found_now) {
+                    let step_gain = step_gain.or(record.gain.map(|g| g as f64)).map_or("unset".into(), |g| g.to_string());
+                    self.log(
+                        None,
+                        format!("Flat step {}: gain {g} (the step's: {step_gain}) keeps the exposure at {}", step + 1, fmt_seconds(exposure)),
+                        LogLevel::Info,
+                    );
+                }
+                self.remember_flat(FlatRecord { exposure, flat_gain, ..record });
+            }
+            super::flat::Next::Try { exposure: e, gain: g } => {
+                flat.calibrated = false;
+                flat.source = None;
+                if test {
+                    flat.tests += 1;
+                }
+                if flat.tests > MAX_FLAT_TESTS {
+                    let e = format!("could not find a flat exposure (last: {level} at {})", at(exposure, now.gain));
+                    return self.sequence_failed(e);
+                }
+                flat.exposure = Some(e);
+                flat.gain = g;
+                let msg = format!("Flat at {} reached {level} (target {:.0} %), next {}", at(exposure, now.gain), target * 100.0, at(e, g));
+                self.log(None, msg, LogLevel::Info);
+            }
+            super::flat::Next::Source { exposure: e, gain: g, brighter } => {
+                flat.calibrated = false;
+                flat.exposure = Some(e);
+                flat.gain = g;
+                let fix = if brighter { "too dark — brighten it" } else { "too bright — dim it" };
+                let msg = format!("Flat source {fix} ({level} at {})", at(exposure, now.gain));
+                match &mut flat.source {
+                    None => {
+                        flat.source = Some((std::time::Instant::now(), msg.clone()));
+                        self.log(None, format!("{msg}; test frames go on until it fits"), LogLevel::Warning);
+                    }
+                    Some((since, _)) if since.elapsed() > FLAT_SOURCE_TIMEOUT => return self.sequence_failed(msg),
+                    Some((_, text)) => *text = msg,
+                }
+            }
         }
-        flat.exposure = Some(next.clamp(min, max));
-        self.log(
-            None,
-            format!(
-                "Flat at {} reached {level} (target {:.0} %), next {}",
-                fmt_seconds(exposure),
-                target * 100.0,
-                fmt_seconds(next.clamp(min, max))
-            ),
-            LogLevel::Info,
-        );
         self.sequence_next();
     }
 
@@ -814,6 +868,7 @@ impl Core {
             binning: s.binning.or(cam_bin).unwrap_or(1),
             gain: s.gain.or(cam_gain).map(|g| g.round() as i64),
             exposure: 0.0,
+            flat_gain: None,
         }
     }
 
