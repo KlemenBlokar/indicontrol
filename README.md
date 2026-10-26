@@ -51,6 +51,16 @@ only on a trusted network: like INDI itself, there is no authentication yet.
 The engine saves its settings (INDI server, equipment roles) in
 `~/.config/indicontrol/engine.json`.
 
+## Equipment
+
+The Equipment tab sets up the rig: the profile, the INDI server, which
+device is the main camera, guide camera, mount, filter wheel and focuser,
+and the optics. Below them are the INDI devices, to connect and
+disconnect; the selected one's properties show beside them. The UI opens
+on this tab while the INDI server is not connected. On the other tabs, an
+assigned device that is not connected shows as a warning, and the INDI
+status in the top bar leads back here.
+
 ## Imaging
 
 The Imaging tab takes single exposures or loops (for framing and focusing)
@@ -267,7 +277,7 @@ change, after a meridian flip, or when the focuser temperature has changed.
 
 ## Profiles and night mode
 
-**Profiles** (top of the Equipment panel) save a whole rig under a name:
+**Profiles** (top of the Equipment tab) save a whole rig under a name:
 INDI server, device roles, imaging, guiding, solver and focus settings, the
 guide calibration and remembered flat exposures. Loading one switches
 everything, reconnecting to its INDI server if needed. Profiles live on the
@@ -321,7 +331,7 @@ INDI_SIM=127.0.0.1:7630 ASTAP=~/.local/opt/astap/astap_cli \
 ```
 
 INDI 2.x keeps the telescope focal length on each camera (`SCOPE_INFO`).
-Set it under **Optics** in the Equipment panel: the engine writes it to the
+Set it under **Optics** in the Equipment tab: the engine writes it to the
 cameras, and FITS metadata, plate solving and the guider rely on it.
 
 ## License

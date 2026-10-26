@@ -29,12 +29,14 @@ pub enum EngineChoice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum View {
+    /// The rig: profile, INDI server, roles, optics and the devices.
+    #[serde(alias = "Devices")]
+    Equipment,
     Imaging,
     Sequence,
     Guiding,
     Focus,
     Mount,
-    Devices,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,9 @@ pub struct App {
     edits: Edits,
     indi_host: String,
     indi_port: u16,
+    /// Until the engine first reports the INDI server: then Equipment is
+    /// shown if it is not connected.
+    choose_start_view: bool,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     engine_input: String,
     applied_night_mode: Option<bool>,
@@ -158,6 +163,7 @@ impl App {
             edits: Edits::default(),
             indi_host: "localhost".into(),
             indi_port: indi_link::DEFAULT_PORT,
+            choose_start_view: true,
             engine_input,
             applied_night_mode: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -275,9 +281,12 @@ impl App {
                     }
                 }
                 ToUi::Doc { doc, value, ack } => self.doc(*doc).on_server(value.clone(), *ack),
-                ToUi::IndiStatus { host, port, .. } => {
+                ToUi::IndiStatus { host, port, status } => {
                     self.indi_host.clone_from(host);
                     self.indi_port = *port;
+                    if std::mem::take(&mut self.choose_start_view) && matches!(status, IndiStatus::Disconnected { .. }) {
+                        self.settings.view = View::Equipment;
+                    }
                 }
                 ToUi::ObjectsFound { query, objects } => self.mount.search.on_results(query, objects),
                 _ => {}
@@ -295,7 +304,7 @@ impl App {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("indicontrol").strong());
             ui.separator();
@@ -316,49 +325,18 @@ impl App {
             self.engine_menu(ui);
             ui.separator();
 
-            // INDI server, as seen by the engine.
-            let usable = self.link.as_ref().is_some_and(EngineLink::is_open);
-            ui.add_enabled_ui(usable, |ui| {
-                ui.label("INDI");
-                let disconnected =
-                    matches!(self.state.indi_status, IndiStatus::Disconnected { .. });
-                ui.add_enabled(
-                    disconnected,
-                    egui::TextEdit::singleline(&mut self.indi_host).desired_width(140.0),
-                );
-                ui.add_enabled(
-                    disconnected,
-                    egui::DragValue::new(&mut self.indi_port).range(1..=65535),
-                );
-                match &self.state.indi_status {
-                    IndiStatus::Disconnected { error } => {
-                        if ui.button("Connect").clicked() {
-                            actions.push(ToEngine::ConnectIndi {
-                                host: self.indi_host.trim().to_owned(),
-                                port: self.indi_port,
-                            });
-                        }
-                        if let Some(e) = error {
-                            ui.label(RichText::new(e).color(theme::c(ui, Color32::from_rgb(220, 60, 60))));
-                        }
-                    }
-                    IndiStatus::Connecting => {
-                        ui.add(egui::Spinner::new());
-                        if ui.button("Cancel").clicked() {
-                            actions.push(ToEngine::DisconnectIndi);
-                        }
-                    }
-                    IndiStatus::Connected => {
-                        if ui.button("Disconnect").clicked() {
-                            actions.push(ToEngine::DisconnectIndi);
-                        }
-                        ui.label(
-                            RichText::new(format!("{} devices", self.state.cache.devices.len()))
-                                .weak(),
-                        );
-                    }
-                }
-            });
+            // INDI server, as seen by the engine; set up under Equipment.
+            let (state, text) = match &self.state.indi_status {
+                IndiStatus::Connected => (PropertyState::Ok, format!("{} devices", self.state.cache.devices.len())),
+                IndiStatus::Connecting => (PropertyState::Busy, "connecting…".to_owned()),
+                IndiStatus::Disconnected { error: Some(e) } => (PropertyState::Alert, e.clone()),
+                IndiStatus::Disconnected { error: None } => (PropertyState::Idle, "not connected".to_owned()),
+            };
+            property_view::state_dot(ui, state);
+            let label = format!("INDI {}:{} · {text}", self.indi_host, self.indi_port);
+            if ui.add(egui::Label::new(label).sense(egui::Sense::click())).on_hover_text("Set up under Equipment").clicked() {
+                self.settings.view = View::Equipment;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.settings.night_mode, "Night mode");
             });
@@ -459,6 +437,8 @@ impl App {
 
     fn equipment_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
         self.profiles(ui, actions);
+        self.indi_server(ui, actions);
+        ui.separator();
         ui.heading("Equipment");
         let mut roles = self.state.roles.clone();
         egui::Grid::new("roles").num_columns(2).show(ui, |ui| {
@@ -538,6 +518,58 @@ impl App {
                 }
             }
         });
+    }
+
+    fn indi_server(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
+        ui.horizontal(|ui| {
+            ui.label("INDI");
+            let disconnected = matches!(self.state.indi_status, IndiStatus::Disconnected { .. });
+            ui.add_enabled(disconnected, egui::TextEdit::singleline(&mut self.indi_host).desired_width(120.0));
+            ui.add_enabled(disconnected, egui::DragValue::new(&mut self.indi_port).range(1..=65535));
+            match &self.state.indi_status {
+                IndiStatus::Disconnected { .. } => {
+                    if ui.button("Connect").clicked() {
+                        actions.push(ToEngine::ConnectIndi {
+                            host: self.indi_host.trim().to_owned(),
+                            port: self.indi_port,
+                        });
+                    }
+                }
+                IndiStatus::Connecting => {
+                    ui.add(egui::Spinner::new());
+                    if ui.button("Cancel").clicked() {
+                        actions.push(ToEngine::DisconnectIndi);
+                    }
+                }
+                IndiStatus::Connected => {
+                    if ui.button("Disconnect").clicked() {
+                        actions.push(ToEngine::DisconnectIndi);
+                    }
+                }
+            }
+        });
+        if let IndiStatus::Disconnected { error: Some(e) } = &self.state.indi_status {
+            ui.label(RichText::new(e).color(theme::c(ui, Color32::from_rgb(220, 60, 60))));
+        }
+    }
+
+    /// Assigned devices that are not there or not connected.
+    fn role_warnings(&self) -> Vec<String> {
+        if self.state.indi_status != IndiStatus::Connected {
+            return Vec::new();
+        }
+        let mut roles = self.state.roles.clone();
+        role_slots(&mut roles)
+            .into_iter()
+            .filter_map(|(label, slot, _)| {
+                let name = slot.as_deref()?;
+                match self.state.cache.devices.get(name) {
+                    Some(d) if d.is_connected() => None,
+                    Some(_) => Some(format!("{label} {name} is not connected")),
+                    None => Some(format!("{label} {name} is not on the INDI server")),
+                }
+            })
+            .collect()
     }
 
     fn device_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ToEngine>) {
@@ -637,17 +669,11 @@ impl eframe::App for App {
         // The engine closes the link to a UI of another protocol version anyway.
         let usable = self.link.as_ref().is_some_and(EngineLink::is_open) && self.state.version_mismatch.is_none();
         let mut actions = Vec::new();
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &mut actions));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("log")
             .resizable(true)
             .default_size(160.0)
             .show(ui, |ui| self.log_panel(ui));
-        egui::Panel::left("equipment")
-            .resizable(true)
-            .default_size(280.0)
-            .show(ui, |ui| {
-                ui.add_enabled_ui(usable, |ui| self.equipment_panel(ui, &mut actions));
-            });
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(v) = self.state.version_mismatch {
                 let fix = if cfg!(target_arch = "wasm32") { "Reload the page" } else { "Update one of them" };
@@ -662,12 +688,12 @@ impl eframe::App for App {
             }
             ui.horizontal(|ui| {
                 for (view, label) in [
+                    (View::Equipment, "Equipment"),
                     (View::Imaging, "Imaging"),
                     (View::Sequence, "Sequence"),
                     (View::Guiding, "Guiding"),
                     (View::Focus, "Focus"),
                     (View::Mount, "Mount"),
-                    (View::Devices, "Devices"),
                 ] {
                     ui.selectable_value(&mut self.settings.view, view, RichText::new(label).heading());
                 }
@@ -693,7 +719,19 @@ impl eframe::App for App {
                 }
             });
             ui.separator();
+            if self.settings.view != View::Equipment {
+                for w in self.role_warnings() {
+                    ui.colored_label(theme::c(ui, Color32::from_rgb(230, 160, 40)), format!("• {w}"));
+                }
+            }
             ui.add_enabled_ui(usable, |ui| match self.settings.view {
+                View::Equipment => {
+                    egui::Panel::left("equipment")
+                        .resizable(true)
+                        .default_size(300.0)
+                        .show(ui, |ui| self.equipment_panel(ui, &mut actions));
+                    egui::CentralPanel::default().show(ui, |ui| self.device_view(ui, &mut actions));
+                }
                 View::Imaging => self.imaging.ui(ui, &self.state, &mut actions),
                 View::Sequence => {
                     let object = self.state.mount.as_ref().and_then(|m| self.mount.object_at(m));
@@ -702,7 +740,6 @@ impl eframe::App for App {
                 View::Guiding => self.guider.ui(ui, &self.state, &mut actions),
                 View::Mount => self.mount.ui(ui, &self.state, &mut actions),
                 View::Focus => self.focus.ui(ui, &self.state, &mut actions),
-                View::Devices => self.device_view(ui, &mut actions),
             });
         });
         // After commands, so Apply sends a draft before the edits in it.
